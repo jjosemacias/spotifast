@@ -161,14 +161,18 @@ fn request(worker: &mut Worker, action: Action) {
 }
 
 async fn queued(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Command>) -> Completed {
-    match tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-        .await
-        .unwrap()
-        .unwrap()
-    {
-        Command::JamFinished(result) => *result,
-        _ => panic!("unexpected command"),
-    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match receiver.recv().await.unwrap() {
+                Command::JamFinished(result) => return *result,
+                // The offline authorization fixtures cancel before HTTP.
+                Command::SignInEnded { .. } => {}
+                _ => panic!("unexpected command"),
+            }
+        }
+    })
+    .await
+    .unwrap()
 }
 
 async fn finish(worker: &mut Worker, receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Command>) {
@@ -177,6 +181,239 @@ async fn finish(worker: &mut Worker, receiver: &mut tokio::sync::mpsc::Unbounded
 
 fn latest(events: &watch::Receiver<Option<Arc<Event>>>) -> Arc<Event> {
     events.borrow().clone().unwrap()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IdentityTransition {
+    Browser,
+    Verification,
+    RemovePersonal,
+}
+
+impl IdentityTransition {
+    fn source(self) -> ApiSource {
+        match self {
+            Self::RemovePersonal => ApiSource::Personal,
+            _ => ApiSource::Shared,
+        }
+    }
+
+    fn apply(self, worker: &mut Worker) {
+        match self {
+            Self::Browser => {
+                worker.sign_in_source_with_opener(self.source(), |_| Ok(()));
+                assert!(matches!(
+                    worker.api.state(self.source()),
+                    crate::api::SessionState::Authorizing
+                ));
+            }
+            Self::Verification => {
+                worker.on_web_signed_in(self.source(), crate::auth::StoredToken::default());
+                // Stop the spawned verification before its first poll. No HTTP.
+                worker
+                    .credentials
+                    .invalidate(crate::credentials::Slot::Shared);
+            }
+            Self::RemovePersonal => worker.configure_personal_web_app(None),
+        }
+    }
+}
+
+fn consumer(
+    worker: &Worker,
+    events: watch::Receiver<Option<Arc<Event>>>,
+) -> crate::backend::Backend {
+    let mut backend = crate::backend::Backend::spawn(
+        worker.dirs.clone(),
+        worker.engine_config.clone(),
+        None,
+        Waker::default(),
+        false,
+    );
+    backend.shutdown();
+    backend.jam_events = events;
+    backend.jam_gate = worker.jam.gate();
+    backend
+}
+
+fn prepare_identity(worker: &mut Worker, transition: IdentityTransition, other_ready: bool) {
+    if matches!(transition, IdentityTransition::RemovePersonal) {
+        worker
+            .api
+            .install(ApiSource::Personal, AccountId::new("alice"))
+            .unwrap();
+        if !other_ready {
+            worker
+                .api
+                .set_state(ApiSource::Shared, crate::api::SessionState::Authorizing);
+        }
+    } else if other_ready {
+        worker
+            .api
+            .install(ApiSource::Personal, AccountId::new("alice"))
+            .unwrap();
+    }
+}
+
+fn restore_identity(worker: &mut Worker, transition: IdentityTransition) {
+    worker.web_tokens = [None, None];
+    worker.web_client_id = Some("personal".into());
+    authorization_tests::verify(worker, transition.source(), "alice");
+}
+
+#[test]
+fn last_verified_identity_loss_retires_before_same_account_returns_and_io_resumes() {
+    let _port = authorization_tests::WEB_PORT.lock().unwrap();
+    for transition in [
+        IdentityTransition::Browser,
+        IdentityTransition::Verification,
+        IdentityTransition::RemovePersonal,
+    ] {
+        let (runtime, mut worker, fake, mut commands, events) =
+            setup(&format!("jam-loss-{transition:?}"));
+        prepare_identity(&mut worker, transition, false);
+        let mut backend = consumer(&worker, events);
+        runtime.block_on(async {
+            let release = fake.wait();
+            request(&mut worker, Action::Current);
+            tokio::task::yield_now().await;
+            let old = backend.jam_stamp();
+            transition.apply(&mut worker);
+            assert!(worker.api.account().is_none());
+            // Consume Unknown while there is no verified account.
+            let invalidated = backend
+                .poll_jam()
+                .expect("identity loss must reach the consumer");
+            assert_eq!(invalidated.phase, Phase::Invalidated(Cause::Account));
+            assert!(invalidated.snapshot.membership == Membership::Unknown);
+            restore_identity(&mut worker, transition);
+            assert!(
+                !worker.jam.gate.accepts(old),
+                "same account must not revive its binding"
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                release.send(owner()).is_err(),
+                "old I/O must have been cancelled"
+            );
+            while let Ok(command) = commands.try_recv() {
+                assert!(matches!(command, Command::SignInEnded { .. }));
+            }
+            worker.request_jam(Request {
+                expected: old,
+                action: Action::Create(CreateIntent::Requested),
+            });
+            request(&mut worker, Action::Current);
+            assert_eq!(
+                fake.calls(),
+                1,
+                "restoration cannot reuse the retired transport"
+            );
+            assert_eq!(fake.writes(), 0);
+        });
+    }
+}
+
+#[test]
+fn queued_owner_and_completed_current_cannot_revive_after_identity_restoration() {
+    let _port = authorization_tests::WEB_PORT.lock().unwrap();
+    for transition in [
+        IdentityTransition::Browser,
+        IdentityTransition::Verification,
+        IdentityTransition::RemovePersonal,
+    ] {
+        for queued_result in [false, true] {
+            // Each case owns its callback listener until its runtime stops.
+            let (runtime, mut worker, fake, mut commands, events) =
+                setup(&format!("jam-queued-loss-{transition:?}-{queued_result}"));
+            prepare_identity(&mut worker, transition, false);
+            let mut backend = consumer(&worker, events);
+            runtime.block_on(async {
+                fake.push(owner());
+                request(&mut worker, Action::Current);
+                let completed = if queued_result {
+                    Some(queued(&mut commands).await)
+                } else {
+                    finish(&mut worker, &mut commands).await;
+                    None
+                };
+                let old = backend.jam_stamp();
+                // Leave either the owner event or the completion unread.
+                transition.apply(&mut worker);
+                restore_identity(&mut worker, transition);
+                if let Some(completed) = completed {
+                    worker.finish_jam(completed);
+                }
+                let event = backend
+                    .poll_jam()
+                    .expect("retirement must survive restoration");
+                assert_eq!(event.phase, Phase::Invalidated(Cause::Account));
+                assert!(event.snapshot.membership == Membership::Unknown);
+                assert!(!worker.jam.gate.accepts(old));
+                assert!(backend.poll_jam().is_none());
+                assert_eq!(fake.calls(), 1);
+            });
+        }
+    }
+}
+
+#[test]
+fn another_ready_grant_keeps_same_account_binding_and_pending_current() {
+    let _port = authorization_tests::WEB_PORT.lock().unwrap();
+    for transition in [
+        IdentityTransition::Browser,
+        IdentityTransition::Verification,
+        IdentityTransition::RemovePersonal,
+    ] {
+        let (runtime, mut worker, fake, mut commands, events) =
+            setup(&format!("jam-retain-{transition:?}"));
+        prepare_identity(&mut worker, transition, true);
+        let mut backend = consumer(&worker, events);
+        runtime.block_on(async {
+            let release = fake.wait();
+            request(&mut worker, Action::Current);
+            tokio::task::yield_now().await;
+            let old = backend.jam_stamp();
+            backend.poll_jam();
+            transition.apply(&mut worker);
+            assert_eq!(worker.api.account(), Some(AccountId::new("alice")));
+            assert!(worker.jam.gate.accepts(old));
+            assert!(
+                backend.poll_jam().is_none(),
+                "no invalidation with another verified grant"
+            );
+            restore_identity(&mut worker, transition);
+            release.send(owner()).ok().unwrap();
+            finish(&mut worker, &mut commands).await;
+            let event = backend.poll_jam().unwrap();
+            assert_eq!(event.phase, Phase::Complete(Kind::Current));
+            assert!(matches!(event.snapshot.membership, Membership::Present(_)));
+            assert_eq!(fake.calls(), 1);
+        });
+    }
+}
+
+#[test]
+fn context_invalidation_reaches_poll_jam_while_verification_is_unavailable() {
+    let (runtime, mut worker, fake, mut commands, events) = setup("jam-context-consumer");
+    let mut backend = consumer(&worker, events);
+    runtime.block_on(async {
+        fake.push(owner());
+        request(&mut worker, Action::Current);
+        let completed = queued(&mut commands).await;
+        worker.api.clear_all();
+        assert!(
+            backend.poll_jam().is_none(),
+            "unverified pending event must be rejected"
+        );
+        worker.finish_jam(completed);
+        let event = backend
+            .poll_jam()
+            .expect("context Unknown must reach the consumer");
+        assert_eq!(event.phase, Phase::Invalidated(Cause::Context));
+        assert!(event.snapshot.membership == Membership::Unknown);
+        assert!(!worker.jam.gate.accepts(event.stamp));
+    });
 }
 
 #[test]

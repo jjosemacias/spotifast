@@ -255,6 +255,14 @@ impl Gate {
         let state = self.lock();
         state.stamp == stamp && state.context_valid()
     }
+    pub(crate) fn accepts_event(&self, event: &Event) -> bool {
+        let state = self.lock();
+        // An invalid context must still clear the consumer's old projection.
+        // Only the latest stamp can deliver that invalidation; requests and
+        // completions continue to require a valid context through accepts().
+        state.stamp == event.stamp
+            && (matches!(event.phase, Phase::Invalidated(_)) || state.context_valid())
+    }
     fn signal(&self, engine: u64, notice: Notice) {
         let mut state = self.lock();
         if state.stamp.engine != engine || !state.listening {

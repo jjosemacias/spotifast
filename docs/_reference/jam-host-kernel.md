@@ -105,6 +105,13 @@ including the kernel's successful-write verification, acquire the backend's
 existing four-slot background_session semaphore. Writes remain serialized and
 are never retried. The kernel deadline also covers waiting for that read slot.
 
+Withdrawing the last verified Web API identity retires the binding before the
+grant changes, even if that same account verifies again before pending work
+resumes. A second Ready grant for the same account preserves the binding.
+Retirement requires a new engine binding and a deliberate Current; restoring
+the account alone cannot revive old results or intentions. The latest Unknown
+invalidation remains consumable while verification or context is unavailable.
+
 On engine acceptance, two listeners reuse its Dealer before a read is allowed:
 social-connect/v2/session_update and hm://pusher/v1/connections/. Jam payloads
 are discarded, not parsed as member/owner truth. Every notification conservatively

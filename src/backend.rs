@@ -1459,7 +1459,7 @@ impl Backend {
         self.jam_events
             .borrow_and_update()
             .clone()
-            .filter(|event| self.jam_gate.accepts(event.stamp))
+            .filter(|event| self.jam_gate.accepts_event(event))
     }
 
     pub fn art(&self) -> &ArtLoader {
@@ -2728,6 +2728,8 @@ impl Worker {
     }
 
     fn on_web_signed_in(&mut self, source: ApiSource, token: crate::auth::StoredToken) {
+        #[cfg(feature = "jam-host")]
+        self.retire_jam_before_withdrawing_identity(source);
         let lease = self.credentials.lease(web_slot(source));
         let tokens = WebTokens::new(
             self.http.clone(),
@@ -2788,6 +2790,8 @@ impl Worker {
     }
 
     fn forget_web_grant(&mut self, source: ApiSource) {
+        #[cfg(feature = "jam-host")]
+        self.retire_jam_before_withdrawing_identity(source);
         let slot = web_slot(source);
         if let Err(error) = self.credentials.revoke(slot) {
             self.emit(Event::Error(error.to_string()));
@@ -2919,6 +2923,14 @@ impl Worker {
     }
 
     fn sign_in_source(&mut self, source: ApiSource) {
+        self.sign_in_source_with_opener(source, crate::opener::open);
+    }
+
+    fn sign_in_source_with_opener(
+        &mut self,
+        source: ApiSource,
+        open: impl FnOnce(String) -> std::io::Result<()> + Send + 'static,
+    ) {
         let http = match self.http.client() {
             Ok(http) => http,
             Err(error) => {
@@ -2955,6 +2967,8 @@ impl Worker {
                 return;
             }
         };
+        #[cfg(feature = "jam-host")]
+        self.retire_jam_before_withdrawing_identity(source);
         self.credentials.invalidate(web_slot(source));
         self.restore_pending[web_slot(source).index()] = false;
         let lease = self.credentials.lease(web_slot(source));
@@ -2972,7 +2986,7 @@ impl Worker {
         }
         let browser_url = flow.url.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = crate::opener::open(&browser_url) {
+            if let Err(error) = open(browser_url) {
                 log::warn!("unable to open a browser: {error}");
             }
         });
@@ -3013,6 +3027,8 @@ impl Worker {
     }
 
     fn configure_personal_web_app(&mut self, client_id: Option<String>) {
+        #[cfg(feature = "jam-host")]
+        self.retire_jam_before_withdrawing_identity(ApiSource::Personal);
         let authorization_in_flight = if let Some(cancel) = self.cancel_signin.as_ref() {
             let _ = cancel.send(true);
             self.credentials.invalidate(
@@ -3052,6 +3068,22 @@ impl Worker {
                 notice(error);
             }
         });
+    }
+
+    /// Fence Jam before a grant's Ready identity disappears. Another verified
+    /// grant for the same account keeps the existing binding usable.
+    #[cfg(feature = "jam-host")]
+    fn retire_jam_before_withdrawing_identity(&mut self, source: ApiSource) {
+        let other = match source {
+            ApiSource::Shared => ApiSource::Personal,
+            ApiSource::Personal => ApiSource::Shared,
+        };
+        if let Some(account) = self.api.state(source).account()
+            && self.api.state(other).account() != Some(account)
+        {
+            self.jam
+                .retire(*self.session.borrow(), jam::lifecycle::Cause::Account);
+        }
     }
 
     /// Cancels in-flight account work and drops cached Home data on sign-out.
@@ -7284,6 +7316,7 @@ mod authorization_tests {
 
     #[test]
     fn occupied_login_port_reports_persistent_failure_before_browser_sign_in() {
+        let _port = WEB_PORT.lock().unwrap();
         let (runtime, mut worker, events) = worker("occupied-login-port");
         let _entered = runtime.enter();
         let _occupied =
@@ -7308,6 +7341,8 @@ mod authorization_tests {
 
     /// Tests that bind the playback callback port take turns.
     static PLAYBACK_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) static WEB_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn failed(events: &std::sync::mpsc::Receiver<Event>) -> Vec<String> {
         events

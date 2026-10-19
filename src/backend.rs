@@ -603,6 +603,10 @@ struct PlaylistCacheWrite {
 }
 
 pub enum Command {
+    #[cfg(feature = "jam-host")]
+    Jam(jam::lifecycle::Request),
+    #[cfg(feature = "jam-host")]
+    JamFinished(Box<jam::lifecycle::Completed>),
     OpenThemesFolder,
     ProxyRestored {
         lease: CredentialLease,
@@ -989,6 +993,10 @@ pub use fastframe_shell::Waker;
 
 /// The interface's handle to the runtime.
 pub struct Backend {
+    #[cfg(feature = "jam-host")]
+    jam_events: watch::Receiver<Option<Arc<jam::lifecycle::Event>>>,
+    #[cfg(feature = "jam-host")]
+    jam_gate: jam::lifecycle::Gate,
     commands: mpsc::UnboundedSender<Command>,
     events: std::sync::mpsc::Receiver<Event>,
     art: ArtLoader,
@@ -1036,6 +1044,10 @@ impl Backend {
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        #[cfg(feature = "jam-host")]
+        let (jam, jam_events) = jam::lifecycle::Bridge::channel(waker.clone());
+        #[cfg(feature = "jam-host")]
+        let jam_gate = jam.gate();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("spotifast-runtime")
@@ -1073,6 +1085,10 @@ impl Backend {
                         worker_commands,
                         waker,
                     );
+                    #[cfg(feature = "jam-host")]
+                    {
+                        worker.jam = jam;
+                    }
                     if restore_sign_in {
                         worker.restore_session();
                     }
@@ -1085,6 +1101,10 @@ impl Backend {
 
         Self {
             commands: command_tx,
+            #[cfg(feature = "jam-host")]
+            jam_events,
+            #[cfg(feature = "jam-host")]
+            jam_gate,
             events: event_rx,
             art,
             activity,
@@ -1423,6 +1443,25 @@ impl Backend {
         self.events.try_iter().collect()
     }
 
+    /// No UI action is wired yet. Consumers echo this stamp for deliberate work.
+    #[cfg(feature = "jam-host")]
+    pub fn jam_stamp(&self) -> jam::lifecycle::Stamp {
+        self.jam_gate.stamp()
+    }
+
+    /// Latest Jam state only; retired queued states cannot cross account/engine
+    /// transitions. Coalescing also bounds memory when no UI consumes this API.
+    #[cfg(feature = "jam-host")]
+    pub fn poll_jam(&mut self) -> Option<Arc<jam::lifecycle::Event>> {
+        if !self.jam_events.has_changed().unwrap_or(false) {
+            return None;
+        }
+        self.jam_events
+            .borrow_and_update()
+            .clone()
+            .filter(|event| self.jam_gate.accepts(event.stamp))
+    }
+
     pub fn art(&self) -> &ArtLoader {
         &self.art
     }
@@ -1581,6 +1620,8 @@ impl PlaylistHeaderLookup {
 }
 
 struct Worker {
+    #[cfg(feature = "jam-host")]
+    jam: jam::lifecycle::Bridge,
     dirs: AppDirs,
     credentials: CredentialStore,
     web_tokens: [Option<Arc<WebTokens>>; 2],
@@ -1676,6 +1717,8 @@ impl Worker {
         waker: Waker,
     ) -> Self {
         Self {
+            #[cfg(feature = "jam-host")]
+            jam: jam::lifecycle::Bridge::default(),
             #[cfg(not(test))]
             credentials: CredentialStore::new(dirs.clone()),
             #[cfg(test)]
@@ -1735,6 +1778,36 @@ impl Worker {
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
         self.waker.wake();
+    }
+
+    #[cfg(feature = "jam-host")]
+    fn request_jam(&mut self, request: jam::lifecycle::Request) {
+        let epoch = *self.session.borrow();
+        if !self.signed_in {
+            self.jam.retire(epoch, jam::lifecycle::Cause::Account);
+        }
+        let account = self.api.account();
+        self.jam.request(
+            request,
+            account.as_ref().map(|account| account.as_str()),
+            epoch,
+            self.commands.clone(),
+        );
+    }
+
+    #[cfg(feature = "jam-host")]
+    fn finish_jam(&mut self, result: jam::lifecycle::Completed) {
+        let epoch = *self.session.borrow();
+        if !self.signed_in {
+            self.jam.retire(epoch, jam::lifecycle::Cause::Account);
+            return;
+        }
+        let account = self.api.account();
+        self.jam.finish(
+            result,
+            account.as_ref().map(|account| account.as_str()),
+            epoch,
+        );
     }
 
     /// Build before replacing either transport configuration. A rejected
@@ -1877,6 +1950,13 @@ impl Worker {
             self.waker.clone(),
         ));
         while let Some(command) = commands.recv().await {
+            // Internal completions must be fenced even while proxy restoration
+            // defers user requests. They never initiate remote work.
+            #[cfg(feature = "jam-host")]
+            if let Command::JamFinished(result) = command {
+                self.finish_jam(*result);
+                continue;
+            }
             if self.restoring_proxy
                 && !matches!(
                     &command,
@@ -1892,6 +1972,10 @@ impl Worker {
                 continue;
             }
             match command {
+                #[cfg(feature = "jam-host")]
+                Command::Jam(request) => self.request_jam(request),
+                #[cfg(feature = "jam-host")]
+                Command::JamFinished(result) => self.finish_jam(*result),
                 Command::OpenThemesFolder => {
                     let directory = self.dirs.config.join("themes");
                     let events = self.events.clone();
@@ -2075,6 +2159,9 @@ impl Worker {
                         if source == ApiSource::Personal {
                             self.emit(Event::WebApp { client_id: None });
                         } else {
+                            #[cfg(feature = "jam-host")]
+                            self.jam
+                                .retire(*self.session.borrow(), jam::lifecycle::Cause::Account);
                             self.signed_in = false;
                             self.emit(Event::Auth(AuthStatus::Failed(
                                 "Your Spotify sign-in expired. Please sign in again.".into(),
@@ -2501,6 +2588,9 @@ impl Worker {
                 }
             }
         }
+        #[cfg(feature = "jam-host")]
+        self.jam
+            .retire(*self.session.borrow(), jam::lifecycle::Cause::Engine);
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
@@ -2727,6 +2817,9 @@ impl Worker {
             ),
         };
         if source == ApiSource::Shared || !other_ready {
+            #[cfg(feature = "jam-host")]
+            self.jam
+                .retire(*self.session.borrow(), jam::lifecycle::Cause::Account);
             self.signed_in = false;
             self.emit(Event::Auth(AuthStatus::Failed(message.clone())));
         }
@@ -2740,9 +2833,22 @@ impl Worker {
         {
             return;
         }
+        #[cfg(feature = "jam-host")]
+        if self
+            .api
+            .account()
+            .as_ref()
+            .is_some_and(|account| account.as_str() != user.id)
+        {
+            self.jam
+                .retire(*self.session.borrow(), jam::lifecycle::Cause::Account);
+        }
         if let Err(error) = self.api.install(source, AccountId::new(user.id.clone())) {
             self.api.clear(source);
             if source == ApiSource::Shared {
+                #[cfg(feature = "jam-host")]
+                self.jam
+                    .retire(*self.session.borrow(), jam::lifecycle::Cause::Account);
                 self.signed_in = false;
                 self.emit(Event::Auth(AuthStatus::Failed(error.to_string())));
             }
@@ -2950,6 +3056,11 @@ impl Worker {
 
     /// Cancels in-flight account work and drops cached Home data on sign-out.
     fn sign_out(&mut self) {
+        #[cfg(feature = "jam-host")]
+        self.jam.retire(
+            self.session.borrow().wrapping_add(1),
+            jam::lifecycle::Cause::Account,
+        );
         self.spotify_restore_started = true;
         self.cancel_search();
         self.signed_in = false;
@@ -3069,6 +3180,9 @@ impl Worker {
         if !self.signed_in {
             return;
         }
+        #[cfg(feature = "jam-host")]
+        self.jam
+            .retire(*self.session.borrow(), jam::lifecycle::Cause::Engine);
         if defer_engine_replace(self.engine_busy, &mut self.engine_restart_pending) {
             return;
         }
@@ -3167,6 +3281,9 @@ impl Worker {
     /// comes back at the level it was heard at, not at the level the app
     /// launched with.
     fn take_engine_for_resume(&mut self) {
+        #[cfg(feature = "jam-host")]
+        self.jam
+            .retire(*self.session.borrow(), jam::lifecycle::Cause::Engine);
         self.resume_verify = None;
         self.album_type_lookup.requeue_active_for_new_engine();
         self.playlist_header_lookup.requeue_active_for_new_engine();
@@ -3448,6 +3565,13 @@ impl Worker {
                     self.resume_verify = Some((spec, 0));
                     self.schedule_resume_check(1_500);
                 }
+                #[cfg(feature = "jam-host")]
+                self.jam.attach(
+                    engine.session().clone(),
+                    self.session.subscribe(),
+                    Arc::clone(&self.api),
+                    Arc::clone(&self.background_session),
+                );
                 self.engine = Some(engine);
                 self.start_rootlist();
                 self.reconnects.clear();
@@ -3511,6 +3635,9 @@ impl Worker {
     fn on_account_checked(&mut self, premium: Option<bool>) {
         self.premium = premium;
         if premium == Some(false) {
+            #[cfg(feature = "jam-host")]
+            self.jam
+                .retire(*self.session.borrow(), jam::lifecycle::Cause::Engine);
             self.album_type_lookup.clear_engine_work();
             self.playlist_header_lookup.clear_engine_work();
             self.carry_volume();

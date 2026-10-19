@@ -6,8 +6,9 @@ nav_exclude: true
 ---
 
 The `jam-host` Cargo feature is off by default. It exposes `backend::jam`
-without connecting it to UI actions, settings, startup, playback, or sign-in.
-Compiling or constructing a kernel sends nothing. This is local development
+and deliberate backend commands, with passive lifecycle binding on engine
+acceptance. It has no UI actions, settings, automatic Jam HTTP requests or audio
+commands. Compiling or constructing a kernel sends nothing. This is local development
 toward Jam support, not a usable or remotely validated Jam feature.
 
 ## Candidate protocol
@@ -80,11 +81,43 @@ authenticating, opening sockets, or creating a playback engine. It covers
 request shape, role and freshness gates, one mutation, verification, parser
 limits, cancellation, timeouts, concurrent calls and lifecycle fences.
 
-Before enabling runtime actions: review the kernel, integrate lifecycle
-invalidation and read budgets with the backend, validate contracts with an
+Before user activation: review the integration, validate contracts with an
 explicitly authorized coordinated host/member test, and approve the UI design.
-The backend must call `Kernel::invalidate` on a Jam transition before accepting
-another session's events or commands. This unit attaches no Dealer listener;
-its operation revision fences that explicit invalidation, and End also requires
-the named ID to match the current owner snapshot.
 App availability documentation remains unchanged until that evidence exists.
+
+## Backend lifecycle binding
+
+`Command::Jam(lifecycle::Request)` is the only deliberate entry point. Echo
+`Backend::jam_stamp()` or the stamp of the last observed state; requests carry
+Current, Create intent, or the named End intent. No UI Action is added.
+`Backend::poll_jam()` exposes a separate, coalesced watch state. This keeps
+memory bounded even without a UI consumer. Phases distinguish pending,
+completion and invalidation, with fixed errors. Completion is not a success
+claim: inspect the snapshot's error and membership.
+
+Stamps cover account, engine, binding revision and operation. Old intentions,
+queued completions and states awaiting consumption are fenced. Busy rejection
+does not replace the identity of the operation already running. Logout,
+engine retirement/replacement, lost account verification, and context changes
+invalidate before retiring work. A transport epoch is advanced before aborting
+tasks, so a delayed read cannot begin after retirement. Only Current requests,
+including the kernel's successful-write verification, acquire the backend's
+existing four-slot background_session semaphore. Writes remain serialized and
+are never retried. The kernel deadline also covers waiting for that read slot.
+
+On engine acceptance, two listeners reuse its Dealer before a read is allowed:
+social-connect/v2/session_update and hm://pusher/v1/connections/. Jam payloads
+are discarded, not parsed as member/owner truth. Every notification conservatively
+invalidates to Unknown, cancels pending work and fences already queued results.
+This includes notifications caused by our own writes: they can leave the outcome
+uncertain, requiring a new deliberate Current, without retrying the mutation.
+The connection header is compared with the Session's installed connection ID;
+it is not exposed in events. A missing header blocks readiness. Stream end/error
+leaves NotReady until a new engine binding; no subscription repair or polling
+is introduced. No notification establishes Absent.
+
+The pin exposes connection identity, not a public acknowledgement that Connect
+registration has finished. No readiness timer is invented. These local fences
+and candidate requests still require a coordinated real registration/host test;
+an engine Ready notification alone is not remote Jam acceptance. The existing
+client-token dependency trace caveat remains open before account tests.

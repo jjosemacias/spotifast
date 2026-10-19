@@ -121,8 +121,8 @@ The complete guide lives at **[spotifast.rocks](https://spotifast.rocks/)**.
 ## Contributing
 
 The optional `jam-host` development feature exposes a candidate host lifecycle
-kernel, with offline tests, through `backend::jam`. It has no UI or startup
-activation and does not make Jam available in the app. See the
+kernel and backend commands, with offline tests, through `backend::jam`. It has
+no UI or automatic Jam requests and does not make Jam available in the app. See the
 [kernel contract](docs/_reference/jam-host-kernel.md) for its limits.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull

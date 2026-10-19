@@ -446,12 +446,14 @@ does not save or log the token.
 
 ## The engine
 
-The optional development feature `jam-host` adds no startup work or UI action.
-Its [candidate host kernel](../jam-host-kernel/) can only be called explicitly
-on an existing registered playback session. It does not open another session,
-start audio, or make Jam available in the app. Its mutation requests use a
-single application dispatch and explicit reconciliation, rather than the
-general SpClient retry helpers.
+The optional development feature `jam-host` passively binds the existing
+playback session to backend Jam commands. Its [candidate host kernel](../jam-host-kernel/)
+has no UI action or automatic Jam HTTP requests. Dealer notifications only
+invalidate pending state; they do not establish membership. Deliberate reads
+and successful-write verification share the existing session read budget.
+It opens no other session, starts no audio, and does not make Jam available
+in the app. Mutations use a single application dispatch and explicit
+reconciliation rather than the general SpClient retry helpers.
 
 Playback runs on a separate runtime. Librespot maintains the Spotify Connect
 session, exposes this computer as a device, receives transfers, and reports

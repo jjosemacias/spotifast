@@ -131,8 +131,8 @@ The Web API and librespot do not provide these features:
   generates these for its own clients. Spotifast only has plain shuffle.
   A Blend that a Spotify app already made opens like any playlist, with
   who added each song, but Spotifast cannot start or manage one.
-  The optional development-only `jam-host` kernel is not connected to the
-  app and does not change this availability. See its
+  The optional `jam-host` development backend has no user interface or real
+  runtime validation and does not change this availability. See its
   [candidate contract](../jam-host-kernel/) for the unverified protocol limits.
 - **Spotify DJ.** Its special playlist context does not expose playable tracks
   to librespot, so Spotifast leaves its card out of Made for you. See

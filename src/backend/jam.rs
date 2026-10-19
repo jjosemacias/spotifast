@@ -1,9 +1,10 @@
-//! Opt-in, candidate Jam host lifecycle. Nothing in the app starts this kernel.
+//! Opt-in, candidate Jam host lifecycle with deliberate backend commands.
 //!
 //! Reuses a registered engine's Session; never opens a Session or controls audio.
 //! Candidate routes: Tu2525/librespot docs/jam.md at 09785618, Requests.
 //! The implementation is independent of PR935. Remote semantics remain unverified.
 
+pub mod lifecycle;
 mod projection;
 
 use std::future::Future;
@@ -356,6 +357,7 @@ fn membership(reply: Reply, _profile: &Profile) -> Result<Membership, Error> {
     Ok(Membership::Present(projection))
 }
 
+#[derive(Clone)]
 pub struct Snapshot {
     pub membership: Membership,
     /// Includes cancellation and ambiguous writes. Cleared only by a fresh read.

@@ -18,6 +18,14 @@ pub(super) const WINAMP_SHORTCUT: &str = platform_shortcut("Ctrl+M", "Cmd+Shift+
 pub(super) const MILKDROP_SHORTCUT: &str = platform_shortcut("Ctrl+Shift+K", "Cmd+Shift+K");
 
 pub fn handle(app: &mut App, ctx: &egui::Context) {
+    #[cfg(feature = "jam-host")]
+    if app.jam.confirmation.is_some() {
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+            super::jam::enqueue(app, crate::model::jam::Intent::CancelEnd);
+        }
+        return;
+    }
+
     let typing = ctx.memory(|memory| memory.focused().is_some());
     // A focused song row still takes Ctrl+arrow to change songs; a text
     // field uses those keys to move its caret.
@@ -175,7 +183,9 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     if forward {
         app.actions.push(Action::Forward);
     }
-    if ctx.input(|input| input.key_pressed(Key::Escape)) {
+    if ctx.input(|input| input.key_pressed(Key::Escape))
+        && (!cfg!(feature = "jam-host") || !egui::Popup::is_any_open(ctx))
+    {
         if app.dialog.is_some() {
             app.actions.push(Action::CloseDialog);
         } else if app.show_devices {
@@ -192,6 +202,8 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             {
                 app.show_devices = false;
             }
+        } else if cfg!(feature = "jam-host") && app.show_queue_panel {
+            app.actions.push(Action::ToggleQueuePanel);
         } else if app.lyrics_fullscreen.is_some() {
             app.actions.push(Action::SetLyricsFullscreen(false));
         }

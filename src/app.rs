@@ -3151,7 +3151,7 @@ impl App {
 
     fn tick(&mut self, ctx: &egui::Context) {
         #[cfg(feature = "jam-host")]
-        self.consume_jam();
+        self.consume_jam(ctx);
         self.poll_custom_themes(ctx);
         if let Some(wait) = self.window_focus(ctx.input(|input| {
             // A minimised window is away even where it keeps focus.
@@ -9476,7 +9476,7 @@ impl App {
     /// and scheduling any backend work or preference persistence it requires.
     pub(crate) fn apply(&mut self, action: Action, ctx: &egui::Context) {
         #[cfg(feature = "jam-host")]
-        self.consume_jam();
+        self.consume_jam(ctx);
         if matches!(
             &action,
             Action::Open(_)

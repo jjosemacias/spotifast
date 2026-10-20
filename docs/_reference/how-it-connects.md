@@ -448,7 +448,7 @@ does not save or log the token.
 
 The optional development feature `jam-host` passively binds the existing
 playback session to backend Jam commands. Its [candidate host kernel](../jam-host-kernel/)
-has an experimental Connect UI with deliberate actions and no automatic Jam
+has an experimental queue/Connect UI with deliberate actions and no automatic Jam
 HTTP requests. Dealer notifications only
 invalidate pending state; they do not establish membership. Deliberate reads
 and successful-write verification share the existing session read budget.
@@ -582,15 +582,19 @@ it never automatically repeats a mutation. Requests have a 20-second deadline.
 Sign-out cancels work, stale session/page generations are ignored, and a new
 link or history navigation cannot be overwritten by an older response.
 
-## Experimental Jam in Connect
+## Experimental Jam in the queue and Connect
 
-The optional `jam-host` build adds a host-only section inside Connect. Opening
-it performs no Jam I/O. Check is deliberate and uses the existing playback
+The optional `jam-host` build places management above the existing queue and a
+36-point membership strip below the player. Connect keeps devices and a compact
+Create/summary entry. Opening either surface or following Manage Jam performs no
+Jam I/O or playback command, and dispatches no extra queue refresh. The existing
+visible queue keeps its usual updates. The strip shows confirmed membership,
+not synchronized audio; expired or uncertain state uses a neutral surface. Check is deliberate and uses the existing playback
 session read budget. Create requires a fresh absence check and local playback;
 End requires a fresh host projection and an explicit named-Jam confirmation.
 Pending actions block duplicates and never retry a write. Watch events only
 invalidate or present state; no timer, Dealer notice, popup reopen or startup
-creates or refreshes a Jam. Closing Connect never sends Leave or End. Account
+creates or refreshes a Jam. Closing Connect or the queue never sends Leave or End. Account
 and engine changes retire authority and confirmations before a new context can
 act. See the [local candidate contract](/jam-host-kernel/) for unavailable
 capabilities and the limits of offline validation.

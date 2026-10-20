@@ -120,13 +120,17 @@ The complete guide lives at **[spotifast.rocks](https://spotifast.rocks/)**.
 
 ## Contributing
 
-The optional `jam-host` development feature adds an experimental Jam section
-inside Connect. It can deliberately check membership, create after a fresh
-absence check while playing locally, and request host termination after a
-separate confirmation. Opening Connect sends no Jam request. The feature is off
-by default and has only offline validation; it is not complete Jam support.
-Joining, participant exit, invitations, members, permissions and shared queue
-commands remain unavailable. See the [candidate contract](docs/_reference/jam-host-kernel.md).
+The optional `jam-host` development feature adds Jam management above the existing
+queue and a 36-point membership strip below the player. Connect keeps devices,
+Start a Jam, and a summary that opens management. Both Create entries share the
+same fresh absence/local playback gates and pending operation. Opening management
+sends no Jam request or audio command. Check Jam state is deliberate. The strip
+is green only for fresh confirmed membership; unconfirmed state is neutral.
+Closing a view never leaves or ends a Jam. End requires fresh host authority and
+confirmation, and verifies only this account's absence, not an end for everyone.
+The feature is off by default with offline validation only. Invitations,
+participants, Join/Leave, permissions, shared queue and synchronized audio remain
+unavailable. See the [candidate contract](docs/_reference/jam-host-kernel.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull
 request. To look at the interface without a Spotify account, run:

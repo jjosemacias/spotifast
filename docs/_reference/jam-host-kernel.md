@@ -6,16 +6,16 @@ nav_exclude: true
 ---
 
 The `jam-host` Cargo feature is off by default. It adds a native experimental
-Jam section to the existing Connect popup and uses `backend::jam` with passive
+Jam management to the existing queue and a compact Connect summary and uses `backend::jam` with passive
 lifecycle binding on engine acceptance. There are no settings, startup Jam
 requests, automatic refreshes or added audio commands. Compiling, constructing
 a kernel and opening Connect send no Jam request. Only synthetic offline
 validation is available; this is an incomplete local development unit.
 
-## Connect host UI
+## Queue, membership strip and Connect
 
 - Choose **Check Jam state** deliberately. It is a read, never creation. A fresh
-  confirmed absence and active local playback enable **Create Jam**. A stale
+  confirmed absence and active local playback enable **Start a Jam**. A stale
   snapshot requires another deliberate check, without automatic chaining.
 - The four membership fields are the only current projection. They do not
   supply participants, invitations, policy or shared queue permissions. These
@@ -33,20 +33,38 @@ validation is available; this is an incomplete local development unit.
   to the kernel's post-write check. There is no lazy pre-write read.
 - A successful End currently verifies only this account's absence. UI does not
   claim that global termination, link invalidation or audio changes were observed.
-- Closing Connect, Escape and outside click never leave or end a Jam. Closing
+- Connect keeps devices, Create and a summary. Manage Jam opens and focuses the
+  queue's Jam heading, selecting Queue instead of Recent. Repeated access never
+  toggles the queue closed. The existing Queue page stays a page; no responsive
+  switch or new minimum window size is introduced. Creation opens management
+  only after fresh confirmed membership. Opening management does not read Current,
+  dispatch an extra queue refresh, transfer devices or control playback. Existing
+  visible-queue updates continue normally.
+- The 36-point strip sits below the unchanged 88-point player. Only fresh
+  presence uses the accent background, with Host/Participant text; Unknown,
+  expiration and pending use neutral text/surface. Fresh absence removes it.
+  Check Jam state on the strip opens recovery; the read requires a separate
+  deliberate gesture in management. It does not certify audio synchronization.
+- The Jam block precedes queue loading/error/empty states in its existing scroll.
+  Recent, Save, local manual/context queues and duplicate occurrences retain
+  their existing data and controls. Local queue availability does not certify
+  a remote shared queue or permission to edit one.
+- Closing Connect, the queue, Escape and outside click never leave or end a Jam. Closing
   preserves a submitted operation; context invalidation clears its authority.
   A closed-popup error produces a discrete notice without opening or focusing it.
 - Existing devices, discovery and playback setup remain in Connect. Once Jam is
   deliberately inspected, device transfers are stopped while membership is
   present or uncertain because continuity is not established. Default builds
-  retain the existing transfer behavior. No Player/Spirc or queue changes.
+  retain the existing transfer behavior. No Player/Spirc commands or queue ownership changes.
 - Join, participant Leave (including the unresolved 405), sharing, member
   management, permissions and queue/control capabilities remain separate pending
   product requirements. This feature does not satisfy the complete Jam scope.
 
 For synthetic native preview, build with `--no-default-features --features
 jam-host,demo` and use `--demo --demo-show jam-owner` (also `jam-unknown`,
-`jam-absent`, `jam-participant`, `jam-pending`, `jam-error`, `jam-end`). These
+`jam-absent`, `jam-participant`, `jam-pending`, `jam-error`, `jam-end`).
+Append `,jam-connect` for Connect, or `,jam-page` to select the existing Queue
+page explicitly for a 760x520 preview. `,light` selects the light theme. These
 fixtures never supply authority to the backend and use the existing offline demo.
 Normal development builds without `jam-host` contain no Jam UI. No new credentials,
 saved Jam state or storage migration is introduced. New UI phrases use the

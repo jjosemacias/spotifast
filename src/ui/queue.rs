@@ -191,6 +191,8 @@ fn queue_drop(ui: &egui::Ui, rect: egui::Rect) -> Option<Arc<DragTrack>> {
 const SECTION_GAP: f32 = 14.0;
 
 fn contents(app: &mut App, ui: &mut egui::Ui, compact: bool) {
+    #[cfg(feature = "jam-host")]
+    super::jam::section(app, ui);
     let palette = app.palette;
     // Neither the Web API nor librespot can reorder or insert into a live
     // remote queue, so without local playback active every drop just

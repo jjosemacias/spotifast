@@ -7,23 +7,49 @@ use crate::backend::jam::{
 use crate::model::jam::{Confirmation, Intent};
 
 impl App {
-    pub(super) fn consume_jam(&mut self) {
+    pub(super) fn consume_jam(&mut self, ctx: &egui::Context) {
+        let had_confirmation = self.jam.confirmation.is_some();
         let event = self.backend.poll_jam();
         let live = self.backend.jam_stamp();
         if let Some(event) = event
             && self.jam.observe(&event, live)
-            && event.snapshot.error.is_some()
-            && !self.show_devices
         {
-            self.toast(gettext(
-                self.locale,
-                "The Jam needs attention. Open Connect to check its state.",
-            ));
+            if matches!(event.phase, lifecycle::Phase::Complete(Kind::Create))
+                && event.snapshot.error.is_none()
+                && self.jam.fresh()
+                && matches!(
+                    self.jam.membership,
+                    crate::backend::jam::Membership::Present(_)
+                )
+            {
+                self.open_jam_management(ctx);
+            }
+            if event.snapshot.error.is_some()
+                && !self.show_devices
+                && !(self.show_queue_panel && self.queue_tab == QueueTab::Queue)
+                && !matches!(self.page(), Page::Queue)
+            {
+                self.toast(gettext(
+                    self.locale,
+                    "The Jam needs attention. Open the queue to check its state.",
+                ));
+            }
         }
         self.jam.sync(live);
-        if !self.jam.fresh() && self.jam.confirmation.take().is_some() {
+        if had_confirmation && (!self.jam.fresh() || self.jam.confirmation.is_none()) {
+            self.jam.confirmation = None;
             self.jam.notice = Some("The Jam changed. Check its state before continuing.");
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
         }
+    }
+
+    fn open_jam_management(&mut self, ctx: &egui::Context) {
+        self.leave_lyrics_fullscreen(ctx);
+        self.show_devices = false;
+        self.show_lyrics_panel = false;
+        self.queue_tab = QueueTab::Queue;
+        self.show_queue_panel = !matches!(self.page(), Page::Queue);
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
     }
 
     pub(super) fn jam_used(&self) -> bool {
@@ -31,13 +57,17 @@ impl App {
     }
 
     pub(super) fn apply_jam(&mut self, action: crate::model::jam::UiAction, ctx: &egui::Context) {
-        self.consume_jam();
+        self.consume_jam(ctx);
         let intent = action.intent;
         if !matches!(intent, Intent::Close | Intent::CancelEnd) && action.expected != self.jam.stamp
         {
             return;
         }
         match intent {
+            Intent::Manage => {
+                self.open_jam_management(ctx);
+                return;
+            }
             Intent::Close => {
                 self.show_devices = false;
                 self.jam.confirmation = None;

@@ -12,6 +12,7 @@ pub enum Intent {
     CancelEnd,
     ConfirmEnd,
     Close,
+    Manage,
 }
 
 #[derive(Clone, Copy, Debug)]

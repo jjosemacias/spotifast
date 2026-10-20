@@ -710,7 +710,9 @@ fn sample_lyrics() -> crate::lyrics::Lyrics {
 pub(crate) fn jam_fixture(app: &mut App, scene: &str) {
     use crate::backend::jam::{Membership, Projection, lifecycle::Kind};
     use crate::model::jam::{Confirmation, State};
-    app.show_devices = true;
+    app.show_devices = false;
+    app.show_queue_panel = !matches!(app.page(), Page::Queue);
+    app.queue_tab = QueueTab::Queue;
     app.jam = State {
         stamp: app.backend.jam_stamp(),
         engaged: true,
@@ -1003,6 +1005,14 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             #[cfg(feature = "jam-host")]
             "jam-unknown" | "jam-absent" | "jam-owner" | "jam-participant" | "jam-pending"
             | "jam-error" | "jam-end" => jam_fixture(app, surface),
+            #[cfg(feature = "jam-host")]
+            "jam-connect" => app.show_devices = true,
+            #[cfg(feature = "jam-host")]
+            "jam-page" => {
+                app.history = vec![Page::Queue];
+                app.history_index = 0;
+                app.show_queue_panel = false;
+            }
             "devices" => app.show_devices = true,
             "sonos-idle" => sonos_devices(app, false),
             "sonos-active" => sonos_devices(app, true),
@@ -1466,7 +1476,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |_| crate::ui::devices::popup(app, &ctx),
+                |ui| crate::ui::show(app, ui),
             );
             output.textures_delta.clear();
         };
@@ -1566,6 +1576,13 @@ mod tests {
         use crate::model::jam::{Intent, UiAction};
         let (ctx, mut app) = accessible_app("jam-focus-return");
         jam_fixture(&mut app, "jam-owner");
+        app.apply(
+            Action::Jam(UiAction {
+                intent: Intent::Manage,
+                expected: app.jam.stamp,
+            }),
+            &ctx,
+        );
         let draw = |app: &mut App| {
             let mut output = ctx.run_ui(
                 egui::RawInput {
@@ -1575,7 +1592,7 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |_| crate::ui::devices::popup(app, &ctx),
+                |ui| crate::ui::show(app, ui),
             );
             output.textures_delta.clear();
         };
@@ -1631,6 +1648,7 @@ mod tests {
                         accessible_app(&format!("{scene}-{}-{}", size.x, palette.dark));
                     app.palette = palette;
                     jam_fixture(&mut app, scene);
+                    app.show_devices = true;
                     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
                     ctx.data_mut(|data| {
                         data.insert_temp(
@@ -1667,6 +1685,208 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "jam-host")]
+    fn jam_frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ui| crate::ui::show(app, ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_management_is_idempotent_navigation_without_requests_or_another_queue() {
+        use crate::model::jam::{Intent, UiAction};
+        let (ctx, mut app) = accessible_app("jam-navigation");
+        jam_fixture(&mut app, "jam-owner");
+        app.queue_tab = QueueTab::Recents;
+        app.show_devices = true;
+        for _ in 0..2 {
+            app.apply(
+                Action::Jam(UiAction {
+                    intent: Intent::Manage,
+                    expected: app.jam.stamp,
+                }),
+                &ctx,
+            );
+            assert!(app.show_queue_panel);
+            assert_eq!(app.queue_tab, QueueTab::Queue);
+            assert!(!app.show_devices);
+        }
+        let size = egui::vec2(1200.0, 760.0);
+        jam_frame(&ctx, &mut app, size, vec![]);
+        jam_frame(&ctx, &mut app, size, vec![]);
+        assert!(ctx.memory(|memory| memory.focused()).is_some());
+        app.apply(Action::ToggleQueuePanel, &ctx);
+        assert!(!app.show_queue_panel);
+        assert!(matches!(
+            app.jam.membership,
+            crate::backend::jam::Membership::Present(_)
+        ));
+        app.history = vec![Page::Queue];
+        app.history_index = 0;
+        app.show_queue_panel = true;
+        app.apply(
+            Action::Jam(UiAction {
+                intent: Intent::Manage,
+                expected: app.jam.stamp,
+            }),
+            &ctx,
+        );
+        assert!(!app.show_queue_panel, "Queue page owns the existing queue");
+        assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        app.backend.shutdown();
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_create_from_connect_and_queue_share_one_pending_dispatch() {
+        use crate::backend::jam::lifecycle::Kind;
+        let (ctx, mut app) = accessible_app("jam-two-entries");
+        jam_fixture(&mut app, "jam-absent");
+        app.local.connected = true;
+        app.local.track = Some(crate::player::LocalTrack::default());
+        app.local.playback = crate::player::Playback::Playing;
+        app.show_devices = true;
+        let size = egui::vec2(1200.0, 760.0);
+        jam_frame(&ctx, &mut app, size, vec![]);
+        let output = jam_frame(&ctx, &mut app, size, vec![]);
+        let entries: Vec<_> = menu_text(&output)
+            .into_iter()
+            .filter(|(text, _)| text == "Start a Jam")
+            .collect();
+        assert_eq!(entries.len(), 2, "one Create on each surface");
+        let expected = app.jam.stamp;
+        let mut gestures = Vec::new();
+        for (_, rect) in entries {
+            app.actions.clear();
+            jam_frame(
+                &ctx,
+                &mut app,
+                size,
+                pointer_click(rect.center(), egui::PointerButton::Primary),
+            );
+            let intent = app
+                .actions
+                .drain(..)
+                .find(|action| {
+                    matches!(
+                        action,
+                        Action::Jam(crate::model::jam::UiAction {
+                            intent: crate::model::jam::Intent::Create,
+                            ..
+                        })
+                    )
+                })
+                .expect("Create gesture from the native button");
+            gestures.push(intent);
+        }
+        for intent in gestures {
+            app.apply(intent, &ctx);
+            // Replaying the other surface's same-frame intention cannot write twice.
+            app.apply(
+                Action::Jam(crate::model::jam::UiAction {
+                    intent: crate::model::jam::Intent::Create,
+                    expected,
+                }),
+                &ctx,
+            );
+        }
+        assert_eq!(
+            *app.backend.jam_requests.lock().unwrap(),
+            vec![Kind::Create]
+        );
+        assert_eq!(app.jam.pending, Some(Kind::Create));
+        assert!(!app.jam.fresh());
+        app.backend.shutdown();
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_bar_requires_fresh_presence_and_keeps_player_geometry() {
+        use crate::backend::jam::Membership;
+        for size in [egui::vec2(1200.0, 760.0), egui::vec2(760.0, 520.0)] {
+            let (ctx, mut app) = accessible_app(&format!("jam-bar-{}", size.x));
+            jam_fixture(&mut app, "jam-owner");
+            if size.x < 1000.0 {
+                app.history = vec![Page::Queue];
+                app.history_index = 0;
+                app.show_queue_panel = false;
+            }
+            for _ in 0..2 {
+                jam_frame(&ctx, &mut app, size, vec![]);
+            }
+            for (id, height) in [
+                ("jam-bar", 36.0),
+                ("player-bar", crate::theme::PLAYER_BAR_HEIGHT),
+            ] {
+                assert_eq!(
+                    egui::containers::panel::PanelState::load(&ctx, egui::Id::new(id))
+                        .unwrap()
+                        .size()
+                        .y,
+                    height
+                );
+            }
+            app.jam.fresh_until = Some(tokio::time::Instant::now());
+            let output = jam_frame(&ctx, &mut app, size, vec![]);
+            let texts = menu_text(&output);
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, _)| text == "Jam · State unconfirmed")
+            );
+            assert!(!texts.iter().any(|(text, _)| text == "Your Jam · Host"));
+            app.jam.membership = Membership::Absent;
+            app.jam.reconcile = false;
+            app.jam.fresh_until =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(15));
+            assert!(!crate::ui::jam::bar_visible(&app));
+            app.jam.start(crate::backend::jam::lifecycle::Kind::Create);
+            assert!(crate::ui::jam::bar_visible(&app));
+            assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+            app.backend.shutdown();
+        }
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_queue_failure_keeps_management_and_recents_has_no_duplicate_management() {
+        let (ctx, mut app) = accessible_app("jam-queue-error");
+        jam_fixture(&mut app, "jam-owner");
+        app.queue = Loadable::Failed("Synthetic queue error".into());
+        let size = egui::vec2(1200.0, 760.0);
+        for _ in 0..2 {
+            jam_frame(&ctx, &mut app, size, vec![]);
+        }
+        let output = jam_frame(&ctx, &mut app, size, vec![]);
+        assert!(
+            menu_text(&output)
+                .iter()
+                .any(|(text, _)| text == "End Jam…")
+        );
+        app.queue_tab = QueueTab::Recents;
+        let output = jam_frame(&ctx, &mut app, size, vec![]);
+        assert!(
+            !menu_text(&output)
+                .iter()
+                .any(|(text, _)| text == "End Jam…")
+        );
+        assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        app.backend.shutdown();
     }
 
     fn accessible_app(name: &str) -> (egui::Context, App) {
@@ -4299,25 +4519,6 @@ mod tests {
         draw(&mut app, vec![]);
         app.devices = discovered;
         draw(&mut app, vec![]);
-        #[cfg(feature = "jam-host")]
-        {
-            // The approved combined surface has a bounded height. Its Devices
-            // shortcut must give the existing picker its usable viewport.
-            let output = draw(&mut app, vec![]);
-            let devices = menu_text(&output)
-                .into_iter()
-                .find(|(text, _)| text == "Devices")
-                .expect("the Devices shortcut is visible")
-                .1
-                .center();
-            draw(
-                &mut app,
-                pointer_click(devices, egui::PointerButton::Primary),
-            );
-            for _ in 0..30 {
-                draw(&mut app, vec![]);
-            }
-        }
         let output = draw(&mut app, vec![]);
         let visible_speakers = output
             .shapes

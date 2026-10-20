@@ -8,7 +8,7 @@ pub(crate) mod devices;
 mod dialogs;
 pub mod home;
 #[cfg(feature = "jam-host")]
-mod jam;
+pub(crate) mod jam;
 mod keys;
 pub mod library;
 pub mod login;
@@ -65,6 +65,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ),
         );
     }
+    #[cfg(feature = "jam-host")]
+    jam::bar(app, ui);
     player_bar::show(app, ui);
     if app.lyrics_fullscreen.is_some() {
         lyrics::fullscreen(app, ui);
@@ -82,10 +84,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         keep_room_for_panels(app, ctx);
     }
     devices::popup(app, ctx);
+    #[cfg(feature = "jam-host")]
+    jam::confirmation(app, ctx);
     dialogs::show(app, ctx);
     update::show(app, ctx);
     widgets::drag_ghost(ctx, &app.palette, app.locale);
-    toasts(app, ctx, theme::PLAYER_BAR_HEIGHT + 16.0);
+    let toast_offset = theme::PLAYER_BAR_HEIGHT + 16.0;
+    #[cfg(feature = "jam-host")]
+    let toast_offset = toast_offset + if jam::bar_visible(app) { 36.0 } else { 0.0 };
+    toasts(app, ctx, toast_offset);
     caption_buttons(ui, &app.palette, app.locale);
     fastframe_titlebar::resize(ui);
 }

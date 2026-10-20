@@ -123,15 +123,17 @@ authenticating, opening sockets, or creating a playback engine. It covers
 request shape, role and freshness gates, one mutation, verification, parser
 limits, cancellation, timeouts, concurrent calls and lifecycle fences.
 
-Before user activation: review the integration, validate contracts with an
-explicitly authorized coordinated host/member test, and approve the UI design.
-App availability documentation remains unchanged until that evidence exists.
+Before enabling by default: independently review the integration and UI, and
+validate contracts with an explicitly authorized coordinated host/member test.
+Default app availability remains unchanged until that evidence exists. The
+experimental opt-in UI above does not satisfy those gates.
 
 ## Backend lifecycle binding
 
 `Command::Jam(lifecycle::Request)` is the only deliberate entry point. Echo
 `Backend::jam_stamp()` or the stamp of the last observed state; requests carry
-Current, Create intent, or the named End intent. No UI Action is added.
+Current, Create intent, or the named End intent. The Connect view emits a UI
+Action; app.rs applies it after drawing and sends these deliberate requests.
 `Backend::poll_jam()` exposes a separate, coalesced watch state. This keeps
 memory bounded even without a UI consumer. Phases distinguish pending,
 completion and invalidation, with fixed errors. Completion is not a success

@@ -448,10 +448,11 @@ does not save or log the token.
 
 The optional development feature `jam-host` passively binds the existing
 playback session to backend Jam commands. Its [candidate host kernel](../jam-host-kernel/)
-has no UI action or automatic Jam HTTP requests. Dealer notifications only
+has an experimental Connect UI with deliberate actions and no automatic Jam
+HTTP requests. Dealer notifications only
 invalidate pending state; they do not establish membership. Deliberate reads
 and successful-write verification share the existing session read budget.
-It opens no other session, starts no audio, and does not make Jam available
+It opens no other session, starts no audio, and does not provide complete Jam support
 in the app. Mutations use a single application dispatch and explicit
 reconciliation rather than the general SpClient retry helpers.
 

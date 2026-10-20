@@ -210,7 +210,7 @@ pub(super) fn section(app: &mut App, ui: &mut egui::Ui) {
                     );
                 }
                 text(app, ui, "Invitation unavailable. Permissions unconfirmed.");
-                text(app, ui, "Local queue; shared queue unconfirmed.");
+                text(app, ui, "Playback queue; shared queue unconfirmed.");
                 text(app, ui, "Audio state is unconfirmed");
             }
             Membership::Unknown => (),

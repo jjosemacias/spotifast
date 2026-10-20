@@ -179,7 +179,19 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         if app.dialog.is_some() {
             app.actions.push(Action::CloseDialog);
         } else if app.show_devices {
-            app.show_devices = false;
+            #[cfg(feature = "jam-host")]
+            super::jam::enqueue(
+                app,
+                if app.jam.confirmation.is_some() {
+                    crate::model::jam::Intent::CancelEnd
+                } else {
+                    crate::model::jam::Intent::Close
+                },
+            );
+            #[cfg(not(feature = "jam-host"))]
+            {
+                app.show_devices = false;
+            }
         } else if app.lyrics_fullscreen.is_some() {
             app.actions.push(Action::SetLyricsFullscreen(false));
         }

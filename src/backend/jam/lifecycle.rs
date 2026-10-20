@@ -32,7 +32,7 @@ pub enum Action {
 }
 
 impl Action {
-    fn kind(&self) -> Kind {
+    pub(crate) fn kind(&self) -> Kind {
         match self {
             Self::Current => Kind::Current,
             Self::Create(_) => Kind::Create,
@@ -169,6 +169,7 @@ fn factory<T: Transport + 'static>(
 
 fn unknown(error: Option<Error>) -> Snapshot {
     Snapshot {
+        fresh_until: None,
         membership: Membership::Unknown,
         reconcile_required: true,
         error,

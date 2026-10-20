@@ -233,7 +233,7 @@ winresource = "0.1"
 default = ["milkdrop"]
 # Sample data and screenshot flags; never part of a release build.
 demo = []
-# Candidate host lifecycle only. No UI or automatic runtime activation.
+# Experimental host UI in Connect. Deliberate reads/writes only; off by default.
 jam-host = ["dep:http-body-util"]
 # MilkDrop, through libprojectM: a C++ library that CMake builds into the
 # binary at compile time, so building needs cmake, a C++ compiler, and

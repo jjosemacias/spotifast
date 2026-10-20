@@ -171,35 +171,66 @@ fn receiver_row(app: &mut App, ui: &mut egui::Ui, receiver: &crate::zeroconf::Re
 }
 
 pub fn popup(app: &mut App, ctx: &egui::Context) {
+    #[cfg(feature = "jam-host")]
+    let open_flag = egui::Id::new("connect-was-open");
     if !app.show_devices {
+        #[cfg(feature = "jam-host")]
+        ctx.data_mut(|data| {
+            data.remove::<bool>(open_flag);
+            data.remove::<bool>(egui::Id::new("jam-end-focus"));
+            data.remove::<crate::backend::jam::lifecycle::Stamp>(egui::Id::new("jam-return-focus"));
+        });
         return;
     }
+    #[cfg(feature = "jam-host")]
+    let just_opened = ctx.data_mut(|data| {
+        let was_open = data.get_temp::<bool>(open_flag).unwrap_or(false);
+        data.insert_temp(open_flag, true);
+        !was_open
+    });
     let palette = app.palette;
     let locale = app.locale;
     let button = ctx
         .data(|data| data.get_temp::<Rect>(egui::Id::new(BUTTON_RECT_ID)))
         .unwrap_or_else(|| Rect::from_min_size(pos2(400.0, 400.0), vec2(0.0, 0.0)));
+    #[cfg(feature = "jam-host")]
+    let width = 320.0_f32.min(ctx.content_rect().width() - 32.0);
+    #[cfg(not(feature = "jam-host"))]
     let width = 320.0;
     let position = pos2(
         (button.right() - width).max(8.0),
         (button.top() - 12.0).max(8.0),
     );
+    #[cfg(feature = "jam-host")]
+    let mut jump = None;
     let area = egui::Area::new(egui::Id::new("devices-popup"))
         .order(egui::Order::Foreground)
         .fixed_pos(position)
         .pivot(egui::Align2::LEFT_BOTTOM)
         .show(ctx, |ui| {
-            super::widgets::menu_frame(&palette).show(ui, |ui| {
+            let frame = super::widgets::menu_frame(&palette);
+            #[cfg(feature = "jam-host")]
+            let frame_padding = frame.total_margin().sum().y;
+            frame.show(ui, |ui| {
+                #[cfg(feature = "jam-host")]
+                let header_top = ui.cursor().top();
                 ui.set_width(width);
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
                     theme::text(
                         ui,
-                        gettext(locale, "Connect to a device").as_ref(),
+                        gettext(locale, if cfg!(feature = "jam-host") { "Connect" } else { "Connect to a device" }).as_ref(),
                         theme::bold(16.0),
                         palette.text,
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        #[cfg(feature = "jam-host")]
+                        {
+                            let close = ui.add(egui::Button::new(gettext(locale, "Close Connect"))
+                                .min_size(vec2(36.0, 36.0)));
+                            if just_opened { close.request_focus(); }
+                            if close.clicked() { super::jam::enqueue(app, crate::model::jam::Intent::Close); }
+                        }
                         if app.devices_loading {
                             theme::spinner(ui, 16.0, palette.accent);
                         } else if theme::icon_button(
@@ -216,7 +247,14 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                         }
                     });
                 });
+                #[cfg(feature = "jam-host")]
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Jam").min_size(vec2(36.0, 36.0))).clicked() { jump = Some(true); }
+                    if ui.add(egui::Button::new(gettext(locale, "Devices")).min_size(vec2(36.0, 36.0))).clicked() { jump = Some(false); }
+                });
                 ui.add_space(4.0);
+                #[cfg(feature = "jam-host")]
+                let header_height = ui.cursor().top() - header_top + frame_padding;
                 let local_id = app.local_device_id.clone();
                 let mut devices: Vec<Device> = app.devices.clone();
                 if app.local_ready
@@ -272,6 +310,12 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                     .cloned()
                     .collect();
 
+                // V2 bounds the whole surface, including header and frame,
+                // rather than giving that full height to the scroll alone.
+                #[cfg(feature = "jam-host")]
+                let max_height = ((ctx.content_rect().height() - 164.0).min(600.0)
+                    .min(position.y - ctx.content_rect().top() - 8.0) - header_height).max(52.0);
+                #[cfg(not(feature = "jam-host"))]
                 let max_height = (position.y - ctx.content_rect().top() - 62.0).clamp(52.0, 416.0);
                 crate::autoscroll::show(
                     ui,
@@ -283,6 +327,17 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                         .max_height(max_height),
                     egui::Vec2b::new(false, true),
                     |ui| {
+                        #[cfg(feature = "jam-host")]
+                        {
+                            let jam = ui.scope(|ui| super::jam::section(app, ui)).response;
+                            ui.separator();
+                            let devices_heading = ui.scope(|ui| {
+                                theme::text(ui, gettext(locale, "Devices"), theme::bold(16.0), palette.text);
+                            }).response;
+                            if let Some(jam_selected) = jump {
+                                ui.scroll_to_rect(if jam_selected { jam.rect } else { devices_heading.rect }, Some(Align::Min));
+                            }
+                        }
                         if !app.local_ready {
                             enable_playback_row(app, ui);
                         }
@@ -384,6 +439,14 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                 .interact_pos()
                 .is_some_and(|pos| !popup_rect.contains(pos) && !button.contains(pos))
     });
+    #[cfg(feature = "jam-host")]
+    {
+        if clicked_outside && app.jam.confirmation.is_none() {
+            super::jam::enqueue(app, crate::model::jam::Intent::Close);
+        }
+        super::jam::confirmation(app, ctx);
+    }
+    #[cfg(not(feature = "jam-host"))]
     if clicked_outside {
         app.show_devices = false;
     }

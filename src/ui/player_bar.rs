@@ -891,9 +891,17 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>) {
             palette.secondary
         },
         palette.text,
-        &gettext(app.locale, "Connect to a device"),
+        &gettext(
+            app.locale,
+            if cfg!(feature = "jam-host") {
+                "Connect"
+            } else {
+                "Connect to a device"
+            },
+        ),
     );
     ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new("connect-button-id"), devices.id);
         data.insert_temp(egui::Id::new(super::devices::BUTTON_RECT_ID), devices.rect)
     });
     if devices.clicked() {

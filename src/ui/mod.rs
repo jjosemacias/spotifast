@@ -7,6 +7,8 @@ pub mod collection;
 pub(crate) mod devices;
 mod dialogs;
 pub mod home;
+#[cfg(feature = "jam-host")]
+mod jam;
 mod keys;
 pub mod library;
 pub mod login;

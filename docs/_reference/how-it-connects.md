@@ -580,3 +580,16 @@ credentials. Failed confirmation leaves state unknown and offers a fresh read;
 it never automatically repeats a mutation. Requests have a 20-second deadline.
 Sign-out cancels work, stale session/page generations are ignored, and a new
 link or history navigation cannot be overwritten by an older response.
+
+## Experimental Jam in Connect
+
+The optional `jam-host` build adds a host-only section inside Connect. Opening
+it performs no Jam I/O. Check is deliberate and uses the existing playback
+session read budget. Create requires a fresh absence check and local playback;
+End requires a fresh host projection and an explicit named-Jam confirmation.
+Pending actions block duplicates and never retry a write. Watch events only
+invalidate or present state; no timer, Dealer notice, popup reopen or startup
+creates or refreshes a Jam. Closing Connect never sends Leave or End. Account
+and engine changes retire authority and confirmations before a new context can
+act. See the [local candidate contract](/jam-host-kernel/) for unavailable
+capabilities and the limits of offline validation.

@@ -869,3 +869,37 @@ fn initial_or_unannounced_connection_installation_needs_only_a_deliberate_read()
         );
     });
 }
+
+#[test]
+fn polling_releases_the_watch_borrow_before_waiting_for_the_lifecycle_gate() {
+    let (_runtime, worker, _fake, _commands, events) = setup("jam-watch-lock-order");
+    let mut backend = consumer(&worker, events);
+    let gate = worker.jam.gate();
+    let mut state = gate.lock();
+    state.publish(Phase::Invalidated(Cause::Context), unknown(None));
+    let event = Arc::clone(state.latest.as_ref().unwrap());
+    let output = state.output.clone();
+    let before = Arc::strong_count(&event);
+    let poll = std::thread::spawn(move || backend.poll_jam());
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while Arc::strong_count(&event) == before && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let cloned = Arc::strong_count(&event) > before;
+    let (sent, received) = std::sync::mpsc::channel();
+    let publisher = std::thread::spawn(move || {
+        output.send_replace(None);
+        sent.send(()).unwrap();
+    });
+    // The consumer is waiting for the gate held above. A publisher must still
+    // be able to replace its watch value, as real publish() does under that gate.
+    let published_without_gate = received.recv_timeout(Duration::from_secs(1)).is_ok();
+    drop(state);
+    publisher.join().unwrap();
+    assert!(poll.join().unwrap().is_some());
+    assert!(cloned, "the consumer must have cloned the pending event");
+    assert!(
+        published_without_gate,
+        "polling held a watch read lock while waiting for the lifecycle gate"
+    );
+}

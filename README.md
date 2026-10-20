@@ -120,10 +120,13 @@ The complete guide lives at **[spotifast.rocks](https://spotifast.rocks/)**.
 
 ## Contributing
 
-The optional `jam-host` development feature exposes a candidate host lifecycle
-kernel and backend commands, with offline tests, through `backend::jam`. It has
-no UI or automatic Jam requests and does not make Jam available in the app. See the
-[kernel contract](docs/_reference/jam-host-kernel.md) for its limits.
+The optional `jam-host` development feature adds an experimental Jam section
+inside Connect. It can deliberately check membership, create after a fresh
+absence check while playing locally, and request host termination after a
+separate confirmation. Opening Connect sends no Jam request. The feature is off
+by default and has only offline validation; it is not complete Jam support.
+Joining, participant exit, invitations, members, permissions and shared queue
+commands remain unavailable. See the [candidate contract](docs/_reference/jam-host-kernel.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull
 request. To look at the interface without a Spotify account, run:

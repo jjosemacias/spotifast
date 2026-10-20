@@ -5,11 +5,53 @@ permalink: /jam-host-kernel/
 nav_exclude: true
 ---
 
-The `jam-host` Cargo feature is off by default. It exposes `backend::jam`
-and deliberate backend commands, with passive lifecycle binding on engine
-acceptance. It has no UI actions, settings, automatic Jam HTTP requests or audio
-commands. Compiling or constructing a kernel sends nothing. This is local development
-toward Jam support, not a usable or remotely validated Jam feature.
+The `jam-host` Cargo feature is off by default. It adds a native experimental
+Jam section to the existing Connect popup and uses `backend::jam` with passive
+lifecycle binding on engine acceptance. There are no settings, startup Jam
+requests, automatic refreshes or added audio commands. Compiling, constructing
+a kernel and opening Connect send no Jam request. Only synthetic offline
+validation is available; this is an incomplete local development unit.
+
+## Connect host UI
+
+- Choose **Check Jam state** deliberately. It is a read, never creation. A fresh
+  confirmed absence and active local playback enable **Create Jam**. A stale
+  snapshot requires another deliberate check, without automatic chaining.
+- The four membership fields are the only current projection. They do not
+  supply participants, invitations, policy or shared queue permissions. These
+  areas explain their availability without working-looking placeholder controls.
+- Only a fresh confirmed host can open **End Jam…**. **Cancel** receives initial
+  focus, Tab stays within the confirmation, and Cancel restores its current
+  trigger. New controls have 36-point minimum targets. **End for everyone** echoes the observed context and named Jam. Any
+  account, engine, connection, revision or operation change discards the intent.
+  Snapshot deadlines come from the kernel, including UI delivery delay. A
+  counter-only acceptance race holds pending progress until the matching event,
+  while a binding change still discards it immediately.
+- Each accepted gesture sends at most one backend command. Pending state appears
+  immediately and blocks duplicate or incompatible requests. No write is retried.
+  Backend serialization and the existing session-read budget still apply, also
+  to the kernel's post-write check. There is no lazy pre-write read.
+- A successful End currently verifies only this account's absence. UI does not
+  claim that global termination, link invalidation or audio changes were observed.
+- Closing Connect, Escape and outside click never leave or end a Jam. Closing
+  preserves a submitted operation; context invalidation clears its authority.
+  A closed-popup error produces a discrete notice without opening or focusing it.
+- Existing devices, discovery and playback setup remain in Connect. Once Jam is
+  deliberately inspected, device transfers are stopped while membership is
+  present or uncertain because continuity is not established. Default builds
+  retain the existing transfer behavior. No Player/Spirc or queue changes.
+- Join, participant Leave (including the unresolved 405), sharing, member
+  management, permissions and queue/control capabilities remain separate pending
+  product requirements. This feature does not satisfy the complete Jam scope.
+
+For synthetic native preview, build with `--no-default-features --features
+jam-host,demo` and use `--demo --demo-show jam-owner` (also `jam-unknown`,
+`jam-absent`, `jam-participant`, `jam-pending`, `jam-error`, `jam-end`). These
+fixtures never supply authority to the backend and use the existing offline demo.
+Normal development builds without `jam-host` contain no Jam UI. No new credentials,
+saved Jam state or storage migration is introduced. New UI phrases use the
+existing gettext fallback; complete catalog extraction and translations remain
+an integration gate for this local opt-in unit.
 
 ## Candidate protocol
 
@@ -128,3 +170,9 @@ registration has finished. No readiness timer is invented. These local fences
 and candidate requests still require a coordinated real registration/host test;
 an engine Ready notification alone is not remote Jam acceptance. The existing
 client-token dependency trace caveat remains open before account tests.
+
+The UI consumer releases its watch borrow before taking the lifecycle gate.
+Publishers acquire those locks in the opposite order, so retaining the watch
+borrow across gate validation could deadlock delivery. A controlled offline
+regression reproduces that old order and verifies publication can proceed with
+the gate occupied. This changes no protocol, requests or retry behavior.

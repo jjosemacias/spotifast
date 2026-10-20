@@ -359,6 +359,8 @@ fn membership(reply: Reply, _profile: &Profile) -> Result<Membership, Error> {
 
 #[derive(Clone)]
 pub struct Snapshot {
+    /// Authority expires at the kernel deadline, including time queued for UI delivery.
+    pub fresh_until: Option<Instant>,
     pub membership: Membership,
     /// Includes cancellation and ambiguous writes. Cleared only by a fresh read.
     pub reconcile_required: bool,
@@ -440,6 +442,7 @@ impl<T: Transport> Kernel<T> {
         let _ = self.sync_context();
         let state = self.state();
         Snapshot {
+            fresh_until: state.current_at.map(|at| at + FRESH_FOR),
             membership: state.membership.clone(),
             reconcile_required: state.reconcile,
             error: state.error,

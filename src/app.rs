@@ -1,5 +1,8 @@
 //! The application: state, event handling, and the actions views ask for.
 
+#[cfg(feature = "jam-host")]
+mod jam;
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -505,6 +508,8 @@ pub struct App {
     /// the first line), so it moves once per change; `None` until it has
     /// positioned itself at all for this track.
     pub lyrics_line_shown: Option<Option<usize>>,
+    #[cfg(feature = "jam-host")]
+    pub jam: crate::model::jam::State,
     pub show_devices: bool,
     pub toasts: Vec<Toast>,
     pub actions: Vec<Action>,
@@ -1013,6 +1018,8 @@ impl App {
             lyrics: Loadable::NotLoaded,
             lyrics_following: true,
             lyrics_line_shown: None,
+            #[cfg(feature = "jam-host")]
+            jam: crate::model::jam::State::default(),
             show_devices: false,
             toasts: Vec::new(),
             actions: Vec::new(),
@@ -2503,6 +2510,10 @@ impl App {
 
     /// Clears account data while preserving request serials that reject late answers.
     fn reset_data(&mut self) {
+        #[cfg(feature = "jam-host")]
+        {
+            self.jam = crate::model::jam::State::default();
+        }
         self.local_transfer_sequence = None;
         self.queue_start_pending = None;
         self.pending_album_queues.clear();
@@ -3139,6 +3150,8 @@ impl App {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        #[cfg(feature = "jam-host")]
+        self.consume_jam();
         self.poll_custom_themes(ctx);
         if let Some(wait) = self.window_focus(ctx.input(|input| {
             // A minimised window is away even where it keeps focus.
@@ -9462,6 +9475,8 @@ impl App {
     /// Apply one queued UI action after drawing, updating optimistic local state
     /// and scheduling any backend work or preference persistence it requires.
     pub(crate) fn apply(&mut self, action: Action, ctx: &egui::Context) {
+        #[cfg(feature = "jam-host")]
+        self.consume_jam();
         if matches!(
             &action,
             Action::Open(_)
@@ -9486,6 +9501,8 @@ impl App {
             self.supersede_play_search();
         }
         match action {
+            #[cfg(feature = "jam-host")]
+            Action::Jam(intent) => self.apply_jam(intent, ctx),
             Action::Open(page) => self.open(page),
             Action::OpenSongRadio { uri, track } => self.open_song_radio(&uri, &track),
             Action::PrepareTint(url) => {
@@ -10048,8 +10065,26 @@ impl App {
                 self.backend
                     .api(ApiRequest::FollowPlaylist { id, follow: false });
             }
-            Action::Transfer(device_id) => self.transfer(device_id),
+            Action::Transfer(device_id) => {
+                #[cfg(feature = "jam-host")]
+                if self.jam.blocks_transfer() && self.jam_used() {
+                    self.toast(gettext(
+                        self.locale,
+                        "Cannot confirm how this device change would affect the Jam.",
+                    ));
+                    return;
+                }
+                self.transfer(device_id);
+            }
             Action::ActivateReceiver(receiver) => {
+                #[cfg(feature = "jam-host")]
+                if self.jam.blocks_transfer() && self.jam_used() {
+                    self.toast(gettext(
+                        self.locale,
+                        "Cannot confirm how this device change would affect the Jam.",
+                    ));
+                    return;
+                }
                 if self.activating_receiver.is_none() {
                     self.activating_receiver = Some(receiver.name.clone());
                     self.activating_play = self.now_playing().is_some_and(|now| now.playing);
@@ -10263,6 +10298,10 @@ impl App {
             Action::RetryLyrics => self.request_lyrics(),
             Action::ToggleDevicesPopup => {
                 self.show_devices = !self.show_devices;
+                #[cfg(feature = "jam-host")]
+                if !self.show_devices {
+                    self.jam.confirmation = None;
+                }
                 if self.show_devices {
                     self.refresh_devices();
                     // Receivers waiting on the network are invisible to the

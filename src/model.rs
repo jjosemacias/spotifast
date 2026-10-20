@@ -1,5 +1,8 @@
 //! UI state, loaded data, and pending actions.
 
+#[cfg(feature = "jam-host")]
+pub mod jam;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -999,6 +1002,8 @@ pub struct Toast {
 /// Actions emitted while drawing and applied afterward to avoid borrow conflicts.
 #[derive(Clone, Debug)]
 pub enum Action {
+    #[cfg(feature = "jam-host")]
+    Jam(jam::UiAction),
     Open(Page),
     /// Opens the radio of a song shown in a list, after caching the row's
     /// song so the page has its name and cover (#644).

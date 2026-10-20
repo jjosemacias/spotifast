@@ -993,6 +993,8 @@ pub use fastframe_shell::Waker;
 
 /// The interface's handle to the runtime.
 pub struct Backend {
+    #[cfg(all(test, feature = "jam-host"))]
+    pub(crate) jam_requests: std::sync::Mutex<Vec<jam::lifecycle::Kind>>,
     #[cfg(feature = "jam-host")]
     jam_events: watch::Receiver<Option<Arc<jam::lifecycle::Event>>>,
     #[cfg(feature = "jam-host")]
@@ -1103,6 +1105,8 @@ impl Backend {
             commands: command_tx,
             #[cfg(feature = "jam-host")]
             jam_events,
+            #[cfg(all(test, feature = "jam-host"))]
+            jam_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "jam-host")]
             jam_gate,
             events: event_rx,
@@ -1167,6 +1171,13 @@ impl Backend {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(cache.clone());
+        }
+        #[cfg(all(test, feature = "jam-host"))]
+        if let Command::Jam(request) = &command {
+            self.jam_requests
+                .lock()
+                .unwrap()
+                .push(request.action.kind());
         }
         if self.offline
             && !matches!(
@@ -1443,7 +1454,7 @@ impl Backend {
         self.events.try_iter().collect()
     }
 
-    /// No UI action is wired yet. Consumers echo this stamp for deliberate work.
+    /// Consumers echo this stamp for deliberate work from the current view.
     #[cfg(feature = "jam-host")]
     pub fn jam_stamp(&self) -> jam::lifecycle::Stamp {
         self.jam_gate.stamp()
@@ -1456,10 +1467,10 @@ impl Backend {
         if !self.jam_events.has_changed().unwrap_or(false) {
             return None;
         }
-        self.jam_events
-            .borrow_and_update()
-            .clone()
-            .filter(|event| self.jam_gate.accepts_event(event))
+        // Publishers hold the lifecycle gate before taking the watch write
+        // lock. Release this read borrow before acquiring that gate too.
+        let event = self.jam_events.borrow_and_update().clone();
+        event.filter(|event| self.jam_gate.accepts_event(event))
     }
 
     pub fn art(&self) -> &ArtLoader {

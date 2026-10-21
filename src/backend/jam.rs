@@ -5,10 +5,13 @@
 //! The implementation is independent of PR935. Remote semantics remain unverified.
 
 pub mod lifecycle;
+mod link;
 mod projection;
+pub use link::Link;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -62,6 +65,8 @@ pub enum Error {
     NotAbsent,
     NotOwner,
     InvalidId,
+    InvalidLink,
+    WriteUncertain,
     Http(u16),
     Transport,
     Timeout,
@@ -79,10 +84,16 @@ pub enum EndIntent {
     ForEveryone,
 }
 
+/// Requests the observed listen_and_control profile, without claiming its effect.
+pub enum JoinIntent {
+    ListenAndControlRequested,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum Operation {
     Current,
     Create,
+    Join(Link),
     End(String),
 }
 
@@ -90,9 +101,18 @@ pub enum Operation {
 pub struct Dispatch {
     pub operation: Operation,
     pub fresh_until: Option<Instant>,
+    uncertainty: Option<Arc<AtomicBool>>,
 }
 
 impl Dispatch {
+    /// Transport must call at the single HTTP boundary, after all preparation
+    /// checks and before yielding to the request future. Cancellation thereafter
+    /// cannot prove that the service did not receive a mutation.
+    pub fn mark_emitted(&self) {
+        if let Some(fence) = &self.uncertainty {
+            fence.store(true, Ordering::SeqCst);
+        }
+    }
     pub fn check_freshness(&self) -> Result<(), Error> {
         if self
             .fresh_until
@@ -119,7 +139,8 @@ pub trait Transport: Send + Sync {
     /// Must reflect logout, engine replacement and Dealer connection changes.
     fn context(&self) -> Result<Context, Error>;
     /// Check `permit` after awaits and both it and dispatch freshness just before
-    /// the single application dispatch. Never retry or reconnect a mutation.
+    /// the single application dispatch, calling `Dispatch::mark_emitted` at that
+    /// boundary. Never retry or reconnect a mutation.
     fn send<'a>(
         &'a self,
         dispatch: Dispatch,
@@ -224,6 +245,7 @@ impl Transport for SessionTransport {
             )?;
             check()?;
             dispatch.check_freshness()?;
+            dispatch.mark_emitted();
             let response = self
                 .session
                 .http_client()
@@ -285,6 +307,10 @@ fn prepare_request(
             Method::GET,
             "/social-connect/v2/sessions/current_or_new".to_owned(),
         ),
+        Operation::Join(link) => (
+            Method::POST,
+            format!("/social-connect/v2/sessions/join/{}", link.0),
+        ),
         Operation::End(id) if safe_id(id) => {
             (Method::DELETE, format!("/social-connect/v3/sessions/{id}"))
         }
@@ -303,6 +329,11 @@ fn prepare_request(
                 .append_pair("activate", "true")
                 .append_pair("local_device_id", &context.device)
                 .append_pair("type", "REMOTE");
+        } else if matches!(operation, Operation::Join(_)) {
+            query
+                .append_pair("playback_control", "listen_and_control")
+                .append_pair("join_type", "deeplinking")
+                .append_pair("local_device_id", &context.device);
         } else if matches!(operation, Operation::End(_)) {
             query.append_pair("local_device_id", &context.device);
         }
@@ -392,6 +423,8 @@ pub struct Kernel<T: Transport> {
     profile: Profile,
     gate: AsyncMutex<()>,
     state: Mutex<State>,
+    // Shared by replacement bindings. A 404 cannot disprove a late mutation.
+    write_uncertain: Arc<AtomicBool>,
 }
 
 impl<T: Transport> Kernel<T> {
@@ -408,6 +441,7 @@ impl<T: Transport> Kernel<T> {
                 reconcile: true,
                 error: None,
             }),
+            write_uncertain: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -466,6 +500,7 @@ impl<T: Transport> Kernel<T> {
                 Dispatch {
                     operation: Operation::Current,
                     fresh_until: None,
+                    uncertainty: None,
                 },
                 context,
                 &permit,
@@ -483,6 +518,10 @@ impl<T: Transport> Kernel<T> {
         self.run(Operation::Create).await
     }
 
+    pub async fn join(&self, link: Link, _intent: JoinIntent) -> Result<Membership, Error> {
+        self.run(Operation::Join(link)).await
+    }
+
     /// Returns Absent for this account only, never claims global termination.
     pub async fn end(&self, session_id: &str, _intent: EndIntent) -> Result<Membership, Error> {
         if !safe_id(session_id) {
@@ -497,6 +536,9 @@ impl<T: Transport> Kernel<T> {
         let (revision, fresh_until) = {
             let mut state = self.state();
             if operation != Operation::Current {
+                if self.write_uncertain.load(Ordering::SeqCst) {
+                    return Err(Error::WriteUncertain);
+                }
                 if state.reconcile {
                     return Err(Error::ReconcileRequired);
                 }
@@ -504,8 +546,8 @@ impl<T: Transport> Kernel<T> {
                     return Err(Error::SnapshotExpired);
                 }
                 match (&operation, &state.membership) {
-                    (Operation::Create, Membership::Absent) => (),
-                    (Operation::Create, _) => return Err(Error::NotAbsent),
+                    (Operation::Create | Operation::Join(_), Membership::Absent) => (),
+                    (Operation::Create | Operation::Join(_), _) => return Err(Error::NotAbsent),
                     (Operation::End(id), Membership::Present(session))
                         if session.is_session_owner && session.session_id == *id => {}
                     _ => return Err(Error::NotOwner),
@@ -529,23 +571,31 @@ impl<T: Transport> Kernel<T> {
                     Dispatch {
                         operation: operation.clone(),
                         fresh_until,
+                        uncertainty: Some(Arc::clone(&self.write_uncertain)),
                     },
                     &context,
                     &permit,
                 )
                 .await?;
             self.check(&context, revision)?;
+            if (400..500).contains(&reply.status) && reply.status != 408 {
+                // A definite rejection can be retried only after a deliberate read.
+                self.write_uncertain.store(false, Ordering::SeqCst);
+            }
             success(&reply)?;
-            let created = if operation == Operation::Create {
-                match membership(reply, &self.profile)? {
-                    Membership::Present(session) if session.is_session_owner => {
-                        Some(session.session_id)
+            let created =
+                if operation == Operation::Create || matches!(operation, Operation::Join(_)) {
+                    match membership(reply, &self.profile)? {
+                        Membership::Present(session)
+                            if session.is_session_owner == (operation == Operation::Create) =>
+                        {
+                            Some(session.session_id)
+                        }
+                        _ => return Err(Error::VerificationFailed),
                     }
-                    _ => return Err(Error::VerificationFailed),
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             let current = self.read_current(&context, revision).await?;
             match (&operation, created, &current) {
                 (Operation::Create, Some(id), Membership::Present(session))
@@ -554,6 +604,11 @@ impl<T: Transport> Kernel<T> {
                     Ok(current)
                 }
                 (Operation::End(_), _, Membership::Absent) => Ok(current),
+                (Operation::Join(_), Some(id), Membership::Present(session))
+                    if !session.is_session_owner && session.session_id == id =>
+                {
+                    Ok(current)
+                }
                 _ => Err(Error::VerificationFailed),
             }
         })
@@ -566,9 +621,15 @@ impl<T: Transport> Kernel<T> {
         }
         match &result {
             Ok(membership) => {
+                if operation != Operation::Current {
+                    self.write_uncertain.store(false, Ordering::SeqCst);
+                }
                 state.membership = membership.clone();
                 state.current_at = Some(Instant::now());
-                state.reconcile = false;
+                state.reconcile = self.write_uncertain.load(Ordering::SeqCst);
+                if state.reconcile {
+                    state.error = Some(Error::WriteUncertain);
+                }
             }
             Err(error) => state.error = Some(*error),
         }

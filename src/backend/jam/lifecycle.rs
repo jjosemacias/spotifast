@@ -19,12 +19,17 @@ pub struct Stamp {
 pub enum Kind {
     Current,
     Create,
+    Join,
     End,
 }
 
 pub enum Action {
     Current,
     Create(CreateIntent),
+    Join {
+        link: Link,
+        intent: JoinIntent,
+    },
     End {
         session_id: String,
         intent: EndIntent,
@@ -36,6 +41,7 @@ impl Action {
         match self {
             Self::Current => Kind::Current,
             Self::Create(_) => Kind::Create,
+            Self::Join { .. } => Kind::Join,
             Self::End { .. } => Kind::End,
         }
     }
@@ -95,6 +101,7 @@ impl<T: Transport> Host for Kernel<T> {
             match action {
                 Action::Current => self.current().await,
                 Action::Create(intent) => self.create(intent).await,
+                Action::Join { link, intent } => self.join(link, intent).await,
                 Action::End { session_id, intent } => self.end(&session_id, intent).await,
             }
         })
@@ -150,6 +157,7 @@ fn factory<T: Transport + 'static>(
     make: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
     verify: Arc<dyn Fn() -> bool + Send + Sync>,
     budget: Arc<Semaphore>,
+    write_uncertain: Arc<AtomicBool>,
 ) -> Factory {
     Box::new(move |mut epoch| {
         epoch.borrow_and_update();
@@ -160,10 +168,9 @@ fn factory<T: Transport + 'static>(
             budget: Arc::clone(&budget),
         };
         transport.context()?;
-        Ok(Arc::new(Kernel::new(
-            Arc::new(transport),
-            Profile::ObservedFourFields,
-        )))
+        let mut kernel = Kernel::new(Arc::new(transport), Profile::ObservedFourFields);
+        kernel.write_uncertain = Arc::clone(&write_uncertain);
+        Ok(Arc::new(kernel))
     })
 }
 
@@ -177,6 +184,7 @@ fn unknown(error: Option<Error>) -> Snapshot {
 }
 
 struct Shared {
+    write_uncertain: Arc<AtomicBool>,
     stamp: Stamp,
     epoch: watch::Sender<u64>,
     output: watch::Sender<Option<Arc<Event>>>,
@@ -314,6 +322,7 @@ impl Bridge {
     pub(crate) fn channel(waker: Waker) -> (Self, watch::Receiver<Option<Arc<Event>>>) {
         let (output, receiver) = watch::channel(None);
         let state = Shared {
+            write_uncertain: Arc::new(AtomicBool::new(false)),
             stamp: Stamp::default(),
             epoch: watch::channel(0).0,
             output,
@@ -419,6 +428,7 @@ impl Bridge {
             move || SessionTransport::new(session.clone(), account_epoch.clone()),
             Arc::clone(&verify),
             budget,
+            Arc::clone(&self.gate.lock().write_uncertain),
         );
         let listening = jam.is_ok() && connections.is_ok();
         self.bind(

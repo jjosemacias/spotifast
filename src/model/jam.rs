@@ -4,7 +4,7 @@ use crate::backend::jam::{
     lifecycle::{Event, Kind, Phase, Stamp},
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Intent {
     Current,
     Create,
@@ -13,9 +13,22 @@ pub enum Intent {
     ConfirmEnd,
     Close,
     Manage,
+    AskJoin,
+    CancelJoin,
+    RequestListenHere,
+    ConfirmJoin,
+    EditJoin(DraftText),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
+pub struct DraftText(pub String);
+impl std::fmt::Debug for DraftText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[private invitation]")
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct UiAction {
     pub intent: Intent,
     pub expected: Stamp,
@@ -24,6 +37,14 @@ pub struct UiAction {
 pub struct Confirmation {
     pub stamp: Stamp,
     pub session_id: String,
+}
+
+/// Ephemeral private draft. Text is changed by actions after drawing.
+#[derive(Default)]
+pub struct JoinDraft {
+    pub link: String,
+    pub listen_here: bool,
+    pub invalid: bool,
 }
 
 pub struct State {
@@ -36,6 +57,7 @@ pub struct State {
     pub fresh_until: Option<tokio::time::Instant>,
     pub confirmation: Option<Confirmation>,
     pub notice: Option<&'static str>,
+    pub join: Option<JoinDraft>,
 }
 
 impl Default for State {
@@ -50,6 +72,7 @@ impl Default for State {
             fresh_until: None,
             confirmation: None,
             notice: None,
+            join: None,
         }
     }
 }
@@ -71,6 +94,7 @@ impl State {
                 self.reconcile = true;
                 self.error = None;
                 self.confirmation = None;
+                self.join = None;
                 return;
             }
             let notice = self
@@ -101,6 +125,7 @@ impl State {
         self.engaged |= matches!(event.phase, Phase::Pending(_) | Phase::Complete(_));
         self.stamp = live;
         self.confirmation = None;
+        self.join = None;
         self.error = event.snapshot.error;
         self.reconcile = event.snapshot.reconcile_required;
         self.fresh_until = event.snapshot.fresh_until;
@@ -141,7 +166,7 @@ impl State {
         }
     }
     pub fn blocks_transfer(&self) -> bool {
-        self.pending.is_some() || !matches!(self.membership, Membership::Absent)
+        !self.fresh() || !matches!(self.membership, Membership::Absent)
     }
     pub fn start(&mut self, kind: Kind) {
         self.engaged = true;
@@ -149,6 +174,7 @@ impl State {
         self.confirmation = None;
         self.error = None;
         self.notice = None;
+        self.join = None;
     }
 }
 
@@ -176,6 +202,23 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn join_draft_and_confirmation_do_not_survive_context_reuse() {
+        let mut state = State {
+            join: Some(JoinDraft {
+                link: "private-synthetic".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let old = state.stamp;
+        state.sync(Stamp { revision: 1, ..old });
+        state.sync(old);
+        assert!(state.join.is_none());
+        let private = DraftText("private-synthetic".into());
+        assert!(!format!("{:?}", Intent::EditJoin(private)).contains("private-synthetic"));
+    }
+
     #[test]
     fn stale_account_engine_revision_and_operation_cannot_restore_authority() {
         let live = Stamp {
@@ -234,6 +277,12 @@ mod tests {
         assert!(!state.can_create());
         state.observe(&event(stamp, Membership::Absent), stamp);
         assert!(state.can_create());
+        assert!(!state.blocks_transfer());
+        state.reconcile = true;
+        assert!(state.blocks_transfer());
+        state.reconcile = false;
+        state.fresh_until = Some(tokio::time::Instant::now());
+        assert!(state.blocks_transfer());
     }
     #[test]
     fn pending_preserves_projection_without_authority_and_error_cannot_confirm_it() {

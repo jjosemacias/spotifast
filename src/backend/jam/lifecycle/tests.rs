@@ -70,6 +70,7 @@ impl Transport for Fake {
                 return Err(Error::Stale);
             }
             dispatch.check_freshness()?;
+            dispatch.mark_emitted();
             self.0.calls.lock().unwrap().push(dispatch.operation);
             let step = self
                 .0
@@ -120,6 +121,7 @@ fn bind(worker: &mut Worker, fake: &Fake, account: &str) {
         },
         Arc::clone(&verify),
         Arc::clone(&worker.background_session),
+        Arc::clone(&worker.jam.gate.lock().write_uncertain),
     );
     worker.jam.bind(
         *worker.session.borrow(),
@@ -553,13 +555,13 @@ fn concurrent_intentions_do_not_retire_the_running_operation_or_emit_a_second_wr
 }
 
 #[test]
-fn queued_current_create_and_end_results_cannot_apply_after_retirement() {
-    for kind in [Kind::Current, Kind::Create, Kind::End] {
+fn queued_lifecycle_results_cannot_apply_after_retirement() {
+    for kind in [Kind::Current, Kind::Create, Kind::Join, Kind::End] {
         let (runtime, mut worker, fake, mut commands, events) =
             setup(&format!("jam-late-{kind:?}"));
         runtime.block_on(async {
             if kind != Kind::Current {
-                fake.push(if kind == Kind::Create {
+                fake.push(if matches!(kind, Kind::Create | Kind::Join) {
                     absent()
                 } else {
                     owner()
@@ -568,6 +570,15 @@ fn queued_current_create_and_end_results_cannot_apply_after_retirement() {
                 finish(&mut worker, &mut commands).await;
             }
             let action = match kind {
+                Kind::Join => {
+                    let member = || Reply { status: 200, content_type: None, body: br#"{"session_id":"synthetic-jam","is_session_owner":false,"is_listening":true,"is_controlling":false}"#.to_vec() };
+                    fake.push(member());
+                    fake.push(member());
+                    Action::Join {
+                        link: Link::parse("https://open.spotify.com/socialsession/Synthetic123").unwrap(),
+                        intent: JoinIntent::ListenAndControlRequested,
+                    }
+                },
                 Kind::Current => {
                     fake.push(owner());
                     Action::Current
@@ -902,4 +913,72 @@ fn polling_releases_the_watch_borrow_before_waiting_for_the_lifecycle_gate() {
         published_without_gate,
         "polling held a watch read lock while waiting for the lifecycle gate"
     );
+}
+
+#[test]
+fn uncertain_join_fence_survives_dealer_retirement_and_account_reuse() {
+    for change in 0..3 {
+        let (runtime, mut worker, fake, mut commands, events) = setup("jam-join-retirement");
+        runtime.block_on(async {
+            fake.push(absent());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            let release = fake.wait();
+            request(
+                &mut worker,
+                Action::Join {
+                    link: Link::parse("https://open.spotify.com/socialsession/Synthetic123")
+                        .unwrap(),
+                    intent: JoinIntent::ListenAndControlRequested,
+                },
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(fake.writes(), 1);
+            assert!(
+                worker
+                    .jam
+                    .gate
+                    .lock()
+                    .write_uncertain
+                    .load(Ordering::SeqCst)
+            );
+            match change {
+                0 => {
+                    let gate = worker.jam.gate();
+                    gate.signal(gate.stamp().engine, Notice::Jam);
+                }
+                1 => {
+                    worker.take_engine_for_resume();
+                    bind(&mut worker, &fake, "alice");
+                }
+                _ => {
+                    worker.sign_out();
+                    worker
+                        .api
+                        .install(ApiSource::Shared, AccountId::new("alice"))
+                        .unwrap();
+                    worker.signed_in = true;
+                    bind(&mut worker, &fake, "alice");
+                }
+            }
+            tokio::task::yield_now().await;
+            assert!(release.send(empty(200)).is_err());
+            fake.push(absent());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            assert_eq!(latest(&events).snapshot.error, Some(Error::WriteUncertain));
+            assert!(latest(&events).snapshot.reconcile_required);
+            request(
+                &mut worker,
+                Action::Join {
+                    link: Link::parse("https://open.spotify.com/socialsession/Synthetic123")
+                        .unwrap(),
+                    intent: JoinIntent::ListenAndControlRequested,
+                },
+            );
+            finish(&mut worker, &mut commands).await;
+            assert_eq!(latest(&events).snapshot.error, Some(Error::WriteUncertain));
+            assert_eq!(fake.writes(), 1);
+        });
+    }
 }

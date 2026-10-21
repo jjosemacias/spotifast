@@ -45,6 +45,10 @@ fn button(app: &mut App, ui: &mut egui::Ui, label: &'static str, enabled: bool, 
         ui.ctx()
             .data_mut(|data| data.insert_temp(egui::Id::new("jam-end-trigger"), response.id));
     }
+    if matches!(intent, Intent::AskJoin) {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("jam-join-trigger"), response.id));
+    }
     if response.clicked() {
         enqueue(app, intent);
     }
@@ -76,6 +80,9 @@ fn progress(app: &App, ui: &mut egui::Ui) {
             match kind {
                 Kind::Current => "Checking Jam…",
                 Kind::Create => "Creating Jam…",
+                Kind::Join => {
+                    "Joining Jam… Requested: listen on this computer. Audio and controls are unconfirmed."
+                }
                 Kind::End => "Ending Jam…",
             },
         );
@@ -88,6 +95,9 @@ fn progress(app: &App, ui: &mut egui::Ui) {
             app,
             ui,
             match error {
+                crate::backend::jam::Error::WriteUncertain => {
+                    "A previous Jam request may still complete. Checking state cannot safely enable another change. Jam changes remain blocked here."
+                }
                 crate::backend::jam::Error::Http(_) => {
                     "Spotify rejected the Jam request. Check its state before trying again."
                 }
@@ -146,6 +156,15 @@ pub(super) fn summary(app: &mut App, ui: &mut egui::Ui) {
     if absent && !local {
         text(app, ui, "Play on this computer before creating a Jam.");
     }
+    if absent {
+        button(
+            app,
+            ui,
+            "Join with an invitation…",
+            app.local.connected,
+            Intent::AskJoin,
+        );
+    }
     progress(app, ui);
     ui.add_space(8.0);
 }
@@ -177,11 +196,16 @@ pub(super) fn section(app: &mut App, ui: &mut egui::Ui) {
         match app.jam.membership.clone() {
             Membership::Absent => {
                 create(app, ui);
-                text(
+                button(
                     app,
                     ui,
-                    "Joining with an invitation is not available yet. Use Spotify to join.",
+                    "Join with an invitation…",
+                    app.local.connected,
+                    Intent::AskJoin,
                 );
+                if !app.local.connected {
+                    text(app, ui, "Set up playback on this computer before joining.");
+                }
             }
             Membership::Present(p) => {
                 text(
@@ -212,6 +236,25 @@ pub(super) fn section(app: &mut App, ui: &mut egui::Ui) {
                 text(app, ui, "Invitation unavailable. Permissions unconfirmed.");
                 text(app, ui, "Playback queue; shared queue unconfirmed.");
                 text(app, ui, "Audio state is unconfirmed");
+                text(
+                    app,
+                    ui,
+                    if p.is_listening {
+                        "Spotify declares listening: yes"
+                    } else {
+                        "Spotify declares listening: no"
+                    },
+                );
+                text(
+                    app,
+                    ui,
+                    if p.is_controlling {
+                        "Spotify declares control: yes"
+                    } else {
+                        "Spotify declares control: no"
+                    },
+                );
+                text(app, ui, "Effective mode and host controls are unconfirmed.");
             }
             Membership::Unknown => (),
         }
@@ -333,6 +376,7 @@ pub(super) fn bar(app: &mut App, ui: &mut egui::Ui) {
 }
 
 pub(super) fn confirmation(app: &mut App, ctx: &egui::Context) {
+    join_form(app, ctx);
     let focus_id = egui::Id::new("jam-end-focus");
     let Some(confirmation) = &app.jam.confirmation else {
         ctx.data_mut(|data| data.remove::<bool>(focus_id));
@@ -392,5 +436,67 @@ pub(super) fn confirmation(app: &mut App, ctx: &egui::Context) {
     ctx.data_mut(|data| data.insert_temp(focus_id, true));
     if modal.should_close() {
         enqueue(app, Intent::CancelEnd);
+    }
+}
+
+fn join_form(app: &mut App, ctx: &egui::Context) {
+    let Some(draft) = &app.jam.join else {
+        let restore = ctx.data_mut(|data| {
+            let stamp = data.get_temp::<crate::backend::jam::lifecycle::Stamp>(egui::Id::new(
+                "jam-join-return",
+            ));
+            data.remove::<crate::backend::jam::lifecycle::Stamp>(egui::Id::new("jam-join-return"));
+            stamp
+        });
+        if restore == Some(app.jam.stamp)
+            && app.jam.can_create()
+            && let Some(trigger) =
+                ctx.data(|data| data.get_temp::<egui::Id>(egui::Id::new("jam-join-trigger")))
+        {
+            ctx.memory_mut(|memory| memory.request_focus(trigger));
+        }
+        return;
+    };
+    let (mut value, listen_here, invalid) = (draft.link.clone(), draft.listen_here, draft.invalid);
+    let first = ctx.data_mut(|data| {
+        let first = data
+            .get_temp::<bool>(egui::Id::new("jam-join-focus"))
+            .unwrap_or(false);
+        data.remove::<bool>(egui::Id::new("jam-join-focus"));
+        first
+    });
+    let modal = egui::Modal::new(egui::Id::new("jam-join-form")).show(ctx, |ui| {
+        ui.set_width(360.0_f32.min(ctx.content_rect().width() - 48.0));
+        egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 120.0).max(120.0)).show(ui, |ui| {
+            ui.heading(gettext(app.locale, "Join with an invitation"));
+            text(app, ui, "Invitation link");
+            let field = ui.add(egui::TextEdit::singleline(&mut value)
+                .id(egui::Id::new("jam-join-link"))
+                .min_size(egui::vec2(36.0, 36.0))
+                .margin(egui::Margin::symmetric(4, 10))
+                .char_limit(2048).desired_width(f32::INFINITY)
+                .hint_text(gettext(app.locale, "Paste a Spotify Jam long link")));
+            field.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, gettext(app.locale, "Invitation link")));
+            if first { field.request_focus(); }
+            if field.changed() {
+                enqueue(app, Intent::EditJoin(crate::model::jam::DraftText(value.clone())));
+            }
+            if invalid { text(app, ui, "Check the invitation link. Only Spotify HTTPS long links are supported here."); }
+            text(app, ui, "Paste only when you choose. Short links and other formats are pending support.");
+            if ui.add_sized(egui::vec2(ui.available_width(), 36.0), egui::RadioButton::new(listen_here, gettext(app.locale, "Request listening on this computer"))).clicked() {
+                enqueue(app, Intent::RequestListenHere);
+            }
+            text(app, ui, "This experimental request asks to listen and control. Spotify may change membership or playback. Effective audio, synchronization and host controls cannot be confirmed here.");
+            ui.add_enabled(false, egui::RadioButton::new(false, gettext(app.locale, "Control the host without local audio")));
+            text(app, ui, "This mode is not available until its contract is verified.");
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                button(app, ui, "Cancel", true, Intent::CancelJoin);
+                button(app, ui, "Join", listen_here && app.jam.can_create() && app.local.connected, Intent::ConfirmJoin);
+            });
+        });
+    });
+    if modal.should_close() {
+        enqueue(app, Intent::CancelJoin);
     }
 }

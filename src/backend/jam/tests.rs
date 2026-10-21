@@ -94,10 +94,12 @@ impl Transport for Fake {
                 receiver.await.map_err(|_| Error::Transport)?;
                 permit()?;
                 dispatch.check_freshness()?;
+                dispatch.mark_emitted();
                 self.calls.lock().unwrap().push(dispatch.operation);
                 return Ok(reply);
             }
             dispatch.check_freshness()?;
+            dispatch.mark_emitted();
             self.calls.lock().unwrap().push(dispatch.operation);
             match step {
                 Step::Reply(reply) => Ok(reply),
@@ -139,6 +141,16 @@ fn request_preparation_is_exact_and_encodes_context_without_an_http_helper() {
             Method::DELETE,
             "/social-connect/v3/sessions/jam_1-A",
             vec![("local_device_id", context.device.as_str())],
+        ),
+        (
+            Operation::Join(link()),
+            Method::POST,
+            "/social-connect/v2/sessions/join/Synthetic123",
+            vec![
+                ("playback_control", "listen_and_control"),
+                ("join_type", "deeplinking"),
+                ("local_device_id", context.device.as_str()),
+            ],
         ),
     ] {
         let request = prepare_request(
@@ -199,6 +211,227 @@ fn request_preparation_is_exact_and_encodes_context_without_an_http_helper() {
             .err(),
             Some(Error::InvalidId)
         );
+    }
+}
+
+fn link() -> Link {
+    Link::parse("https://open.spotify.com/socialsession/Synthetic123?si=fixture&utm_source=test")
+        .unwrap()
+}
+
+async fn join(kernel: &Kernel<Fake>) -> Result<Membership, Error> {
+    kernel
+        .join(link(), JoinIntent::ListenAndControlRequested)
+        .await
+}
+
+#[test]
+fn join_link_is_exact_bounded_and_discards_only_valid_tracking() {
+    assert!(link() == Link::parse("https://open.spotify.com/socialsession/Synthetic123").unwrap());
+    for value in [
+        "",
+        "http://open.spotify.com/socialsession/A",
+        "https://spotify.link/A",
+        "https://open.spotify.com:443/socialsession/A",
+        "https://open.spotify.com.evil.test/socialsession/A",
+        "https://user@open.spotify.com/socialsession/A",
+        "https://OPEN.spotify.com/socialsession/A",
+        "https://open.spotify.com/socialsession/",
+        "https://open.spotify.com/socialsession/A/",
+        "https://open.spotify.com/socialsession/A#f",
+        "https://open.spotify.com/socialsession/A%2fB",
+        " https://open.spotify.com/socialsession/A",
+        "https://open.spotify.com/socialsession/A\n",
+        "https://open.spotify.com/socialsession/A?",
+        "https://open.spotify.com/socialsession/A?si=x&si=y",
+        "https://open.spotify.com/socialsession/A?si=",
+        "https://open.spotify.com/socialsession/A?unknown=x",
+        "https://open.spotify.com/socialsession/A?si=%41",
+        "https://open.spotify.com/socialsession/A?si=a+b",
+        "https://open.spotify.com/socialsession/A?utm_source=x&utm_source=y",
+    ] {
+        assert_eq!(Link::parse(value).err(), Some(Error::InvalidLink));
+    }
+    assert_eq!(
+        Link::parse(&format!(
+            "https://open.spotify.com/socialsession/{}",
+            "a".repeat(1025)
+        ))
+        .err(),
+        Some(Error::InvalidLink)
+    );
+    assert_eq!(
+        Link::parse(&format!(
+            "https://open.spotify.com/socialsession/A?si={}",
+            "a".repeat(257)
+        ))
+        .err(),
+        Some(Error::InvalidLink)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn join_requires_absence_freshness_and_no_reconcile_or_pending() {
+    let fake = Fake::new(vec![]);
+    let kernel = kernel(&fake);
+    assert_eq!(join(&kernel).await.err(), Some(Error::ReconcileRequired));
+    assert_eq!(fake.count(), 0);
+    for owner in [true, false] {
+        fake.push(Step::Reply(session("existing", owner)));
+        kernel.current().await.unwrap();
+        assert_eq!(join(&kernel).await.err(), Some(Error::NotAbsent));
+    }
+    fake.push(Step::Reply(status(404)));
+    kernel.current().await.unwrap();
+    tokio::time::advance(FRESH_FOR).await;
+    assert_eq!(join(&kernel).await.err(), Some(Error::SnapshotExpired));
+    fake.push(Step::Pending);
+    let mut read = Box::pin(kernel.current());
+    tokio::select! { _ = &mut read => panic!("pending"), _ = tokio::task::yield_now() => () }
+    assert_eq!(join(&kernel).await.err(), Some(Error::Busy));
+    assert_eq!(fake.writes(), 0);
+}
+
+#[tokio::test]
+async fn join_correlates_strict_member_reply_and_current_without_mode_inference() {
+    let fake = Fake::new(vec![
+        status(404),
+        session("joined", false),
+        session("joined", false),
+    ]);
+    let kernel = kernel(&fake);
+    kernel.current().await.unwrap();
+    assert!(
+        matches!(join(&kernel).await, Ok(Membership::Present(p)) if !p.is_session_owner && p.is_listening && !p.is_controlling)
+    );
+    assert_eq!(fake.writes(), 1);
+    assert_eq!(join(&kernel).await.err(), Some(Error::NotAbsent));
+    assert_eq!(fake.count(), 3);
+    for followup in [
+        session("different", false),
+        session("joined", true),
+        status(404),
+        status(200),
+    ] {
+        let fake = Fake::new(vec![status(404), session("joined", false), followup]);
+        let kernel = self::kernel(&fake);
+        kernel.current().await.unwrap();
+        assert!(join(&kernel).await.is_err());
+        assert!(kernel.snapshot().membership == Membership::Unknown);
+        assert!(kernel.snapshot().reconcile_required);
+    }
+    for reply in [session("joined", true), status(200), status(204)] {
+        let fake = Fake::new(vec![status(404), reply]);
+        let kernel = self::kernel(&fake);
+        kernel.current().await.unwrap();
+        assert!(join(&kernel).await.is_err());
+        assert_eq!(fake.count(), 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguous_join_cannot_be_replayed_after_current_404_or_invalidation() {
+    for step in [
+        Step::Pending,
+        Step::Error(Error::Transport),
+        Step::Reply(status(500)),
+        Step::Reply(status(200)),
+    ] {
+        let fake = Fake::new(vec![status(404)]);
+        let kernel = kernel(&fake);
+        kernel.current().await.unwrap();
+        fake.push(step);
+        assert!(join(&kernel).await.is_err());
+        fake.push(Step::Reply(status(404)));
+        assert!(kernel.current().await.unwrap() == Membership::Absent);
+        assert!(kernel.snapshot().reconcile_required);
+        assert_eq!(kernel.snapshot().error, Some(Error::WriteUncertain));
+        assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
+        assert_eq!(
+            kernel.create(CreateIntent::Requested).await.err(),
+            Some(Error::WriteUncertain)
+        );
+        kernel.invalidate();
+        fake.push(Step::Reply(status(404)));
+        kernel.current().await.unwrap();
+        assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
+        assert_eq!(fake.writes(), 1);
+    }
+}
+
+#[tokio::test]
+async fn rejected_join_needs_deliberate_current_then_a_new_gesture() {
+    for code in [400, 403, 404, 405, 429] {
+        let fake = Fake::new(vec![
+            status(404),
+            status(code),
+            status(404),
+            session("joined", false),
+            session("joined", false),
+        ]);
+        let kernel = kernel(&fake);
+        kernel.current().await.unwrap();
+        assert_eq!(join(&kernel).await.err(), Some(Error::Http(code)));
+        assert_eq!(fake.count(), 2);
+        assert_eq!(join(&kernel).await.err(), Some(Error::ReconcileRequired));
+        kernel.current().await.unwrap();
+        assert!(join(&kernel).await.is_ok());
+        assert_eq!(fake.writes(), 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn join_preparation_expiry_context_loss_and_late_replies_are_fenced() {
+    for preparing in [true, false] {
+        for change in 0..6 {
+            let fake = Fake::new(vec![status(404)]);
+            let kernel = kernel(&fake);
+            kernel.current().await.unwrap();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let (reply, response) = tokio::sync::oneshot::channel();
+            fake.push(if preparing {
+                Step::Preparing(wait, session("joined", false))
+            } else {
+                Step::Wait(response)
+            });
+            let mut task = Box::pin(join(&kernel));
+            tokio::select! { _ = &mut task => panic!("pending"), _ = tokio::task::yield_now() => () }
+            assert_eq!(join(&kernel).await.err(), Some(Error::Busy));
+            match change {
+                0 => tokio::time::advance(FRESH_FOR).await,
+                1 => *fake.context.lock().unwrap() = None,
+                2 => {
+                    fake.context.lock().unwrap().as_mut().unwrap().connection = "replacement".into()
+                }
+                3 => fake.context.lock().unwrap().as_mut().unwrap().generation += 1,
+                4 => fake.context.lock().unwrap().as_mut().unwrap().account = "replacement".into(),
+                _ => kernel.invalidate(),
+            }
+            if preparing {
+                release.send(()).ok();
+            } else {
+                reply.send(session("joined", false)).ok();
+            }
+            // Expiry after emission cannot undo a request. It still needs a Current.
+            if !preparing && change == 0 {
+                fake.push(Step::Reply(session("joined", false)));
+            }
+            let result = task.await;
+            if !preparing && change == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result.err(),
+                    Some(if change == 0 {
+                        Error::SnapshotExpired
+                    } else {
+                        Error::Stale
+                    })
+                );
+                assert!(kernel.snapshot().membership == Membership::Unknown);
+            }
+            assert_eq!(fake.writes(), usize::from(!preparing));
+        }
     }
 }
 
@@ -376,14 +609,23 @@ async fn rejected_and_uncertain_writes_never_verify_retry_or_publish_success() {
         let snapshot = kernel.snapshot();
         assert!(snapshot.membership == Membership::Unknown);
         assert!(snapshot.reconcile_required && snapshot.error.is_some());
+        let uncertain = !matches!(snapshot.error, Some(Error::Http(403 | 405 | 429)));
         assert_eq!(
             kernel.create(CreateIntent::Requested).await.err(),
-            Some(Error::ReconcileRequired)
+            Some(if uncertain {
+                Error::WriteUncertain
+            } else {
+                Error::ReconcileRequired
+            })
         );
         assert_eq!(fake.writes(), 1);
         fake.push(Step::Reply(status(404)));
         kernel.current().await.unwrap();
-        assert!(!kernel.snapshot().reconcile_required);
+        assert_eq!(kernel.snapshot().reconcile_required, uncertain);
+        if uncertain {
+            assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
+            assert_eq!(fake.writes(), 1);
+        }
     }
 }
 
@@ -426,32 +668,53 @@ async fn verification_must_match_the_created_owner_or_confirm_departure() {
 
 #[tokio::test(start_paused = true)]
 async fn timeout_and_cancellation_require_explicit_reconciliation() {
-    let fake = Fake::new(vec![status(404)]);
+    for cancel in [false, true] {
+        let fake = Fake::new(vec![status(404)]);
+        let kernel = kernel(&fake);
+        kernel.current().await.unwrap();
+        fake.push(Step::Pending);
+        if cancel {
+            let mut future = Box::pin(kernel.create(CreateIntent::Requested));
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut future)
+                    .await
+                    .is_err()
+            );
+            drop(future);
+        } else {
+            assert_eq!(
+                kernel.create(CreateIntent::Requested).await.err(),
+                Some(Error::Timeout)
+            );
+        }
+        assert!(kernel.snapshot().membership == Membership::Unknown);
+        assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
+        fake.push(Step::Reply(status(404)));
+        kernel.current().await.unwrap();
+        assert!(kernel.snapshot().reconcile_required);
+        assert_eq!(
+            kernel.create(CreateIntent::Requested).await.err(),
+            Some(Error::WriteUncertain)
+        );
+        assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
+        assert_eq!(fake.writes(), 1);
+    }
+}
+
+#[tokio::test]
+async fn uncertain_end_cannot_authorize_join_even_after_absent_current() {
+    let fake = Fake::new(vec![session("host", true)]);
     let kernel = kernel(&fake);
     kernel.current().await.unwrap();
-    fake.push(Step::Pending);
+    fake.push(Step::Error(Error::Transport));
     assert_eq!(
-        kernel.create(CreateIntent::Requested).await.err(),
-        Some(Error::Timeout)
+        kernel.end("host", EndIntent::ForEveryone).await.err(),
+        Some(Error::Transport)
     );
-    assert_eq!(fake.writes(), 1);
-    assert!(kernel.snapshot().reconcile_required);
     fake.push(Step::Reply(status(404)));
     kernel.current().await.unwrap();
-    fake.push(Step::Pending);
-    let mut future = Box::pin(kernel.create(CreateIntent::Requested));
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), &mut future)
-            .await
-            .is_err()
-    );
-    drop(future);
-    assert!(kernel.snapshot().membership == Membership::Unknown);
-    assert_eq!(
-        kernel.create(CreateIntent::Requested).await.err(),
-        Some(Error::ReconcileRequired)
-    );
-    assert_eq!(fake.writes(), 2);
+    assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
+    assert_eq!(fake.writes(), 1);
 }
 
 #[tokio::test]

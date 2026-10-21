@@ -132,7 +132,9 @@ The Web API and librespot do not provide these features:
   A Blend that a Spotify app already made opens like any playlist, with
   who added each song, but Spotifast cannot start or manage one.
   The optional `jam-host` development feature has an experimental host section
-  in Connect, with deliberate check/create/end commands. It has no real runtime
+  in the queue and Connect, with deliberate check/create/end commands and
+  experimental long-link Join. Confirmed membership does not establish audio or
+  control of another account. It has no real runtime
   validation or complete Jam support and does not change default availability. See its
   [candidate contract](../jam-host-kernel/) for the unverified protocol limits.
 - **Spotify DJ.** Its special playlist context does not expose playable tracks

@@ -56,7 +56,7 @@ validation is available; this is an incomplete local development unit.
   deliberately inspected, device transfers are stopped while membership is
   present or uncertain because continuity is not established. Default builds
   retain the existing transfer behavior. No Player/Spirc commands or queue ownership changes.
-- Join, participant Leave (including the unresolved 405), sharing, member
+- Participant Leave (including the unresolved 405), sharing, member
   management, permissions and queue/control capabilities remain separate pending
   product requirements. This feature does not satisfy the complete Jam scope.
 
@@ -92,7 +92,7 @@ remain unverified.
   response followed by current404 establishes only this account's absence.
   It does not prove global termination or playback recovery for other users.
 
-No join, member leave, invite, members, permission, kick, queue, or audio
+No member leave, invite, members, permission, kick, shared queue, or audio
 implementation is included. The earlier member-leave HTTP405 is unresolved.
 
 ## Transport and lifetime
@@ -120,7 +120,13 @@ revision after asynchronous preparation and before dispatch/commit. Logout,
 replacement, explicit invalidation, cancellation, transport errors, timeouts,
 unreadable responses, and unsuccessful verification leave Unknown with a
 reconciliation requirement. Rejected writes do not trigger verification or
-retry. Only an explicit successful current read permits another write.
+retry. A definite rejection requires an explicit successful current read before
+a new gesture. Any ambiguous Jam mutation retains a write fence even after Current404,
+Dealer invalidation, engine replacement or sign-out/sign-in in this process.
+That read cannot disprove a late remote mutation. There is no automatic replay or
+UI reset for this fence; resolve and observe remote state explicitly before a
+separately authorized further test. Restarting the process loses this in-memory
+fence and is not a remote reconciliation protocol.
 Current and the entire mutation/verification sequence each have a 20-second
 deadline; a timed-out mutation may already have taken effect remotely.
 
@@ -196,3 +202,60 @@ Publishers acquire those locks in the opposite order, so retaining the watch
 borrow across gate validation could deadlock delivery. A controlled offline
 regression reproduces that old order and verifies publication can proceed with
 the gate occupied. This changes no protocol, requests or retry behavior.
+
+
+## Experimental long-link Join (J02-06)
+
+After a deliberate fresh Current404 on the same registered Connect/Dealer
+context, **Join with an invitation…** opens a native modal from either Connect
+or the queue. Opening, closing and editing send nothing and never read the
+clipboard; standard paste is a user gesture. Cancel clears the private draft.
+Context changes and expiry retire it. Keyboard playback shortcuts are suspended
+while the form is open. No link is saved or included in diagnostic output.
+
+Only the exact `https://open.spotify.com/socialsession/{alphanumeric-token}`
+form is accepted, optionally with unique `si` and `utm_source` URI-unreserved
+tracking values, validated then discarded. Case changes, ports, credentials,
+fragments, encoded tokens, unknown/duplicate parameters and short links are
+rejected before any Jam request. Input, token and tracking budgets are bounded.
+The parser is adapted from Jose's local librespot experiment at 627b5f0,
+`core/src/jam.rs`; no dependency source or observer was ported.
+
+The user explicitly requests listening on this computer. The only founded
+request profile is `POST /social-connect/v2/sessions/join/{token}` with empty
+body and `playback_control=listen_and_control`, `join_type=deeplinking`, and
+`local_device_id`. This parameter expresses a request, not achieved mode or
+permission. Host control without local audio remains visibly unavailable;
+no alternative endpoint or transfer is guessed. Short links/additional formats
+remain requirements pending clarification, not advertised support.
+
+Join is distinct from Create and shares its serialization/fresh absence gate,
+without requiring the local player to be active. The engine must already be
+registered. Present owner/member, Unknown, stale, pending, reconciliation or
+an uncertain previous Join allow no POST. Context and freshness are checked
+again after token preparation immediately before the single dispatch. No
+Leave, End, transfer, new Session, auth flow, retry or polling is introduced.
+A cancellation before emission is fenced without claiming a remote write;
+the uncertainty latch is marked at the actual HTTP boundary for Join, Create
+and End, so an uncertain earlier host mutation also blocks Join. An absent but stale or
+reconciliation-blocked projection cannot enable device transfer either.
+
+A strict Join response must explicitly identify a participant and a subsequent
+Current must identify that same session and participant role within the same
+context. This correlates the response to the submitted intention, not a general
+token-to-session mapping or idempotency guarantee. A repeated link while Present
+is refused. An ID, YOU_JOINED or HTTP200 alone cannot confirm membership. Passive
+Dealer updates continue to invalidate; they do not manufacture identity/roles.
+Listening/control booleans are displayed as service declarations only. Effective
+mode, local audio/synchronization and host command authority remain unconfirmed,
+with no new playback capability enabled. Disagreement or unreadable data leaves
+Unknown and no successful Join message. Definite 4xx rejection (except ambiguous
+408), transport failure, timeout, cancellation and reconciliation are tested
+separately. No failed mutation is automatically verified or replayed.
+
+Native offline demo scenes add `jam-join`, `jam-join-invalid`,
+`jam-join-pending`, `jam-join-uncertain`. They are fixtures, not service evidence.
+Backend/lifecycle/model and native demo tests cover the guards, late results,
+draft retirement, keyboard focus/cancel and single gesture. Real two-account
+membership and audio acceptance remain J02-12/13; this unit does not accept
+R03/R04 as complete, M1/M2 or the full Jam feature.

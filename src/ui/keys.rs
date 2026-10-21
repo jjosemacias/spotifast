@@ -19,6 +19,13 @@ pub(super) const MILKDROP_SHORTCUT: &str = platform_shortcut("Ctrl+Shift+K", "Cm
 
 pub fn handle(app: &mut App, ctx: &egui::Context) {
     #[cfg(feature = "jam-host")]
+    if app.jam.join.is_some() {
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+            super::jam::enqueue(app, crate::model::jam::Intent::CancelJoin);
+        }
+        return;
+    }
+    #[cfg(feature = "jam-host")]
     if app.jam.confirmation.is_some() {
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
             super::jam::enqueue(app, crate::model::jam::Intent::CancelEnd);

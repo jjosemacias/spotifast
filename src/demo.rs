@@ -720,7 +720,8 @@ pub(crate) fn jam_fixture(app: &mut App, scene: &str) {
         fresh_until: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(15)),
         membership: match scene {
             "jam-unknown" | "jam-error" => Membership::Unknown,
-            "jam-absent" => Membership::Absent,
+            "jam-absent" | "jam-join" | "jam-join-invalid" | "jam-join-pending"
+            | "jam-join-uncertain" => Membership::Absent,
             _ => Membership::Present(Projection {
                 session_id: "synthetic-jam".into(),
                 is_session_owner: scene != "jam-participant",
@@ -736,6 +737,25 @@ pub(crate) fn jam_fixture(app: &mut App, scene: &str) {
     }
     if scene == "jam-error" {
         app.jam.error = Some(crate::backend::jam::Error::Timeout);
+    }
+    if scene == "jam-join" || scene == "jam-join-invalid" {
+        app.jam.join = Some(crate::model::jam::JoinDraft {
+            link: if scene == "jam-join-invalid" {
+                "synthetic-invalid".into()
+            } else {
+                String::new()
+            },
+            listen_here: false,
+            invalid: scene == "jam-join-invalid",
+        });
+        app.local.connected = true;
+    }
+    if scene == "jam-join-pending" {
+        app.jam.start(Kind::Join);
+    }
+    if scene == "jam-join-uncertain" {
+        app.jam.error = Some(crate::backend::jam::Error::WriteUncertain);
+        app.jam.reconcile = true;
     }
     if scene == "jam-end" {
         app.jam.confirmation = Some(Confirmation {
@@ -1004,7 +1024,8 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             }
             #[cfg(feature = "jam-host")]
             "jam-unknown" | "jam-absent" | "jam-owner" | "jam-participant" | "jam-pending"
-            | "jam-error" | "jam-end" => jam_fixture(app, surface),
+            | "jam-error" | "jam-end" | "jam-join" | "jam-join-invalid" | "jam-join-pending"
+            | "jam-join-uncertain" => jam_fixture(app, surface),
             #[cfg(feature = "jam-host")]
             "jam-connect" => app.show_devices = true,
             #[cfg(feature = "jam-host")]
@@ -1388,6 +1409,150 @@ mod tests {
     use crate::paths::AppDirs;
     use crate::settings::Settings;
     use std::sync::Arc;
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_join_requires_explicit_valid_intent_and_one_dispatch() {
+        use crate::backend::jam::lifecycle::Kind;
+        use crate::model::jam::{DraftText, Intent, UiAction};
+        let (ctx, mut app) = accessible_app("jam-join-intent");
+        let apply = |app: &mut App, intent| {
+            let expected = app.jam.stamp;
+            app.apply(Action::Jam(UiAction { intent, expected }), &ctx);
+        };
+        for scene in [
+            "jam-owner",
+            "jam-participant",
+            "jam-unknown",
+            "jam-pending",
+            "jam-error",
+            "jam-join-uncertain",
+        ] {
+            jam_fixture(&mut app, scene);
+            apply(&mut app, Intent::AskJoin);
+            apply(&mut app, Intent::ConfirmJoin);
+            assert!(app.jam.join.is_none());
+        }
+        jam_fixture(&mut app, "jam-absent");
+        app.local.connected = true;
+        apply(&mut app, Intent::AskJoin);
+        assert!(app.jam.join.as_ref().unwrap().link.is_empty());
+        apply(&mut app, Intent::ConfirmJoin);
+        assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        apply(&mut app, Intent::RequestListenHere);
+        apply(
+            &mut app,
+            Intent::EditJoin(DraftText("invalid-fixture".into())),
+        );
+        apply(&mut app, Intent::ConfirmJoin);
+        assert!(app.jam.join.as_ref().unwrap().invalid);
+        assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        apply(
+            &mut app,
+            Intent::EditJoin(DraftText(
+                "https://open.spotify.com/socialsession/Synthetic123".into(),
+            )),
+        );
+        apply(&mut app, Intent::ConfirmJoin);
+        apply(&mut app, Intent::ConfirmJoin);
+        apply(&mut app, Intent::CancelJoin);
+        assert_eq!(*app.backend.jam_requests.lock().unwrap(), vec![Kind::Join]);
+        assert_eq!(app.jam.pending, Some(Kind::Join));
+        assert!(app.jam.join.is_none());
+        assert!(!app.jam.fresh());
+        assert!(app.jam.notice.is_none());
+        app.backend.shutdown();
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_join_form_keyboard_draft_loss_and_layout_are_native() {
+        use crate::model::jam::{Intent, UiAction};
+        for light in [false, true] {
+            for size in [egui::vec2(1200.0, 760.0), egui::vec2(760.0, 520.0)] {
+                let (ctx, mut app) = accessible_app("jam-join-keyboard");
+                jam_fixture(&mut app, "jam-absent");
+                app.local.connected = true;
+                if light {
+                    app.palette = crate::theme::Palette::light();
+                }
+                jam_frame(&ctx, &mut app, size, vec![]);
+                let trigger = ctx
+                    .data(|data| data.get_temp::<egui::Id>(egui::Id::new("jam-join-trigger")))
+                    .unwrap();
+                let expected = app.jam.stamp;
+                app.apply(
+                    Action::Jam(UiAction {
+                        intent: Intent::AskJoin,
+                        expected,
+                    }),
+                    &ctx,
+                );
+                jam_frame(&ctx, &mut app, size, vec![]);
+                let output = jam_frame(&ctx, &mut app, size, vec![]);
+                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                let labels = tree
+                    .nodes
+                    .iter()
+                    .flat_map(|(_, node)| [node.label(), node.value()].into_iter().flatten())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(labels.contains("Invitation link"));
+                assert!(
+                    tree.nodes
+                        .iter()
+                        .any(|(_, node)| node.label() == Some("Invitation link")
+                            && node.bounds().is_some_and(|r| r.y1 - r.y0 >= 36.0))
+                );
+                assert!(labels.contains("unconfirmed") || labels.contains("cannot be confirmed"));
+                assert_eq!(
+                    ctx.memory(|m| m.focused()),
+                    Some(egui::Id::new("jam-join-link"))
+                );
+                jam_frame(
+                    &ctx,
+                    &mut app,
+                    size,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                for action in std::mem::take(&mut app.actions) {
+                    app.apply(action, &ctx);
+                }
+                assert!(app.jam.join.is_none());
+                assert!(
+                    egui::text_edit::TextEditState::load(&ctx, egui::Id::new("jam-join-link"))
+                        .is_none()
+                );
+                jam_frame(&ctx, &mut app, size, vec![]);
+                jam_frame(&ctx, &mut app, size, vec![]);
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(trigger));
+                assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+                app.apply(
+                    Action::Jam(UiAction {
+                        intent: Intent::AskJoin,
+                        expected,
+                    }),
+                    &ctx,
+                );
+                app.jam.fresh_until = Some(tokio::time::Instant::now());
+                app.apply(
+                    Action::Jam(UiAction {
+                        intent: Intent::ConfirmJoin,
+                        expected,
+                    }),
+                    &ctx,
+                );
+                assert!(app.jam.join.is_none());
+                app.backend.shutdown();
+            }
+        }
+    }
 
     #[cfg(feature = "jam-host")]
     #[test]

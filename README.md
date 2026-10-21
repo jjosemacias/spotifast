@@ -129,8 +129,10 @@ is green only for fresh confirmed membership; unconfirmed state is neutral.
 Closing a view never leaves or ends a Jam. End requires fresh host authority and
 confirmation, and verifies only this account's absence, not an end for everyone.
 The feature is off by default with offline validation only. Invitations,
-participants, Join/Leave, permissions, shared queue and synchronized audio remain
-unavailable. See the [candidate contract](docs/_reference/jam-host-kernel.md).
+participants, Leave, permissions, shared queue and synchronized audio remain
+unavailable. Join accepts only strict Spotify HTTPS long invitations, after a fresh
+absence check and an explicit request. Membership confirmation does not confirm
+local audio or host controls. Short links and other modes remain pending. See the [candidate contract](docs/_reference/jam-host-kernel.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull
 request. To look at the interface without a Spotify account, run:

@@ -40,6 +40,7 @@ impl App {
             }
         }
         self.jam.sync(live);
+        self.jam.diagnostic = self.backend.jam_diagnostic();
         if !self.jam.fresh() || !self.backend.jam_context_valid(live) {
             self.jam.clear_metadata();
         }
@@ -201,6 +202,10 @@ impl App {
         }
         let (action, kind) = match intent {
             Intent::Current => (lifecycle::Action::Current, Kind::Current),
+            Intent::DiagnoseCurrent => (
+                lifecycle::Action::DiagnoseCurrent(Default::default()),
+                Kind::Current,
+            ),
             Intent::Create
                 if self.jam.can_create() && self.local.connected && self.local.is_active() =>
             {

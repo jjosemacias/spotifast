@@ -126,8 +126,15 @@ Start a Jam, and a summary that opens management. Both Create entries share the
 same fresh absence/local playback gates and pending operation. Opening management
 sends no Jam request or audio command. Check Jam state is deliberate. The strip
 is green only for fresh confirmed membership; unconfirmed state is neutral.
-Closing a view never leaves or ends a Jam. End requires fresh host authority and
-confirmation, and verifies only this account's absence, not an end for everyone.
+Closing a view never leaves or ends a Jam. The experimental local diagnostic
+button performs one deliberate Current check and shows only a fixed class,
+captured HTTP status and validation
+stage in memory. Ordinary Check does not enable diagnostics. The record describes
+the last accepted observation, not the first failure or a network trace. Retirement
+seals it; account/engine replacement clears it. No diagnostic data is logged or
+saved, and it never enables a Jam action.
+End requires fresh host authority and confirmation, and verifies only this
+account's absence, not an end for everyone.
 The feature is off by default with offline validation only. Leave,
 permissions, shared queue and synchronized audio remain
 unavailable. Join accepts only strict Spotify HTTPS long invitations, after a fresh

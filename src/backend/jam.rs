@@ -4,6 +4,7 @@
 //! Candidate routes: Tu2525/librespot docs/jam.md at 09785618, Requests.
 //! The implementation is independent of PR935. Remote semantics remain unverified.
 
+pub mod diagnostic;
 pub mod lifecycle;
 mod link;
 pub mod metadata;
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use diagnostic::{Probe, Schema, Stage};
 use http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use librespot_core::session::Session;
@@ -103,6 +105,7 @@ pub struct Dispatch {
     pub operation: Operation,
     pub fresh_until: Option<Instant>,
     uncertainty: Option<Arc<AtomicBool>>,
+    diagnostic: Option<Probe>,
 }
 
 impl Dispatch {
@@ -120,6 +123,9 @@ impl Dispatch {
         permit()?;
         self.check_freshness()?;
         self.mark_emitted();
+        if let Some(probe) = &self.diagnostic {
+            probe.stage(Stage::Transport);
+        }
         future.await
     }
 
@@ -234,6 +240,9 @@ impl Transport for SessionTransport {
                 permit()
             };
             check()?;
+            if let Some(probe) = &dispatch.diagnostic {
+                probe.stage(Stage::Preparation);
+            }
             let base = self
                 .session
                 .spclient()
@@ -270,32 +279,52 @@ impl Transport for SessionTransport {
                 .map_err(|_| Error::Transport)
                 .map(|future| async move { future.await.map_err(|_| Error::Transport) });
             let response = dispatch.poll_prepared(prepared, &check).await?;
-            check()?;
-            let status = response.status().as_u16();
-            let content_type = response
-                .headers()
-                .get(http::header::CONTENT_TYPE)
-                .map(|value| value.as_bytes().to_vec());
-            let mut incoming = response.into_body();
-            let mut body = Vec::new();
-            while let Some(frame) = incoming.frame().await {
-                check()?;
-                let frame = frame.map_err(|_| Error::Transport)?;
-                if let Ok(data) = frame.into_data() {
-                    if data.len() > MAX_BODY - body.len() {
-                        return Err(Error::InvalidResponse);
-                    }
-                    body.extend_from_slice(&data);
-                }
-            }
-            check()?;
-            Ok(Reply {
-                status,
-                content_type,
-                body,
-            })
+            receive_reply(response, &check, dispatch.diagnostic.as_ref()).await
         })
     }
+}
+
+async fn receive_reply<B>(
+    response: http::Response<B>,
+    check: Check<'_>,
+    diagnostic: Option<&Probe>,
+) -> Result<Reply, Error>
+where
+    B: BodyExt + Unpin,
+    B::Data: AsRef<[u8]>,
+{
+    let status = response.status().as_u16();
+    if let Some(probe) = diagnostic {
+        probe.status(status);
+        probe.stage(Stage::Body);
+    }
+    check()?;
+    let content_type = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .map(|value| value.as_bytes().to_vec());
+    let mut incoming = response.into_body();
+    let mut body = Vec::new();
+    while let Some(frame) = incoming.frame().await {
+        check()?;
+        let frame = frame.map_err(|_| Error::Transport)?;
+        if let Ok(data) = frame.into_data() {
+            let data = data.as_ref();
+            if data.len() > MAX_BODY - body.len() {
+                if let Some(probe) = diagnostic {
+                    probe.schema(Schema::BodyLimit);
+                }
+                return Err(Error::InvalidResponse);
+            }
+            body.extend_from_slice(data);
+        }
+    }
+    check()?;
+    Ok(Reply {
+        status,
+        content_type,
+        body,
+    })
 }
 
 fn safe_id(id: &str) -> bool {
@@ -397,7 +426,18 @@ fn membership(reply: Reply, profile: &Profile) -> Result<Membership, Error> {
     read_reply(reply, profile).map(|read| read.membership)
 }
 
-fn read_reply(reply: Reply, _profile: &Profile) -> Result<Read, Error> {
+fn read_reply(reply: Reply, profile: &Profile) -> Result<Read, Error> {
+    read_reply_observed(reply, profile, None)
+}
+
+fn read_reply_observed(
+    reply: Reply,
+    _profile: &Profile,
+    diagnostic: Option<&Probe>,
+) -> Result<Read, Error> {
+    if let Some(probe) = diagnostic {
+        probe.status(reply.status);
+    }
     if reply.status == StatusCode::NOT_FOUND.as_u16() {
         return Ok(Read {
             membership: Membership::Absent,
@@ -412,11 +452,28 @@ fn read_reply(reply: Reply, _profile: &Profile) -> Result<Read, Error> {
                 .ok()
                 .and_then(|s| s.split(';').next())
                 .is_some_and(|s| s.trim().eq_ignore_ascii_case("application/json")) => {}
-        _ => return Err(Error::InvalidResponse),
+        _ => {
+            if let Some(probe) = diagnostic {
+                probe.schema(Schema::Mime);
+            }
+            return Err(Error::InvalidResponse);
+        }
     }
-    let root = projection::json(&reply.body)?;
-    let metadata = metadata::snapshot(&root)?;
-    let projection = projection::from_value(root)?;
+    let classify = |schema| {
+        move |error| {
+            if let Some(probe) = diagnostic {
+                probe.schema(schema);
+            }
+            error
+        }
+    };
+    let root = projection::json(&reply.body).map_err(classify(if reply.body.len() > MAX_BODY {
+        Schema::BodyLimit
+    } else {
+        Schema::JsonStructure
+    }))?;
+    let metadata = metadata::snapshot(&root).map_err(classify(Schema::Metadata))?;
+    let projection = projection::from_value(root).map_err(classify(Schema::Projection))?;
     Ok(Read {
         membership: Membership::Present(projection),
         metadata,
@@ -540,7 +597,12 @@ impl<T: Transport> Kernel<T> {
         }
     }
 
-    async fn read_current(&self, context: &Context, revision: u64) -> Result<Read, Error> {
+    async fn read_current(
+        &self,
+        context: &Context,
+        revision: u64,
+        diagnostic: Option<&Probe>,
+    ) -> Result<Read, Error> {
         self.check(context, revision)?;
         let permit = || self.check(context, revision);
         let reply = self
@@ -550,13 +612,17 @@ impl<T: Transport> Kernel<T> {
                     operation: Operation::Current,
                     fresh_until: None,
                     uncertainty: None,
+                    diagnostic: diagnostic.cloned(),
                 },
                 context,
                 &permit,
             )
             .await?;
         self.check(context, revision)?;
-        read_reply(reply, &self.profile)
+        if let Some(probe) = diagnostic {
+            probe.stage(Stage::Response);
+        }
+        read_reply_observed(reply, &self.profile, diagnostic)
     }
 
     pub async fn current(&self) -> Result<Membership, Error> {
@@ -580,6 +646,14 @@ impl<T: Transport> Kernel<T> {
     }
 
     async fn run(&self, operation: Operation) -> Result<Membership, Error> {
+        self.run_observed(operation, None).await
+    }
+
+    async fn run_observed(
+        &self,
+        operation: Operation,
+        diagnostic: Option<&Probe>,
+    ) -> Result<Membership, Error> {
         let _gate = self.gate.try_lock().map_err(|_| Error::Busy)?;
         let context = self.sync_context()?;
         let (revision, fresh_until) = {
@@ -611,7 +685,7 @@ impl<T: Transport> Kernel<T> {
         let result = tokio::time::timeout(DEADLINE, async {
             self.check(&context, revision)?;
             if operation == Operation::Current {
-                return self.read_current(&context, revision).await;
+                return self.read_current(&context, revision, diagnostic).await;
             }
             let permit = || self.check(&context, revision);
             let reply = self
@@ -621,6 +695,7 @@ impl<T: Transport> Kernel<T> {
                         operation: operation.clone(),
                         fresh_until,
                         uncertainty: Some(Arc::clone(&self.write_uncertain)),
+                        diagnostic: None,
                     },
                     &context,
                     &permit,
@@ -646,7 +721,7 @@ impl<T: Transport> Kernel<T> {
                 } else {
                     None
                 };
-            let current = self.read_current(&context, revision).await?;
+            let current = self.read_current(&context, revision, None).await?;
             match (&operation, created, &current.membership) {
                 (Operation::Create, Some(id), Membership::Present(session))
                     if session.is_session_owner && session.session_id == id =>

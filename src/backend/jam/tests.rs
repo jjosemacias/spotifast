@@ -200,6 +200,127 @@ fn kernel(fake: &Arc<Fake>) -> Kernel<Fake> {
 }
 
 #[tokio::test]
+async fn diagnostic_current_preserves_parser_results_and_reports_validation_boundary() {
+    let mut mime = session("private-sentinel", true);
+    mime.content_type = Some(b"application/x-protobuf".to_vec());
+    let mut json = session("private-sentinel", true);
+    json.body = br#"{"secret":"private-sentinel","secret":0}"#.to_vec();
+    let mut projection = session("private-sentinel", true);
+    projection.body = br#"{"session_id":"private-sentinel"}"#.to_vec();
+    let cases = [
+        (status(404), Schema::None, None),
+        (session("private-sentinel", false), Schema::None, None),
+        (status(405), Schema::None, Some(Error::Http(405))),
+        (mime, Schema::Mime, Some(Error::InvalidResponse)),
+        (json, Schema::JsonStructure, Some(Error::InvalidResponse)),
+        (
+            metadata_reply(true, serde_json::json!({"session_members":null})),
+            Schema::Metadata,
+            Some(Error::InvalidResponse),
+        ),
+        (projection, Schema::Projection, Some(Error::InvalidResponse)),
+    ];
+    for (reply, schema, expected_error) in cases {
+        let ordinary = Reply {
+            status: reply.status,
+            content_type: reply.content_type.clone(),
+            body: reply.body.clone(),
+        };
+        let http = reply.status;
+        let fake = Fake::new(vec![reply]);
+        let probe = Probe::default();
+        let result = kernel(&fake)
+            .run_observed(Operation::Current, Some(&probe))
+            .await;
+        let control = Fake::new(vec![ordinary]);
+        let baseline = kernel(&control).current().await;
+        assert_eq!(result.as_ref().err().copied(), expected_error);
+        assert!(result == baseline);
+        assert_eq!(probe.snapshot().schema, schema);
+        assert_eq!(probe.snapshot().http, Some(http));
+        assert_eq!((fake.count(), control.count(), fake.writes()), (1, 1, 0));
+        assert!(!probe.snapshot().to_string().contains("private-sentinel"));
+    }
+}
+
+#[tokio::test]
+async fn diagnostic_headers_survive_body_failure_limit_and_context_refusal() {
+    use http_body_util::{Full, Limited};
+    // Limited emits a real body frame error, without a network or new transport.
+    let probe = Probe::default();
+    let response = http::Response::builder()
+        .status(405)
+        .body(Limited::new(Full::new(&b"private-sentinel"[..]), 0))
+        .unwrap();
+    let result = receive_reply(response, &|| Ok(()), Some(&probe)).await;
+    probe.finish(Err(result.as_ref().err().copied().unwrap()));
+    assert_eq!(result.err(), Some(Error::Transport));
+    assert_eq!(
+        probe.snapshot(),
+        diagnostic::Diagnostic {
+            class: diagnostic::Class::Failed(Stage::Body, Error::Transport),
+            http: Some(405),
+            schema: Schema::None,
+        }
+    );
+    let body = vec![b'x'; MAX_BODY + 1];
+    let response = http::Response::builder()
+        .status(404)
+        .body(Full::new(body.as_slice()))
+        .unwrap();
+    let probe = Probe::default();
+    assert_eq!(
+        receive_reply(response, &|| Ok(()), Some(&probe))
+            .await
+            .err(),
+        Some(Error::InvalidResponse)
+    );
+    assert_eq!(probe.snapshot().schema, Schema::BodyLimit);
+    assert_eq!(probe.snapshot().http, Some(404));
+    let response = http::Response::builder()
+        .status(404)
+        .body(Full::new(&b""[..]))
+        .unwrap();
+    let probe = Probe::default();
+    assert_eq!(
+        receive_reply(response, &|| Err(Error::Stale), Some(&probe))
+            .await
+            .err(),
+        Some(Error::Stale)
+    );
+    assert_eq!(probe.snapshot().http, Some(404));
+    probe.retire(lifecycle::Cause::Context);
+    probe.status(200);
+    assert_eq!(probe.snapshot().http, None);
+    assert_eq!(probe.snapshot().schema, Schema::None);
+}
+
+#[tokio::test]
+async fn diagnostic_prepared_refusal_is_not_reported_as_a_polled_transport() {
+    let probe = Probe::default();
+    probe.stage(Stage::Preparation);
+    let dispatch = Dispatch {
+        operation: Operation::Current,
+        fresh_until: None,
+        uncertainty: None,
+        diagnostic: Some(probe.clone()),
+    };
+    let prepared: Result<std::future::Ready<Result<(), Error>>, Error> = Err(Error::Transport);
+    let result = dispatch.poll_prepared(prepared, &|| Ok(())).await;
+    probe.finish(
+        result
+            .as_ref()
+            .map(|_| &Membership::Unknown)
+            .map_err(|e| *e),
+    );
+    assert_eq!(
+        probe.snapshot().class,
+        diagnostic::Class::Failed(Stage::Preparation, Error::Transport)
+    );
+    assert_eq!(probe.snapshot().http, None);
+}
+
+#[tokio::test]
 async fn local_http_refusal_before_future_does_not_latch_or_poll_http() {
     use std::sync::atomic::AtomicUsize;
     struct LocalRefusal {
@@ -315,6 +436,7 @@ async fn prepared_future_checks_before_poll_and_retains_possible_emission_on_can
     let polls = AtomicUsize::new(0);
     for expired in [false, true] {
         let dispatch = Dispatch {
+            diagnostic: None,
             operation: Operation::Join(link()),
             fresh_until: Some(Instant::now() + if expired { Duration::ZERO } else { FRESH_FOR }),
             uncertainty: Some(Arc::clone(&fence)),
@@ -336,6 +458,7 @@ async fn prepared_future_checks_before_poll_and_retains_possible_emission_on_can
     }
     assert_eq!(polls.load(Ordering::SeqCst), 0);
     let dispatch = Dispatch {
+        diagnostic: None,
         operation: Operation::Join(link()),
         fresh_until: None,
         uncertainty: Some(Arc::clone(&fence)),

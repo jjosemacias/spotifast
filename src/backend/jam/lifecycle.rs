@@ -25,6 +25,7 @@ pub enum Kind {
 
 pub enum Action {
     Current,
+    DiagnoseCurrent(Probe),
     Create(CreateIntent),
     Join {
         link: Link,
@@ -39,7 +40,7 @@ pub enum Action {
 impl Action {
     pub(crate) fn kind(&self) -> Kind {
         match self {
-            Self::Current => Kind::Current,
+            Self::Current | Self::DiagnoseCurrent(_) => Kind::Current,
             Self::Create(_) => Kind::Create,
             Self::Join { .. } => Kind::Join,
             Self::End { .. } => Kind::End,
@@ -100,6 +101,9 @@ impl<T: Transport> Host for Kernel<T> {
         Box::pin(async move {
             match action {
                 Action::Current => self.current().await,
+                Action::DiagnoseCurrent(probe) => {
+                    self.run_observed(Operation::Current, Some(&probe)).await
+                }
                 Action::Create(intent) => self.create(intent).await,
                 Action::Join { link, intent } => self.join(link, intent).await,
                 Action::End { session_id, intent } => self.end(&session_id, intent).await,
@@ -136,6 +140,9 @@ impl<T: Transport> Transport for EpochTransport<T> {
             };
             check()?;
             let _budget = if dispatch.operation == Operation::Current {
+                if let Some(probe) = &dispatch.diagnostic {
+                    probe.stage(Stage::Budget);
+                }
                 Some(
                     Arc::clone(&self.budget)
                         .acquire_owned()
@@ -146,6 +153,9 @@ impl<T: Transport> Transport for EpochTransport<T> {
                 None
             };
             check()?;
+            if let Some(probe) = &dispatch.diagnostic {
+                probe.stage(Stage::Preparation);
+            }
             self.inner.send(dispatch, context, &check).await
         })
     }
@@ -185,6 +195,7 @@ fn unknown(error: Option<Error>) -> Snapshot {
 }
 
 struct Shared {
+    diagnostic: Option<Probe>,
     write_uncertain: Arc<AtomicBool>,
     stamp: Stamp,
     epoch: watch::Sender<u64>,
@@ -214,6 +225,9 @@ impl Shared {
     }
 
     fn invalidate(&mut self, cause: Cause) {
+        if let Some(probe) = &self.diagnostic {
+            probe.retire(cause);
+        }
         // Fence first, then cancel. A task already running on another thread
         // sees the epoch in its transport checks, not just its result handler.
         self.epoch
@@ -253,6 +267,31 @@ impl Shared {
 pub(crate) struct Gate(Arc<Mutex<Shared>>);
 
 impl Gate {
+    /// Independent of membership delivery: a coalesced invalidation must still
+    /// expose the fixed retirement reason, never stale authority or identity.
+    pub(crate) fn diagnostic(&self) -> Option<diagnostic::Diagnostic> {
+        let state = self.lock();
+        let probe = state.diagnostic.as_ref()?;
+        if !state.context_valid() {
+            probe.retire(Cause::Context);
+        }
+        Some(probe.snapshot())
+    }
+
+    pub(crate) fn arm_diagnostic(&self, action: &Action) {
+        let mut state = self.lock();
+        if let Some(probe) = state.diagnostic.take() {
+            probe.retire(Cause::Context);
+        }
+        state.diagnostic = match action {
+            Action::DiagnoseCurrent(probe) => {
+                probe.wake_with(state.waker.clone());
+                Some(probe.clone())
+            }
+            _ => None,
+        };
+        state.waker.wake();
+    }
     /// Local safety only. This survives retired bindings and conveys no remote
     /// identity, membership, freshness or permission to the presentation.
     pub(crate) fn write_uncertain(&self) -> bool {
@@ -335,6 +374,7 @@ impl Bridge {
     pub(crate) fn channel(waker: Waker) -> (Self, watch::Receiver<Option<Arc<Event>>>) {
         let (output, receiver) = watch::channel(None);
         let state = Shared {
+            diagnostic: None,
             write_uncertain: Arc::new(AtomicBool::new(false)),
             stamp: Stamp::default(),
             epoch: watch::channel(0).0,
@@ -371,6 +411,7 @@ impl Bridge {
         }
         let mut state = self.gate.lock();
         state.invalidate(cause);
+        state.diagnostic = None;
         state.stamp.account = account;
         state.stamp.engine = state.stamp.engine.wrapping_add(1);
         state.account = None;
@@ -494,6 +535,21 @@ impl Bridge {
         commands: tokio::sync::mpsc::UnboundedSender<Command>,
     ) {
         let mut state = self.gate.lock();
+        let diagnostic = match &request.action {
+            Action::DiagnoseCurrent(probe) => Some(probe.clone()),
+            _ => None,
+        };
+        // Backend::send installs the visible handle before queuing. An older
+        // queued command must never replace a newer diagnostic intention.
+        if let Some(probe) = &diagnostic {
+            probe.stage(Stage::Preflight);
+        }
+        let reject = |state: &mut Shared, error| {
+            if let Some(probe) = &diagnostic {
+                probe.finish(Err(error));
+            }
+            state.reject(error);
+        };
         if state.account.as_deref() != account
             || state.stamp.account != epoch
             || !state.context_valid()
@@ -502,24 +558,24 @@ impl Bridge {
                 state.connection = None;
             }
             state.invalidate(Cause::Context);
-            state.reject(Error::Stale);
+            reject(&mut state, Error::Stale);
             return;
         }
         if state.pending.is_some() {
-            state.reject(Error::Busy);
+            reject(&mut state, Error::Busy);
             return;
         }
         if request.expected != state.stamp {
-            state.reject(Error::Stale);
+            reject(&mut state, Error::Stale);
             return;
         }
         if !state.listening {
-            state.reject(Error::NotReady);
+            reject(&mut state, Error::NotReady);
             return;
         }
         if state.kernel.is_none() {
-            if !matches!(request.action, Action::Current) {
-                state.reject(Error::ReconcileRequired);
+            if request.action.kind() != Kind::Current {
+                reject(&mut state, Error::ReconcileRequired);
                 return;
             }
             let result = self
@@ -555,17 +611,17 @@ impl Bridge {
                             // caller must deliberately read with the new stamp.
                             state.connection = Some(context.connection);
                             state.invalidate(Cause::Connection);
-                            state.reject(Error::Stale);
+                            reject(&mut state, Error::Stale);
                             return;
                         }
                         _ => {
-                            state.reject(Error::NotReady);
+                            reject(&mut state, Error::NotReady);
                             return;
                         }
                     }
                 }
                 Err(error) => {
-                    state.reject(error);
+                    reject(&mut state, error);
                     return;
                 }
             }
@@ -584,22 +640,27 @@ impl Bridge {
                 kernel.run(request.action).await.map(|_| ())
             }
             .await;
-            if let Err(error) = result {
+            let snapshot = if let Err(error) = result {
                 kernel.invalidate();
                 let mut snapshot = kernel.snapshot();
                 snapshot.error = Some(error);
-                let _ = commands.send(Command::JamFinished(Box::new(Completed {
-                    stamp,
-                    kind,
-                    snapshot,
-                })));
+                snapshot
             } else {
-                let _ = commands.send(Command::JamFinished(Box::new(Completed {
-                    stamp,
-                    kind,
-                    snapshot: kernel.snapshot(),
-                })));
+                kernel.snapshot()
+            };
+            if let Some(probe) = &diagnostic {
+                probe.finish(
+                    result
+                        .as_ref()
+                        .map(|_| &snapshot.membership)
+                        .map_err(|error| *error),
+                );
             }
+            let _ = commands.send(Command::JamFinished(Box::new(Completed {
+                stamp,
+                kind,
+                snapshot,
+            })));
         });
         state.pending = Some(task.abort_handle());
     }

@@ -71,6 +71,36 @@ saved Jam state or storage migration is introduced. New UI phrases use the
 existing gettext fallback; complete catalog extraction and translations remain
 an integration gate for this local opt-in unit.
 
+## Temporary local Current diagnostic
+
+**Diagnose one Jam check** is a separate deliberate read in this experimental
+feature. It issues the same Current request, with the same parser, deadline,
+budget and context guards. Opening the view does not arm it. Ordinary Check and
+every mutation clear the visible diagnostic slot and do not instrument requests.
+
+The one in-memory record contains only `class`, `http` (numeric or `none`) and
+`schema` (`none`, `body_limit`, `mime`, `json_structure`, `metadata`, `projection`).
+Classes distinguish queue, preflight, budget, preparation, request-future wait,
+body receipt and response validation, followed by the fixed error or result.
+They describe the **last accepted observation**, not the first failure, an HTTP
+trace or proof of remote receipt. `http=none` means no status captured at that
+boundary, not proof that no request was sent. Status is captured before body
+reading, so body errors can retain it. Preparation can itself require existing
+session traffic; there is no additional Jam request or retry.
+
+The first connection/Jam/listener invalidation replaces the class with its fixed
+cause and seals the record against late updates, even if a Complete watch event was
+coalesced away. A loss of verified context additionally clears status/schema;
+account/engine replacement removes the slot. The next intention replaces or
+clears it, and process exit destroys it. No history, timestamps, identities,
+stamps, URLs, response/header values, exception strings, logging or persistence
+are added. Updates wake the existing UI directly; there is no diagnostic timer
+or network polling. The record never supplies authority to any Jam action.
+
+The diagnostic UI is temporary local development tooling. It has offline unit
+coverage only; independent review and a separately authorized human observation
+are required before using it with an account.
+
 ## Candidate protocol
 
 The proposed [protocol description at 09785618](https://github.com/Tu2525/librespot/blob/09785618ef782b746821315b7548617f96671148/docs/jam.md#requests)

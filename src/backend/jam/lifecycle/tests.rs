@@ -71,6 +71,9 @@ impl Transport for Fake {
             }
             dispatch.check_freshness()?;
             dispatch.mark_emitted();
+            if let Some(probe) = &dispatch.diagnostic {
+                probe.stage(Stage::Transport);
+            }
             self.0.calls.lock().unwrap().push(dispatch.operation);
             let step = self
                 .0
@@ -196,6 +199,187 @@ fn private_local_emission_rechecks_context_even_without_a_new_stamp_or_event() {
 fn request(worker: &mut Worker, action: Action) {
     let expected = worker.jam.gate.stamp();
     worker.request_jam(Request { expected, action });
+}
+
+fn diagnose(worker: &mut Worker) -> Probe {
+    let probe = Probe::default();
+    let action = Action::DiagnoseCurrent(probe.clone());
+    worker.jam.gate.arm_diagnostic(&action);
+    request(worker, action);
+    probe
+}
+
+#[test]
+fn diagnostic_preflight_refusals_are_local_and_do_not_change_the_guards() {
+    use crate::backend::jam::diagnostic::Class;
+    for error in [Error::NotReady, Error::Stale, Error::Busy] {
+        let (runtime, mut worker, fake, mut commands, events) = setup("jam-diagnostic-refusal");
+        runtime.block_on(async {
+            let expected = worker.jam.gate.stamp();
+            let mut request_stamp = expected;
+            match error {
+                Error::NotReady => worker.jam.gate.lock().listening = false,
+                Error::Stale => request_stamp.operation = 99,
+                Error::Busy => {
+                    let _release = fake.wait();
+                    request(&mut worker, Action::Current);
+                }
+                _ => unreachable!(),
+            }
+            let probe = Probe::default();
+            let action = Action::DiagnoseCurrent(probe.clone());
+            worker.jam.gate.arm_diagnostic(&action);
+            worker.request_jam(Request {
+                expected: request_stamp,
+                action,
+            });
+            assert_eq!(
+                probe.snapshot().class,
+                Class::Failed(Stage::Preflight, error)
+            );
+            assert_eq!(latest(&events).snapshot.error, Some(error));
+            assert_eq!(fake.calls(), 0);
+            assert!(commands.try_recv().is_err());
+        });
+    }
+}
+
+#[test]
+fn diagnostic_budget_timeout_and_transport_failure_never_retry_or_grant_absence() {
+    use crate::backend::jam::diagnostic::Class;
+    let (runtime, mut worker, fake, mut commands, events) = setup("jam-diagnostic-budget");
+    runtime.block_on(async {
+        tokio::time::pause();
+        let _held = Arc::clone(&worker.background_session)
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let probe = diagnose(&mut worker);
+        tokio::task::yield_now().await;
+        assert_eq!(probe.snapshot().class, Class::Waiting(Stage::Budget));
+        tokio::time::advance(Duration::from_secs(21)).await;
+        finish(&mut worker, &mut commands).await;
+        assert_eq!(
+            probe.snapshot().class,
+            Class::Failed(Stage::Budget, Error::Timeout)
+        );
+        assert_eq!(latest(&events).snapshot.error, Some(Error::Timeout));
+        assert!(latest(&events).snapshot.membership == Membership::Unknown);
+        assert_eq!(fake.calls(), 0);
+        assert_eq!(fake.writes(), 0);
+    });
+    let (runtime, mut worker, fake, mut commands, events) = setup("jam-diagnostic-transport");
+    runtime.block_on(async {
+        let release = fake.wait();
+        let probe = diagnose(&mut worker);
+        tokio::task::yield_now().await;
+        drop(release);
+        finish(&mut worker, &mut commands).await;
+        assert_eq!(
+            probe.snapshot().class,
+            Class::Failed(Stage::Transport, Error::Transport)
+        );
+        assert_eq!(latest(&events).snapshot.error, Some(Error::Transport));
+        assert!(latest(&events).snapshot.membership == Membership::Unknown);
+        assert_eq!((fake.calls(), fake.writes()), (1, 0));
+        tokio::task::yield_now().await;
+        assert_eq!(fake.calls(), 1);
+    });
+}
+
+#[test]
+fn diagnostic_completion_coalesced_by_invalidation_stays_retired_and_account_clean() {
+    use crate::backend::jam::diagnostic::Class;
+    let (runtime, mut worker, fake, mut commands, events) = setup("jam-diagnostic-retire");
+    runtime.block_on(async {
+        fake.push(absent());
+        let probe = diagnose(&mut worker);
+        finish(&mut worker, &mut commands).await;
+        let gate = worker.jam.gate();
+        assert_eq!(gate.diagnostic().unwrap().class, Class::Absent);
+        assert_eq!(probe.snapshot().http, Some(404));
+        assert!(latest(&events).snapshot.membership == Membership::Absent);
+        let stamp = gate.stamp();
+        gate.signal(stamp.engine, Notice::Jam);
+        let mut backend = consumer(&worker, events);
+        let delivered = backend.poll_jam().unwrap();
+        assert!(delivered.phase == Phase::Invalidated(Cause::Jam));
+        assert!(delivered.snapshot.membership == Membership::Unknown);
+        assert_eq!(
+            backend.jam_diagnostic().unwrap().class,
+            Class::Invalidated(Cause::Jam)
+        );
+        probe.status(200);
+        probe.finish(Ok(&Membership::Absent));
+        assert_eq!(probe.snapshot().http, Some(404));
+        assert!(!gate.accepts(stamp));
+        worker.jam.retire(stamp.account + 1, Cause::Account);
+        assert!(gate.diagnostic().is_none());
+        assert_eq!(probe.snapshot().http, None);
+        assert_eq!(probe.snapshot().schema, Schema::None);
+        assert_eq!(fake.calls(), 1);
+    });
+}
+
+#[test]
+fn diagnostic_queue_replacement_and_normal_checks_cannot_restore_an_old_slot() {
+    use crate::backend::jam::diagnostic::Class;
+    let (runtime, mut worker, fake, mut commands, _) = setup("jam-diagnostic-queue");
+    runtime.block_on(async {
+        let first = Probe::default();
+        let old = Action::DiagnoseCurrent(first.clone());
+        worker.jam.gate.arm_diagnostic(&old);
+        assert_eq!(
+            worker.jam.gate.diagnostic().unwrap().class,
+            Class::Waiting(Stage::Queued)
+        );
+        let next = Probe::default();
+        worker
+            .jam
+            .gate
+            .arm_diagnostic(&Action::DiagnoseCurrent(next.clone()));
+        fake.push(absent());
+        request(&mut worker, old);
+        finish(&mut worker, &mut commands).await;
+        assert_eq!(worker.jam.gate.diagnostic().unwrap(), next.snapshot());
+        assert_eq!(next.snapshot().class, Class::Waiting(Stage::Queued));
+        worker.jam.gate.arm_diagnostic(&Action::Current);
+        next.status(200);
+        assert!(worker.jam.gate.diagnostic().is_none());
+        assert_eq!(next.snapshot().http, None);
+    });
+}
+
+#[test]
+fn diagnostic_result_and_late_completion_never_replace_context_retirement() {
+    use crate::backend::jam::diagnostic::Class;
+    let (runtime, mut worker, fake, mut commands, events) = setup("jam-diagnostic-late");
+    runtime.block_on(async {
+        fake.push(empty(200));
+        let probe = diagnose(&mut worker);
+        finish(&mut worker, &mut commands).await;
+        assert_eq!(
+            probe.snapshot().class,
+            Class::Failed(Stage::Response, Error::InvalidResponse)
+        );
+        assert_eq!(probe.snapshot().schema, Schema::JsonStructure);
+        assert!(latest(&events).snapshot.membership == Membership::Unknown);
+        assert!(latest(&events).snapshot.reconcile_required);
+        fake.push(owner());
+        let probe = diagnose(&mut worker);
+        let complete = queued(&mut commands).await;
+        assert_eq!(probe.snapshot().class, Class::Present);
+        // Verification can disappear before any lifecycle watch notification.
+        worker.jam.gate.lock().verify = Arc::new(|| false);
+        let sanitized = worker.jam.gate.diagnostic().unwrap();
+        assert_eq!(sanitized.class, Class::Invalidated(Cause::Context));
+        assert_eq!(sanitized.http, None);
+        assert_eq!(sanitized.schema, Schema::None);
+        worker.finish_jam(complete);
+        assert_eq!(probe.snapshot(), sanitized);
+        assert!(latest(&events).snapshot.membership == Membership::Unknown);
+        assert_eq!((fake.calls(), fake.writes()), (2, 0));
+    });
 }
 
 async fn queued(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Command>) -> Completed {

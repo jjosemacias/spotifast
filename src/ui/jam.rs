@@ -333,6 +333,29 @@ fn progress(app: &App, ui: &mut egui::Ui) {
     }
 }
 
+fn diagnostic(app: &mut App, ui: &mut egui::Ui) {
+    text(
+        app,
+        ui,
+        "Experimental local diagnostic. Checks once; does not change Jam membership.",
+    );
+    button(
+        app,
+        ui,
+        "Diagnose one Jam check",
+        app.jam.pending.is_none(),
+        Intent::DiagnoseCurrent,
+    );
+    if let Some(diagnostic) = app.jam.diagnostic {
+        ui.add(egui::Label::new(diagnostic.to_string()).wrap());
+        text(
+            app,
+            ui,
+            "Last accepted observation. http=none means no status captured. Retirement seals this record; it cannot confirm membership.",
+        );
+    }
+}
+
 fn create(app: &mut App, ui: &mut egui::Ui) {
     button(
         app,
@@ -396,6 +419,7 @@ pub(super) fn summary(app: &mut App, ui: &mut egui::Ui) {
         );
     }
     progress(app, ui);
+    diagnostic(app, ui);
     ui.add_space(8.0);
 }
 
@@ -427,6 +451,7 @@ pub(super) fn section(app: &mut App, ui: &mut egui::Ui) {
     }
     ui.add_space(8.0);
     progress(app, ui);
+    diagnostic(app, ui);
     if app.jam.fresh() {
         match app.jam.membership.clone() {
             Membership::Absent => {

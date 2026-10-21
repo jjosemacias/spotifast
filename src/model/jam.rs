@@ -7,6 +7,7 @@ use crate::backend::jam::{
 #[derive(Clone, Debug)]
 pub enum Intent {
     Current,
+    DiagnoseCurrent,
     Create,
     AskEnd,
     CancelEnd,
@@ -53,6 +54,7 @@ pub struct JoinDraft {
 }
 
 pub struct State {
+    pub diagnostic: Option<crate::backend::jam::diagnostic::Diagnostic>,
     pub metadata: crate::backend::jam::metadata::Metadata,
     pub invitation_open: bool,
     pub qr_expanded: bool,
@@ -72,6 +74,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            diagnostic: None,
             metadata: Default::default(),
             invitation_open: false,
             qr_expanded: false,

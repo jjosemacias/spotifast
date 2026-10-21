@@ -1158,6 +1158,10 @@ impl Backend {
     }
 
     pub fn send(&self, command: Command) {
+        #[cfg(feature = "jam-host")]
+        if let Command::Jam(request) = &command {
+            self.jam_gate.arm_diagnostic(&request.action);
+        }
         #[cfg(test)]
         if let Command::StoreLibraryCache(cache) = &command {
             self.library_cache_stores
@@ -1458,6 +1462,11 @@ impl Backend {
     #[cfg(feature = "jam-host")]
     pub fn jam_stamp(&self) -> jam::lifecycle::Stamp {
         self.jam_gate.stamp()
+    }
+
+    #[cfg(feature = "jam-host")]
+    pub(crate) fn jam_diagnostic(&self) -> Option<jam::diagnostic::Diagnostic> {
+        self.jam_gate.diagnostic()
     }
 
     #[cfg(feature = "jam-host")]

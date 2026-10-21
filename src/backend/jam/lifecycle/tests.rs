@@ -982,3 +982,142 @@ fn uncertain_join_fence_survives_dealer_retirement_and_account_reuse() {
         });
     }
 }
+
+#[test]
+fn app_connect_actions_keep_backend_uncertainty_across_relogin_and_current_404() {
+    use crate::app::{App, AppOptions};
+    use crate::backend::{AuthStatus, Event as BackendEvent};
+    use crate::model::{Action as UiAction, jam::JoinDraft};
+    use crate::player::PlayerCommand;
+    use crate::settings::Settings;
+
+    for uncertain in [false, true] {
+        let (runtime, mut worker, fake, mut commands, events) = setup("jam-app-relogin");
+        runtime.block_on(async {
+            let mut app = App::new(
+                &Waker::default(),
+                worker.dirs.clone(),
+                Settings::default(),
+                AppOptions {
+                    media_controls: false,
+                    restore_sign_in: false,
+                    tray: false,
+                },
+            );
+            app.backend.shutdown();
+            app.backend = consumer(&worker, events);
+            // The consumer worker is stopped. Commands go only to this spy,
+            // while the real injected Jam Bridge remains owned by `worker`.
+            let (spy, mut sent) = tokio::sync::mpsc::unbounded_channel();
+            app.backend.commands = spy;
+            let (auth, received) = std::sync::mpsc::channel();
+            app.backend.events = received;
+            let ctx = egui::Context::default();
+            let frame = |app: &mut App| {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    app.background_frame(ui.ctx())
+                });
+                output.textures_delta.clear();
+            };
+            let mut release = None;
+            if uncertain {
+                fake.push(absent());
+                request(&mut worker, Action::Current);
+                finish(&mut worker, &mut commands).await;
+                frame(&mut app);
+                assert!(app.jam.can_create());
+                app.jam.join = Some(JoinDraft {
+                    link: "private-synthetic-draft".into(),
+                    ..Default::default()
+                });
+                release = Some(fake.wait());
+                request(
+                    &mut worker,
+                    Action::Join {
+                        link: Link::parse("https://open.spotify.com/socialsession/Synthetic123")
+                            .unwrap(),
+                        intent: JoinIntent::ListenAndControlRequested,
+                    },
+                );
+                tokio::task::yield_now().await;
+                assert_eq!(fake.writes(), 1);
+                assert!(app.backend.jam_write_uncertain());
+            }
+            worker.sign_out();
+            auth.send(BackendEvent::Auth(AuthStatus::SignedOut))
+                .unwrap();
+            frame(&mut app); // Exercises handle_auth -> reset_data.
+            worker
+                .api
+                .install(ApiSource::Shared, AccountId::new("alice"))
+                .unwrap();
+            worker.signed_in = true;
+            bind(&mut worker, &fake, "alice");
+            auth.send(BackendEvent::Auth(AuthStatus::Connected {
+                username: "alice".into(),
+            }))
+            .unwrap();
+            frame(&mut app); // The same account's login also calls reset_data.
+            assert!(!app.jam.engaged);
+            assert!(app.jam.membership == Membership::Unknown);
+            assert!(app.jam.join.is_none() && app.jam.confirmation.is_none());
+            assert!(!app.jam.fresh() && app.jam.owner_id().is_none());
+            assert_eq!(app.backend.jam_write_uncertain(), uncertain);
+            if let Some(release) = release {
+                tokio::task::yield_now().await;
+                assert!(release.send(empty(200)).is_err());
+            }
+            let receiver = crate::zeroconf::Receiver {
+                name: "synthetic-receiver".into(),
+                device_id: Some("synthetic-target".into()),
+                address: "192.0.2.1".parse().unwrap(),
+                port: 8009,
+                path: "/".into(),
+                cast: true,
+            };
+            for after_current in [false, true] {
+                if after_current {
+                    fake.push(absent());
+                    request(&mut worker, Action::Current);
+                    finish(&mut worker, &mut commands).await;
+                    frame(&mut app);
+                    assert!(app.jam.membership == Membership::Absent);
+                    assert_eq!(app.jam.fresh(), !uncertain);
+                    assert_eq!(app.jam.can_create(), !uncertain);
+                    assert!(app.jam.owner_id().is_none() && app.jam.join.is_none());
+                }
+                while sent.try_recv().is_ok() {}
+                app.backend.take_transfer_requests();
+                app.backend.take_player_commands();
+                app.activating_receiver = None;
+                app.apply(UiAction::Transfer("synthetic-other-device".into()), &ctx);
+                app.apply(UiAction::ActivateReceiver(Box::new(receiver.clone())), &ctx);
+                let expected = usize::from(!uncertain);
+                assert_eq!(
+                    app.backend.take_transfer_requests().len(),
+                    expected,
+                    "Transfer: uncertain={uncertain}, after_current={after_current}"
+                );
+                assert!(
+                    !app.backend
+                        .take_player_commands()
+                        .iter()
+                        .any(|command| matches!(command, PlayerCommand::Transfer))
+                );
+                let mut activations = 0;
+                while let Ok(command) = sent.try_recv() {
+                    if matches!(command, Command::ActivateReceiver(_)) {
+                        activations += 1;
+                    }
+                }
+                assert_eq!(
+                    activations, expected,
+                    "ActivateReceiver: uncertain={uncertain}, after_current={after_current}"
+                );
+                assert_eq!(app.activating_receiver.is_some(), !uncertain);
+            }
+            assert_eq!(fake.writes(), usize::from(uncertain));
+            app.backend.shutdown();
+        });
+    }
+}

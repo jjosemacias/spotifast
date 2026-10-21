@@ -252,6 +252,12 @@ impl Shared {
 pub(crate) struct Gate(Arc<Mutex<Shared>>);
 
 impl Gate {
+    /// Local safety only. This survives retired bindings and conveys no remote
+    /// identity, membership, freshness or permission to the presentation.
+    pub(crate) fn write_uncertain(&self) -> bool {
+        self.lock().write_uncertain.load(Ordering::SeqCst)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Shared> {
         self.0
             .lock()

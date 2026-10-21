@@ -105,6 +105,23 @@ pub struct Dispatch {
 }
 
 impl Dispatch {
+    /// A synchronous local refusal cannot have emitted HTTP. Only crossing the
+    /// first-poll boundary after the final checks creates remote uncertainty.
+    async fn poll_prepared<F, T>(
+        &self,
+        prepared: Result<F, Error>,
+        permit: Check<'_>,
+    ) -> Result<T, Error>
+    where
+        F: Future<Output = Result<T, Error>>,
+    {
+        let future = prepared?;
+        permit()?;
+        self.check_freshness()?;
+        self.mark_emitted();
+        future.await
+    }
+
     /// Transport must call at the single HTTP boundary, after all preparation
     /// checks and before yielding to the request future. Cancellation thereafter
     /// cannot prove that the service did not receive a mutation.
@@ -245,14 +262,13 @@ impl Transport for SessionTransport {
             )?;
             check()?;
             dispatch.check_freshness()?;
-            dispatch.mark_emitted();
-            let response = self
+            let prepared = self
                 .session
                 .http_client()
                 .request_fut(request.map(Into::into))
-                .map_err(|_| Error::Transport)?
-                .await
-                .map_err(|_| Error::Transport)?;
+                .map_err(|_| Error::Transport)
+                .map(|future| async move { future.await.map_err(|_| Error::Transport) });
+            let response = dispatch.poll_prepared(prepared, &check).await?;
             check()?;
             let status = response.status().as_u16();
             let content_type = response

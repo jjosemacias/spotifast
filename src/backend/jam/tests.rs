@@ -116,6 +116,163 @@ fn kernel(fake: &Arc<Fake>) -> Kernel<Fake> {
     Kernel::new(Arc::clone(fake), Profile::ObservedFourFields)
 }
 
+#[tokio::test]
+async fn local_http_refusal_before_future_does_not_latch_or_poll_http() {
+    use std::sync::atomic::AtomicUsize;
+    struct LocalRefusal {
+        client: librespot_core::http_client::HttpClient,
+        attempts: AtomicUsize,
+        http_polls: AtomicUsize,
+    }
+    impl Transport for LocalRefusal {
+        fn context(&self) -> Result<Context, Error> {
+            Ok(context())
+        }
+        fn send<'a>(
+            &'a self,
+            dispatch: Dispatch,
+            _: &'a Context,
+            permit: Check<'a>,
+        ) -> Response<'a> {
+            Box::pin(async move {
+                permit()?;
+                if dispatch.operation == Operation::Current {
+                    return Ok(if self.attempts.load(Ordering::SeqCst) < 2 {
+                        status(404)
+                    } else {
+                        session("synthetic-joined", false)
+                    });
+                }
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let request = Request::builder()
+                        .uri("https://example.invalid/synthetic")
+                        .body(Vec::<u8>::new())
+                        .unwrap();
+                    let prepared = self
+                        .client
+                        .request_fut(request.map(Into::into))
+                        .map_err(|_| Error::Transport)
+                        .map(|future| {
+                            std::future::poll_fn(
+                                move |_| -> std::task::Poll<Result<Reply, Error>> {
+                                    let _unpolled_http = &future;
+                                    self.http_polls.fetch_add(1, Ordering::SeqCst);
+                                    panic!("a synchronous local refusal must never poll HTTP");
+                                },
+                            )
+                        });
+                    // The same first-poll boundary as SessionTransport.
+                    dispatch.poll_prepared(prepared, permit).await
+                } else {
+                    dispatch
+                        .poll_prepared(Ok(async { Ok(session("synthetic-joined", false)) }), permit)
+                        .await
+                }
+            })
+        }
+    }
+    let client = librespot_core::http_client::HttpClient::new(None);
+    let mut refused = false;
+    for _ in 0..1000 {
+        let request = Request::builder()
+            .uri("https://example.invalid/synthetic")
+            .body(Vec::<u8>::new())
+            .unwrap();
+        match client.request_fut(request.map(Into::into)) {
+            Ok(future) => drop(future), // Construction alone never sends HTTP.
+            Err(_) => {
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        refused,
+        "the real pin's local limiter must reject synchronously"
+    );
+    let transport = Arc::new(LocalRefusal {
+        client,
+        attempts: AtomicUsize::new(0),
+        http_polls: AtomicUsize::new(0),
+    });
+    let kernel = Kernel::new(Arc::clone(&transport), Profile::ObservedFourFields);
+    kernel.current().await.unwrap();
+    assert_eq!(
+        kernel
+            .join(link(), JoinIntent::ListenAndControlRequested)
+            .await
+            .err(),
+        Some(Error::Transport)
+    );
+    assert!(!kernel.write_uncertain.load(Ordering::SeqCst));
+    assert!(kernel.snapshot().reconcile_required);
+    assert_eq!(
+        kernel
+            .join(link(), JoinIntent::ListenAndControlRequested)
+            .await
+            .err(),
+        Some(Error::ReconcileRequired)
+    );
+    kernel.current().await.unwrap();
+    assert!(!kernel.snapshot().reconcile_required);
+    assert!(
+        kernel
+            .join(link(), JoinIntent::ListenAndControlRequested)
+            .await
+            .is_ok()
+    );
+    assert_eq!(transport.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.http_polls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn prepared_future_checks_before_poll_and_retains_possible_emission_on_cancel() {
+    use std::sync::atomic::AtomicUsize;
+    let fence = Arc::new(AtomicBool::new(false));
+    let polls = AtomicUsize::new(0);
+    for expired in [false, true] {
+        let dispatch = Dispatch {
+            operation: Operation::Join(link()),
+            fresh_until: Some(Instant::now() + if expired { Duration::ZERO } else { FRESH_FOR }),
+            uncertainty: Some(Arc::clone(&fence)),
+        };
+        let future = std::future::poll_fn(|_| -> std::task::Poll<Result<(), Error>> {
+            polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Pending
+        });
+        let check = || if expired { Ok(()) } else { Err(Error::Stale) };
+        assert_eq!(
+            dispatch.poll_prepared(Ok(future), &check).await.err(),
+            Some(if expired {
+                Error::SnapshotExpired
+            } else {
+                Error::Stale
+            })
+        );
+        assert!(!fence.load(Ordering::SeqCst));
+    }
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    let dispatch = Dispatch {
+        operation: Operation::Join(link()),
+        fresh_until: None,
+        uncertainty: Some(Arc::clone(&fence)),
+    };
+    let future = std::future::poll_fn(|_| -> std::task::Poll<Result<(), Error>> {
+        polls.fetch_add(1, Ordering::SeqCst);
+        std::task::Poll::Pending
+    });
+    let check = || Ok(());
+    let mut operation = Box::pin(dispatch.poll_prepared(Ok(future), &check));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut operation)
+            .await
+            .is_err()
+    );
+    drop(operation);
+    assert!(fence.load(Ordering::SeqCst));
+    assert!(polls.load(Ordering::SeqCst) > 0);
+}
+
 #[test]
 fn request_preparation_is_exact_and_encodes_context_without_an_http_helper() {
     let context = context();

@@ -68,8 +68,8 @@ impl App {
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
     }
 
-    pub(super) fn jam_used(&self) -> bool {
-        self.jam.engaged
+    pub(super) fn jam_blocks_transfer(&self) -> bool {
+        self.backend.jam_write_uncertain() || (self.jam.engaged && self.jam.blocks_transfer())
     }
 
     pub(super) fn apply_jam(&mut self, action: crate::model::jam::UiAction, ctx: &egui::Context) {

@@ -259,3 +259,21 @@ Backend/lifecycle/model and native demo tests cover the guards, late results,
 draft retirement, keyboard focus/cancel and single gesture. Real two-account
 membership and audio acceptance remain J02-12/13; this unit does not accept
 R03/R04 as complete, M1/M2 or the full Jam feature.
+
+
+## Local refusal and presentation resets
+
+A synchronous `request_fut` refusal happens before a Hyper response future is
+available. It does not mark remote uncertainty. After obtaining the future,
+context and freshness are checked again, then the write fence is set immediately
+before the first poll. A failed or cancelled future after that point keeps the
+fence; there is still no automatic retry. A local refusal still retires the
+snapshot and requires a deliberate fresh Current and a new gesture.
+
+Connect's Transfer and ActivateReceiver actions also consult the Bridge's local
+write fence directly, independently of presentation engagement. Signing out and
+back in clears membership, roles, drafts and confirmation as before, but cannot
+turn a possibly outstanding write into permission to transfer. A Current404 does
+not remove that safety block. The scalar local fence grants no remote identity,
+role, freshness or capability. Without uncertain Jam activity, ordinary Connect
+and fresh confirmed absence keep their existing behavior.

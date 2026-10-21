@@ -1460,6 +1460,11 @@ impl Backend {
         self.jam_gate.stamp()
     }
 
+    #[cfg(feature = "jam-host")]
+    pub(crate) fn jam_write_uncertain(&self) -> bool {
+        self.jam_gate.write_uncertain()
+    }
+
     /// Latest Jam state only; retired queued states cannot cross account/engine
     /// transitions. Coalescing also bounds memory when no UI consumes this API.
     #[cfg(feature = "jam-host")]

@@ -10067,7 +10067,7 @@ impl App {
             }
             Action::Transfer(device_id) => {
                 #[cfg(feature = "jam-host")]
-                if self.jam.blocks_transfer() && self.jam_used() {
+                if self.jam_blocks_transfer() {
                     self.toast(gettext(
                         self.locale,
                         "Cannot confirm how this device change would affect the Jam.",
@@ -10078,7 +10078,7 @@ impl App {
             }
             Action::ActivateReceiver(receiver) => {
                 #[cfg(feature = "jam-host")]
-                if self.jam.blocks_transfer() && self.jam_used() {
+                if self.jam_blocks_transfer() {
                     self.toast(gettext(
                         self.locale,
                         "Cannot confirm how this device change would affect the Jam.",

@@ -92,6 +92,22 @@ fn heading(app: &App) -> String {
     }
 }
 
+// A Latin prefix does not make an embedded RTL name a left-to-right run.
+// Keep the logical text for shaping, then reorder the complete mixed line.
+fn heading_line(ui: &mut egui::Ui, value: &str, font: egui::FontId, color: egui::Color32) {
+    let galley = crate::bidi::layout(
+        ui.painter(),
+        value,
+        font,
+        color,
+        ui.available_width(),
+        1,
+        Some(crate::bidi::ELLIPSIS),
+    );
+    ui.add(egui::Label::new(galley).selectable(false))
+        .on_hover_text(value);
+}
+
 fn participants(app: &mut App, ui: &mut egui::Ui) {
     let Some(members) = app.jam.metadata.members.clone() else {
         text(app, ui, "Participants unavailable");
@@ -346,7 +362,7 @@ pub(super) fn summary(app: &mut App, ui: &mut egui::Ui) {
     egui::Sides::new().shrink_left().show(
         ui,
         |ui| {
-            theme::text(ui, heading, theme::bold(14.0), palette.text);
+            heading_line(ui, &heading, theme::bold(14.0), palette.text);
             if !fresh {
                 theme::text(ui, status, theme::regular(13.0), palette.secondary);
             }
@@ -584,8 +600,7 @@ pub(super) fn bar(app: &mut App, ui: &mut egui::Ui) {
             egui::Sides::new().shrink_left().show(
                 ui,
                 |ui| {
-                    theme::text(ui, label.clone(), theme::bold(13.0), foreground)
-                        .on_hover_text(label);
+                    heading_line(ui, &label, theme::bold(13.0), foreground);
                 },
                 |ui| {
                     let label = if confirmed {
@@ -737,5 +752,148 @@ fn join_form(app: &mut App, ctx: &egui::Context) {
     });
     if modal.should_close() {
         enqueue(app, Intent::CancelJoin);
+    }
+}
+
+#[cfg(all(test, feature = "demo"))]
+mod tests {
+    use super::*;
+
+    fn accessible_app(name: &str) -> (egui::Context, App) {
+        let root =
+            std::env::temp_dir().join(format!("spotifast-bidi-{name}-{}", std::process::id()));
+        let ctx = egui::Context::default();
+        let waker = crate::backend::Waker::default();
+        waker.attach(&ctx);
+        let mut app = App::new(
+            &waker,
+            crate::paths::AppDirs {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+            },
+            crate::settings::Settings::default(),
+            crate::app::AppOptions {
+                media_controls: false,
+                restore_sign_in: false,
+                tray: false,
+            },
+        );
+        app.attach(&ctx);
+        crate::demo::populate(&mut app);
+        app.reveal_theme_changes = false;
+        (ctx, app)
+    }
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_mixed_rtl_host_keeps_visual_word_order_and_single_line_controls() {
+        fn text_shapes<'a>(shape: &'a egui::Shape, result: &mut Vec<&'a egui::epaint::TextShape>) {
+            match shape {
+                egui::Shape::Text(text) => result.push(text),
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| text_shapes(shape, result))
+                }
+                _ => (),
+            }
+        }
+        let hebrew = |c: char| ('\u{05d0}'..='\u{05ea}').contains(&c);
+        for locale in [crate::i18n::Locale::English, crate::i18n::Locale::Spanish] {
+            for name in ["אבג דהו", "אבג דהו זחט", "אבג דהו זחט יכל מנס עפק"]
+            {
+                for palette in [
+                    crate::theme::Palette::dark(),
+                    crate::theme::Palette::light(),
+                ] {
+                    let (ctx, mut app) = accessible_app("jam-bidi-order");
+                    crate::demo::jam_fixture(&mut app, "jam-bidi");
+                    app.jam.metadata.members.as_mut().unwrap()[0].name = Some(name.into());
+                    app.locale = locale;
+                    app.palette = palette;
+                    let authority = app.jam.owner_id().map(str::to_owned);
+                    let deadline = app.jam.fresh_until;
+                    for width in [1000.0, 280.0] {
+                        for bar in [false, true] {
+                            let mut output = ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(width, 220.0),
+                                    )),
+                                    ..Default::default()
+                                },
+                                |ui| {
+                                    if bar {
+                                        crate::ui::jam::bar(&mut app, ui);
+                                    } else {
+                                        crate::ui::jam::summary(&mut app, ui);
+                                    }
+                                },
+                            );
+                            let mut texts = Vec::new();
+                            for shape in &output.shapes {
+                                text_shapes(&shape.shape, &mut texts);
+                            }
+                            let heading = texts
+                                .iter()
+                                .find(|t| t.galley.text().starts_with("Jam"))
+                                .expect("host heading");
+                            assert_eq!(heading.galley.rows.len(), 1, "heading must stay one line");
+                            let mut glyphs: Vec<_> = heading.galley.rows[0]
+                                .row
+                                .glyphs
+                                .iter()
+                                .filter(|g| hebrew(g.chr) && g.advance_width > 0.01)
+                                .collect();
+                            glyphs.sort_by(|a, b| a.pos.x.total_cmp(&b.pos.x));
+                            let physical: Vec<_> = glyphs.iter().map(|g| g.chr).collect();
+                            // For this uninterrupted Hebrew run, Unicode visual order
+                            // reverses the entire run, not each word independently.
+                            let expected: Vec<_> = heading
+                                .galley
+                                .text()
+                                .chars()
+                                .filter(|c| hebrew(*c))
+                                .rev()
+                                .collect();
+                            assert_eq!(
+                                physical, expected,
+                                "mixed RTL words must not swap in summary/bar"
+                            );
+                            if width > 500.0 {
+                                assert_eq!(
+                                    physical,
+                                    name.chars()
+                                        .filter(|c| hebrew(*c))
+                                        .rev()
+                                        .collect::<Vec<_>>()
+                                );
+                            } else if name.chars().filter(|c| hebrew(*c)).count() > 9 {
+                                assert!(heading.galley.text().contains(crate::bidi::ELLIPSIS));
+                            }
+                            let manage = texts
+                                .iter()
+                                .find(|t| {
+                                    t.galley.text() == crate::i18n::gettext(locale, "Manage Jam")
+                                })
+                                .expect("Manage remains visible");
+                            let bounds = |t: &egui::epaint::TextShape| {
+                                t.galley.rect.translate(t.pos.to_vec2())
+                            };
+                            assert!(
+                                bounds(heading).right() <= bounds(manage).left(),
+                                "heading must not overlap Manage"
+                            );
+                            assert!(bounds(manage).right() <= width + 1.0);
+                            assert!(output.platform_output.commands.is_empty());
+                            output.textures_delta.clear();
+                        }
+                    }
+                    assert_eq!(app.jam.owner_id().map(str::to_owned), authority);
+                    assert_eq!(app.jam.fresh_until, deadline);
+                    assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+                    app.backend.shutdown();
+                }
+            }
+        }
     }
 }

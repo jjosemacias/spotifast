@@ -733,7 +733,7 @@ pub(crate) fn jam_fixture(app: &mut App, scene: &str) {
     };
     if matches!(
         scene,
-        "jam-invitation" | "jam-qr" | "jam-members" | "jam-members-empty"
+        "jam-invitation" | "jam-qr" | "jam-members" | "jam-members-empty" | "jam-bidi"
     ) {
         use crate::backend::jam::metadata::{Invitation, Member, Metadata};
         app.jam.metadata = Metadata {
@@ -766,6 +766,9 @@ pub(crate) fn jam_fixture(app: &mut App, scene: &str) {
                 "https://open.spotify.com/socialsession/SyntheticInvite08",
             ),
         };
+        if scene == "jam-bidi" {
+            app.jam.metadata.members.as_mut().unwrap()[0].name = Some("אבג דהו".into());
+        }
         if scene == "jam-invitation" || scene == "jam-qr" {
             app.jam.invitation_open = true;
             app.jam.qr = Some(
@@ -1073,7 +1076,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             "jam-unknown" | "jam-absent" | "jam-owner" | "jam-participant" | "jam-pending"
             | "jam-error" | "jam-end" | "jam-join" | "jam-join-invalid" | "jam-join-pending"
             | "jam-join-uncertain" | "jam-invitation" | "jam-qr" | "jam-members"
-            | "jam-members-empty" => jam_fixture(app, surface),
+            | "jam-members-empty" | "jam-bidi" => jam_fixture(app, surface),
             #[cfg(feature = "jam-host")]
             "jam-connect" => app.show_devices = true,
             #[cfg(feature = "jam-host")]

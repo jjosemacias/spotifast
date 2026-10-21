@@ -157,6 +157,42 @@ fn setup(name: &str) -> Harness {
     (runtime, worker, fake, receiver, events)
 }
 
+#[test]
+fn private_local_emission_rechecks_context_even_without_a_new_stamp_or_event() {
+    let (_runtime, mut worker, fake, _commands, _events) = setup("jam-private-emission");
+    let gate = worker.jam.gate();
+    let stamp = gate.stamp();
+    let emitted = AtomicUsize::new(0);
+    assert!(
+        gate.with_context(stamp, || {
+            assert!(
+                gate.0.try_lock().is_err(),
+                "apply must retain the context gate"
+            );
+            emitted.fetch_add(1, Ordering::SeqCst)
+        })
+        .is_some()
+    );
+    let stale = Stamp {
+        operation: stamp.operation.wrapping_add(1),
+        ..stamp
+    };
+    assert!(
+        gate.with_context(stale, || emitted.fetch_add(1, Ordering::SeqCst))
+            .is_none()
+    );
+    // Account verification can fail before its notification reaches the bridge.
+    gate.lock().verify = Arc::new(|| false);
+    assert_eq!(gate.stamp(), stamp);
+    assert!(
+        gate.with_context(stamp, || emitted.fetch_add(1, Ordering::SeqCst))
+            .is_none()
+    );
+    assert_eq!(emitted.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.calls(), 0);
+    worker.jam.retire(stamp.account, Cause::Account);
+}
+
 fn request(worker: &mut Worker, action: Action) {
     let expected = worker.jam.gate.stamp();
     worker.request_jam(Request { expected, action });

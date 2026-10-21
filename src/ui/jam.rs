@@ -49,6 +49,18 @@ fn button(app: &mut App, ui: &mut egui::Ui, label: &'static str, enabled: bool, 
         ui.ctx()
             .data_mut(|data| data.insert_temp(egui::Id::new("jam-join-trigger"), response.id));
     }
+    for (matches, key) in [
+        (
+            matches!(intent, Intent::OpenInvitation),
+            "jam-invitation-trigger",
+        ),
+        (matches!(intent, Intent::ExpandQr), "jam-qr-trigger"),
+    ] {
+        if matches {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(egui::Id::new(key), response.id));
+        }
+    }
     if response.clicked() {
         enqueue(app, intent);
     }
@@ -69,6 +81,204 @@ fn title(app: &App) -> &'static str {
         Membership::Present(_) if app.jam.fresh() => "Jam",
         Membership::Absent if app.jam.fresh() => "Listen and choose together",
         _ => "Jam state is unconfirmed",
+    }
+}
+
+fn heading(app: &App) -> String {
+    if let Some(name) = app.jam.host_name() {
+        gettext(app.locale, "Jam hosted by {name}").replace("{name}", name)
+    } else {
+        gettext(app.locale, title(app)).to_string()
+    }
+}
+
+fn participants(app: &mut App, ui: &mut egui::Ui) {
+    let Some(members) = app.jam.metadata.members.clone() else {
+        text(app, ui, "Participants unavailable");
+        return;
+    };
+    text(app, ui, "Participants · Partial list");
+    if members.is_empty() {
+        text(
+            app,
+            ui,
+            "No participants listed in this response. The full list is unconfirmed.",
+        );
+    }
+    let owner = app.jam.metadata.owner.clone();
+    for (index, member) in members.iter().enumerate() {
+        // Identity is established by the parser, never by name or avatar. Stable
+        // UI order is the supplied partial snapshot, with no fabricated total.
+        ui.push_id(
+            (
+                "jam-member",
+                member.id.as_ref().or(member.username.as_ref()),
+                index,
+            ),
+            |ui| {
+                ui.horizontal_top(|ui| {
+                    super::widgets::cover(
+                        ui,
+                        &app.palette,
+                        member.image.as_deref(),
+                        28.0,
+                        14.0,
+                        theme::Icon::User,
+                    );
+                    ui.vertical(|ui| {
+                        let name = member
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| gettext(app.locale, "Participant").to_string());
+                        let galley = crate::bidi::layout(
+                            ui.painter(),
+                            &name,
+                            theme::regular(14.0),
+                            app.palette.text,
+                            ui.available_width(),
+                            2,
+                            Some(crate::bidi::ELLIPSIS),
+                        );
+                        ui.add(egui::Label::new(galley)).on_hover_text(name);
+                        if owner.as_deref().is_some_and(|id| member.named_by(id)) {
+                            text(app, ui, "Host (declared by Spotify)");
+                        } else if owner.is_some() {
+                            text(app, ui, "Participant · Permissions unconfirmed");
+                        } else {
+                            text(app, ui, "Role unconfirmed");
+                        }
+                    });
+                });
+            },
+        );
+    }
+}
+
+/// Paint modules directly, with a four-module quiet zone. No texture, URI cache,
+/// disk file, network service or diagnostic representation holds the QR.
+fn qr(ui: &mut egui::Ui, code: &qrcodegen::QrCode, desired: f32) {
+    let modules = code.size() + 8;
+    let pixels = (desired.min(ui.available_width()) / modules as f32)
+        .floor()
+        .max(1.0);
+    let side = pixels * modules as f32;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Image, true, "Jam invitation QR")
+    });
+    ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
+    for y in 0..code.size() {
+        for x in 0..code.size() {
+            if code.get_module(x, y) {
+                let min = rect.min + egui::vec2((x + 4) as f32 * pixels, (y + 4) as f32 * pixels);
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(min, egui::Vec2::splat(pixels)),
+                    0.0,
+                    egui::Color32::BLACK,
+                );
+            }
+        }
+    }
+}
+
+fn return_focus(ctx: &egui::Context, key: &'static str, trigger: &'static str) {
+    let focus = ctx
+        .data_mut(|data| data.remove_temp::<bool>(egui::Id::new(key)))
+        .unwrap_or(false);
+    if focus && let Some(id) = ctx.data(|data| data.get_temp::<egui::Id>(egui::Id::new(trigger))) {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    }
+}
+
+fn invitation(app: &mut App, ui: &mut egui::Ui) {
+    if app.jam.invitation().is_none() {
+        text(app, ui, "Invitation unavailable");
+        return;
+    }
+    button(app, ui, "Invite", true, Intent::OpenInvitation);
+    return_focus(ui.ctx(), "jam-invitation-return", "jam-invitation-trigger");
+    return_focus(ui.ctx(), "jam-qr-return", "jam-qr-trigger");
+    if !app.jam.invitation_open {
+        return;
+    }
+    egui::Frame::new()
+        .fill(app.palette.surface)
+        .inner_margin(12.0)
+        .corner_radius(8.0)
+        .show(ui, |ui| {
+            let title = ui.add(
+                egui::Label::new(gettext(app.locale, "Invite to this Jam"))
+                    .sense(egui::Sense::focusable_noninteractive()),
+            );
+            if ui
+                .ctx()
+                .data_mut(|data| data.remove_temp::<bool>(egui::Id::new("jam-invitation-focus")))
+                .unwrap_or(false)
+            {
+                title.request_focus();
+                title.scroll_to_me(Some(egui::Align::Min));
+            }
+            text(app, ui, "Share only with people you want to invite.");
+            if let Some(code) = &app.jam.qr {
+                qr(ui, code, 180.0);
+            } else {
+                text(
+                    app,
+                    ui,
+                    "QR unavailable. You can request a copy of the link.",
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                button(app, ui, "Copy link", true, Intent::CopyInvitation);
+                button(
+                    app,
+                    ui,
+                    "Enlarge QR",
+                    app.jam.qr.is_some(),
+                    Intent::ExpandQr,
+                );
+                button(app, ui, "Close invitation", true, Intent::CloseInvitation);
+            });
+            if !app.jam.qr_expanded
+                && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                enqueue(app, Intent::CloseInvitation);
+            }
+        });
+}
+
+fn qr_modal(app: &mut App, ctx: &egui::Context) {
+    if !app.jam.qr_expanded || app.jam.invitation().is_none() {
+        return;
+    }
+    let response = egui::Modal::new(egui::Id::new("jam-qr-modal")).show(ctx, |ui| {
+        ui.set_width(340.0_f32.min(ctx.content_rect().width() - 48.0));
+        egui::ScrollArea::vertical()
+            .max_height((ctx.content_rect().height() - 80.0).max(80.0))
+            .show(ui, |ui| {
+                text(app, ui, "Invite to this Jam");
+                if let Some(code) = &app.jam.qr {
+                    qr(ui, code, 300.0);
+                }
+                let close = ui.add(
+                    egui::Button::new(gettext(app.locale, "Close QR"))
+                        .min_size(egui::vec2(36.0, 36.0)),
+                );
+                if !ctx.data(|data| {
+                    data.get_temp::<bool>(egui::Id::new("jam-qr-focused"))
+                        .unwrap_or(false)
+                }) {
+                    close.request_focus();
+                    ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-qr-focused"), true));
+                }
+                if close.clicked() {
+                    enqueue(app, Intent::CloseQr);
+                }
+                button(app, ui, "Copy link", true, Intent::CopyInvitation);
+            });
+    });
+    if response.should_close() {
+        enqueue(app, Intent::CloseQr);
     }
 }
 
@@ -126,7 +336,11 @@ pub(super) fn summary(app: &mut App, ui: &mut egui::Ui) {
     let fresh = app.jam.fresh();
     let absent = app.jam.can_create();
     let present = fresh && matches!(app.jam.membership, Membership::Present(_));
-    let heading = gettext(app.locale, if fresh { title(app) } else { "Jam" });
+    let heading = if fresh {
+        heading(app)
+    } else {
+        gettext(app.locale, "Jam").to_string()
+    };
     let status = gettext(app.locale, "State unconfirmed");
     let local = app.local.connected && app.local.is_active();
     egui::Sides::new().shrink_left().show(
@@ -171,14 +385,19 @@ pub(super) fn summary(app: &mut App, ui: &mut egui::Ui) {
 
 pub(super) fn section(app: &mut App, ui: &mut egui::Ui) {
     deadline(app, ui.ctx());
-    let heading = ui.add(
-        egui::Label::new(
-            egui::RichText::new(gettext(app.locale, title(app)))
-                .font(theme::bold(20.0))
-                .color(app.palette.text),
-        )
-        .sense(egui::Sense::focusable_noninteractive()),
+    let name = heading(app);
+    let galley = crate::bidi::layout(
+        ui.painter(),
+        &name,
+        theme::bold(20.0),
+        app.palette.text,
+        ui.available_width(),
+        2,
+        Some(crate::bidi::ELLIPSIS),
     );
+    let heading = ui
+        .add(egui::Label::new(galley).sense(egui::Sense::focusable_noninteractive()))
+        .on_hover_text(name);
     let focus = ui.ctx().data_mut(|data| {
         let focus = data
             .get_temp::<bool>(egui::Id::new("jam-management-focus"))
@@ -217,7 +436,8 @@ pub(super) fn section(app: &mut App, ui: &mut egui::Ui) {
                         "Participant"
                     },
                 );
-                text(app, ui, "Participants unavailable");
+                participants(app, ui);
+                invitation(app, ui);
                 if p.is_session_owner {
                     button(
                         app,
@@ -233,7 +453,7 @@ pub(super) fn section(app: &mut App, ui: &mut egui::Ui) {
                         "Leaving this Jam is not available here yet. Use Spotify to leave; the Jam can continue for others.",
                     );
                 }
-                text(app, ui, "Invitation unavailable. Permissions unconfirmed.");
+                text(app, ui, "Permissions unconfirmed.");
                 text(app, ui, "Playback queue; shared queue unconfirmed.");
                 text(app, ui, "Audio state is unconfirmed");
                 text(
@@ -335,29 +555,45 @@ pub(super) fn bar(app: &mut App, ui: &mut egui::Ui) {
                 .inner_margin(egui::Margin::symmetric(12, 0)),
         )
         .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                let label = if confirmed {
-                    if app.jam.owner_id().is_some() {
-                        "Your Jam · Host"
-                    } else {
-                        "Jam · Participant"
-                    }
+            let label = if confirmed {
+                if app.jam.host_name().is_some() {
+                    let role = gettext(
+                        app.locale,
+                        if app.jam.owner_id().is_some() {
+                            "Host"
+                        } else {
+                            "Participant"
+                        },
+                    );
+                    format!("{} · {role}", heading(app))
                 } else {
-                    "Jam · State unconfirmed"
-                };
-                theme::text(
-                    ui,
-                    gettext(app.locale, label),
-                    theme::bold(13.0),
-                    foreground,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    gettext(
+                        app.locale,
+                        if app.jam.owner_id().is_some() {
+                            "Your Jam · Host"
+                        } else {
+                            "Jam · Participant"
+                        },
+                    )
+                    .to_string()
+                }
+            } else {
+                gettext(app.locale, "Jam · State unconfirmed").to_string()
+            };
+            let mut manage = false;
+            egui::Sides::new().shrink_left().show(
+                ui,
+                |ui| {
+                    theme::text(ui, label.clone(), theme::bold(13.0), foreground)
+                        .on_hover_text(label);
+                },
+                |ui| {
                     let label = if confirmed {
                         "Manage Jam"
                     } else {
                         "Check Jam state"
                     };
-                    if ui
+                    manage = ui
                         .add(
                             egui::Button::new(
                                 egui::RichText::new(gettext(app.locale, label)).color(foreground),
@@ -365,17 +601,20 @@ pub(super) fn bar(app: &mut App, ui: &mut egui::Ui) {
                             .frame(false)
                             .min_size(egui::vec2(36.0, 36.0)),
                         )
-                        .clicked()
-                    {
-                        // Open recovery, never implicitly read Current.
-                        enqueue(app, Intent::Manage);
-                    }
-                });
-            });
+                        .clicked();
+                },
+            );
+            if manage {
+                enqueue(app, Intent::Manage);
+            }
         });
 }
 
 pub(super) fn confirmation(app: &mut App, ctx: &egui::Context) {
+    qr_modal(app, ctx);
+    if !app.jam.qr_expanded {
+        ctx.data_mut(|data| data.remove::<bool>(egui::Id::new("jam-qr-focused")));
+    }
     join_form(app, ctx);
     let focus_id = egui::Id::new("jam-end-focus");
     let Some(confirmation) = &app.jam.confirmation else {

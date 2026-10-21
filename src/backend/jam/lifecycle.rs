@@ -176,6 +176,7 @@ fn factory<T: Transport + 'static>(
 
 fn unknown(error: Option<Error>) -> Snapshot {
     Snapshot {
+        metadata: Default::default(),
         fresh_until: None,
         membership: Membership::Unknown,
         reconcile_required: true,
@@ -269,6 +270,12 @@ impl Gate {
     pub(crate) fn accepts(&self, stamp: Stamp) -> bool {
         let state = self.lock();
         state.stamp == stamp && state.context_valid()
+    }
+    /// A local private-data emission must also check a context getter that may
+    /// have changed before its notification, and hold the stamp through apply.
+    pub(crate) fn with_context<T>(&self, stamp: Stamp, apply: impl FnOnce() -> T) -> Option<T> {
+        let state = self.lock();
+        (state.stamp == stamp && state.context_valid()).then(apply)
     }
     pub(crate) fn accepts_event(&self, event: &Event) -> bool {
         let state = self.lock();
@@ -422,7 +429,15 @@ impl Bridge {
         });
         let jam = session
             .dealer()
-            .listen_for("social-connect/v2/session_update", |_| Ok(()));
+            .listen_for("social-connect/v2/session_update", |message| {
+                if let librespot_core::dealer::protocol::PayloadValue::Json(json) = &message.payload
+                {
+                    // Strict separate decoder; no delta may establish membership or
+                    // ordering. Invalid payloads must also retire the old binding.
+                    let _ = metadata::dealer(json.as_bytes());
+                }
+                Ok(())
+            });
         let connections = session
             .dealer()
             .listen_for("hm://pusher/v1/connections/", |message| {

@@ -6,6 +6,7 @@
 
 pub mod lifecycle;
 mod link;
+pub mod metadata;
 mod projection;
 pub use link::Link;
 
@@ -386,9 +387,22 @@ fn success(reply: &Reply) -> Result<(), Error> {
     }
 }
 
-fn membership(reply: Reply, _profile: &Profile) -> Result<Membership, Error> {
+struct Read {
+    membership: Membership,
+    metadata: metadata::Metadata,
+}
+
+#[cfg(test)]
+fn membership(reply: Reply, profile: &Profile) -> Result<Membership, Error> {
+    read_reply(reply, profile).map(|read| read.membership)
+}
+
+fn read_reply(reply: Reply, _profile: &Profile) -> Result<Read, Error> {
     if reply.status == StatusCode::NOT_FOUND.as_u16() {
-        return Ok(Membership::Absent);
+        return Ok(Read {
+            membership: Membership::Absent,
+            metadata: Default::default(),
+        });
     }
     success(&reply)?;
     match &reply.content_type {
@@ -400,12 +414,18 @@ fn membership(reply: Reply, _profile: &Profile) -> Result<Membership, Error> {
                 .is_some_and(|s| s.trim().eq_ignore_ascii_case("application/json")) => {}
         _ => return Err(Error::InvalidResponse),
     }
-    let projection = projection::read(&reply.body)?;
-    Ok(Membership::Present(projection))
+    let root = projection::json(&reply.body)?;
+    let metadata = metadata::snapshot(&root)?;
+    let projection = projection::from_value(root)?;
+    Ok(Read {
+        membership: Membership::Present(projection),
+        metadata,
+    })
 }
 
 #[derive(Clone)]
 pub struct Snapshot {
+    pub metadata: metadata::Metadata,
     /// Authority expires at the kernel deadline, including time queued for UI delivery.
     pub fresh_until: Option<Instant>,
     pub membership: Membership,
@@ -415,6 +435,7 @@ pub struct Snapshot {
 }
 
 struct State {
+    metadata: metadata::Metadata,
     context: Option<Context>,
     revision: u64,
     membership: Membership,
@@ -427,6 +448,7 @@ impl State {
     fn invalidate(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.membership = Membership::Unknown;
+        self.metadata = Default::default();
         self.current_at = None;
         self.reconcile = true;
         self.error = None;
@@ -450,6 +472,7 @@ impl<T: Transport> Kernel<T> {
             profile,
             gate: AsyncMutex::new(()),
             state: Mutex::new(State {
+                metadata: Default::default(),
                 context: None,
                 revision: 0,
                 membership: Membership::Unknown,
@@ -490,8 +513,18 @@ impl<T: Transport> Kernel<T> {
 
     pub fn snapshot(&self) -> Snapshot {
         let _ = self.sync_context();
-        let state = self.state();
+        let mut state = self.state();
+        if !state.current_at.is_some_and(|at| at.elapsed() < FRESH_FOR) {
+            state.metadata = Default::default();
+        }
         Snapshot {
+            metadata: if !state.reconcile
+                && state.current_at.is_some_and(|at| at.elapsed() < FRESH_FOR)
+            {
+                state.metadata.clone()
+            } else {
+                Default::default()
+            },
             fresh_until: state.current_at.map(|at| at + FRESH_FOR),
             membership: state.membership.clone(),
             reconcile_required: state.reconcile,
@@ -507,7 +540,7 @@ impl<T: Transport> Kernel<T> {
         }
     }
 
-    async fn read_current(&self, context: &Context, revision: u64) -> Result<Membership, Error> {
+    async fn read_current(&self, context: &Context, revision: u64) -> Result<Read, Error> {
         self.check(context, revision)?;
         let permit = || self.check(context, revision);
         let reply = self
@@ -523,7 +556,7 @@ impl<T: Transport> Kernel<T> {
             )
             .await?;
         self.check(context, revision)?;
-        membership(reply, &self.profile)
+        read_reply(reply, &self.profile)
     }
 
     pub async fn current(&self) -> Result<Membership, Error> {
@@ -601,10 +634,11 @@ impl<T: Transport> Kernel<T> {
             success(&reply)?;
             let created =
                 if operation == Operation::Create || matches!(operation, Operation::Join(_)) {
-                    match membership(reply, &self.profile)? {
-                        Membership::Present(session)
-                            if session.is_session_owner == (operation == Operation::Create) =>
-                        {
+                    match read_reply(reply, &self.profile)? {
+                        Read {
+                            membership: Membership::Present(session),
+                            metadata: _,
+                        } if session.is_session_owner == (operation == Operation::Create) => {
                             Some(session.session_id)
                         }
                         _ => return Err(Error::VerificationFailed),
@@ -613,7 +647,7 @@ impl<T: Transport> Kernel<T> {
                     None
                 };
             let current = self.read_current(&context, revision).await?;
-            match (&operation, created, &current) {
+            match (&operation, created, &current.membership) {
                 (Operation::Create, Some(id), Membership::Present(session))
                     if session.is_session_owner && session.session_id == id =>
                 {
@@ -636,11 +670,12 @@ impl<T: Transport> Kernel<T> {
             return Err(Error::Stale);
         }
         match &result {
-            Ok(membership) => {
+            Ok(read) => {
                 if operation != Operation::Current {
                     self.write_uncertain.store(false, Ordering::SeqCst);
                 }
-                state.membership = membership.clone();
+                state.membership = read.membership.clone();
+                state.metadata = read.metadata.clone();
                 state.current_at = Some(Instant::now());
                 state.reconcile = self.write_uncertain.load(Ordering::SeqCst);
                 if state.reconcile {
@@ -649,7 +684,7 @@ impl<T: Transport> Kernel<T> {
             }
             Err(error) => state.error = Some(*error),
         }
-        result
+        result.map(|read| read.membership)
     }
 }
 

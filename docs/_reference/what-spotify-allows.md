@@ -133,7 +133,8 @@ The Web API and librespot do not provide these features:
   who added each song, but Spotifast cannot start or manage one.
   The optional `jam-host` development feature has an experimental host section
   in the queue and Connect, with deliberate check/create/end commands and
-  experimental long-link Join. Confirmed membership does not establish audio or
+  experimental long-link Join, partial participants and local invitation/QR
+  presentation when validated data is available. Confirmed membership does not establish audio or
   control of another account. It has no real runtime
   validation or complete Jam support and does not change default availability. See its
   [candidate contract](../jam-host-kernel/) for the unverified protocol limits.

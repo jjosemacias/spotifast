@@ -33,6 +33,21 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         return;
     }
 
+    #[cfg(feature = "jam-host")]
+    if app.jam.qr_expanded {
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+            super::jam::enqueue(app, crate::model::jam::Intent::CloseQr);
+        }
+        return;
+    }
+    #[cfg(feature = "jam-host")]
+    if app.jam.invitation_open
+        && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+    {
+        super::jam::enqueue(app, crate::model::jam::Intent::CloseInvitation);
+        return;
+    }
+
     let typing = ctx.memory(|memory| memory.focused().is_some());
     // A focused song row still takes Ctrl+arrow to change songs; a text
     // field uses those keys to move its caret.

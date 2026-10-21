@@ -1465,6 +1465,20 @@ impl Backend {
         self.jam_gate.write_uncertain()
     }
 
+    #[cfg(feature = "jam-host")]
+    pub(crate) fn jam_context_valid(&self, stamp: jam::lifecycle::Stamp) -> bool {
+        self.jam_gate.accepts(stamp)
+    }
+
+    #[cfg(feature = "jam-host")]
+    pub(crate) fn with_jam_context<T>(
+        &self,
+        stamp: jam::lifecycle::Stamp,
+        apply: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.jam_gate.with_context(stamp, apply)
+    }
+
     /// Latest Jam state only; retired queued states cannot cross account/engine
     /// transitions. Coalescing also bounds memory when no UI consumes this API.
     #[cfg(feature = "jam-host")]

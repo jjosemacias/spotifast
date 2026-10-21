@@ -31,6 +31,89 @@ fn status(status: u16) -> Reply {
     }
 }
 
+fn metadata_reply(owner: bool, metadata: serde_json::Value) -> Reply {
+    let mut reply = session("synthetic-jam", owner);
+    let mut root: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    root.as_object_mut()
+        .unwrap()
+        .extend(metadata.as_object().unwrap().clone());
+    reply.body = serde_json::to_vec(&root).unwrap();
+    reply
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_is_ephemeral_without_changing_authority_or_expiry() {
+    let fake = Fake::new(vec![metadata_reply(
+        false,
+        serde_json::json!({
+            "session_owner_id":"synthetic-account",
+            "session_members":[{"id":"synthetic-account","display_name":"Named host"}],
+            "join_session_url":"https://open.spotify.com/socialsession/Synthetic08"
+        }),
+    )]);
+    let kernel = Kernel::new(Arc::clone(&fake), Profile::ObservedFourFields);
+    assert!(
+        matches!(kernel.current().await.unwrap(), Membership::Present(p) if !p.is_session_owner)
+    );
+    let snapshot = kernel.snapshot();
+    let deadline = snapshot.fresh_until;
+    assert_eq!(snapshot.metadata.members.as_ref().unwrap().len(), 1);
+    assert!(matches!(
+        kernel.end("synthetic-jam", EndIntent::ForEveryone).await,
+        Err(Error::NotOwner)
+    ));
+    assert_eq!(kernel.snapshot().fresh_until, deadline);
+    tokio::time::advance(FRESH_FOR).await;
+    assert!(kernel.snapshot().metadata.members.is_none());
+    assert!(kernel.state().metadata.invitation.is_none());
+    assert_eq!(kernel.snapshot().fresh_until, deadline);
+    assert_eq!(fake.writes(), 0);
+}
+
+#[tokio::test]
+async fn metadata_snapshots_do_not_merge_omission_or_cross_account_boundaries() {
+    let fake = Fake::new(vec![
+        metadata_reply(
+            true,
+            serde_json::json!({"session_members":[{"id":"synthetic"}],"join_session_url":"https://open.spotify.com/socialsession/Synthetic08"}),
+        ),
+        metadata_reply(true, serde_json::json!({})),
+        metadata_reply(true, serde_json::json!({"session_members":[]})),
+    ]);
+    let kernel = Kernel::new(Arc::clone(&fake), Profile::ObservedFourFields);
+    kernel.current().await.unwrap();
+    assert!(kernel.snapshot().metadata.invitation.is_some());
+    kernel.current().await.unwrap();
+    assert!(kernel.snapshot().metadata.members.is_none());
+    assert!(kernel.snapshot().metadata.invitation.is_none());
+    kernel.current().await.unwrap();
+    assert!(kernel.snapshot().metadata.members.unwrap().is_empty());
+    fake.context.lock().unwrap().as_mut().unwrap().account = "other-synthetic-account".into();
+    let snapshot = kernel.snapshot();
+    assert!(snapshot.membership == Membership::Unknown);
+    assert!(snapshot.metadata.members.is_none());
+}
+
+#[tokio::test]
+async fn metadata_late_reply_cannot_restore_a_retired_binding() {
+    let fake = Fake::new(vec![]);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    fake.push(Step::Wait(receive));
+    let kernel = Arc::new(Kernel::new(Arc::clone(&fake), Profile::ObservedFourFields));
+    let task = tokio::spawn({
+        let kernel = Arc::clone(&kernel);
+        async move { kernel.current().await }
+    });
+    while fake.count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    kernel.invalidate();
+    send.send(metadata_reply(true, serde_json::json!({"session_members":[{"id":"synthetic"}],"join_session_url":"https://open.spotify.com/socialsession/Synthetic08"}))).ok().unwrap();
+    assert!(matches!(task.await.unwrap(), Err(Error::Stale)));
+    assert!(kernel.snapshot().metadata.members.is_none());
+    assert!(kernel.snapshot().metadata.invitation.is_none());
+}
+
 enum Step {
     Reply(Reply),
     Error(Error),

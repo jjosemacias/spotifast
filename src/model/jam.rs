@@ -18,6 +18,11 @@ pub enum Intent {
     RequestListenHere,
     ConfirmJoin,
     EditJoin(DraftText),
+    OpenInvitation,
+    CloseInvitation,
+    ExpandQr,
+    CloseQr,
+    CopyInvitation,
 }
 
 #[derive(Clone)]
@@ -48,6 +53,10 @@ pub struct JoinDraft {
 }
 
 pub struct State {
+    pub metadata: crate::backend::jam::metadata::Metadata,
+    pub invitation_open: bool,
+    pub qr_expanded: bool,
+    pub qr: Option<qrcodegen::QrCode>,
     pub stamp: Stamp,
     pub engaged: bool,
     pub membership: Membership,
@@ -63,6 +72,10 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            metadata: Default::default(),
+            invitation_open: false,
+            qr_expanded: false,
+            qr: None,
             stamp: Stamp::default(),
             engaged: false,
             membership: Membership::Unknown,
@@ -95,6 +108,7 @@ impl State {
                 self.error = None;
                 self.confirmation = None;
                 self.join = None;
+                self.clear_metadata();
                 return;
             }
             let notice = self
@@ -126,6 +140,7 @@ impl State {
         self.stamp = live;
         self.confirmation = None;
         self.join = None;
+        self.clear_metadata();
         self.error = event.snapshot.error;
         self.reconcile = event.snapshot.reconcile_required;
         self.fresh_until = event.snapshot.fresh_until;
@@ -146,7 +161,40 @@ impl State {
                 self.notice.take()
             };
         }
+        if self.fresh() && matches!(event.snapshot.membership, Membership::Present(_)) {
+            self.metadata = event.snapshot.metadata.clone();
+        }
         true
+    }
+
+    pub fn clear_metadata(&mut self) {
+        self.metadata = Default::default();
+        self.close_invitation();
+    }
+
+    pub fn close_invitation(&mut self) {
+        self.invitation_open = false;
+        self.qr_expanded = false;
+        self.qr = None;
+    }
+
+    pub fn invitation(&self) -> Option<&str> {
+        self.owner_id()?;
+        self.metadata.invitation.as_ref().map(|link| link.url())
+    }
+
+    pub fn host_name(&self) -> Option<&str> {
+        if !self.fresh() {
+            return None;
+        }
+        let owner = self.metadata.owner.as_deref()?;
+        let member = self
+            .metadata
+            .members
+            .as_ref()?
+            .iter()
+            .find(|m| m.named_by(owner))?;
+        member.name.as_deref()
     }
 
     pub fn fresh(&self) -> bool {
@@ -175,6 +223,7 @@ impl State {
         self.error = None;
         self.notice = None;
         self.join = None;
+        self.clear_metadata();
     }
 }
 
@@ -190,11 +239,50 @@ mod tests {
             is_controlling: false,
         })
     }
+    #[test]
+    fn unknown_and_old_operation_metadata_never_replenish_authority() {
+        use crate::backend::jam::metadata::{Invitation, Metadata};
+        let mut state = State::default();
+        let live = state.stamp;
+        let mut snapshot = event(live, owner());
+        snapshot.snapshot.metadata = Metadata {
+            invitation: Invitation::parse("https://open.spotify.com/socialsession/Synthetic08"),
+            ..Default::default()
+        };
+        state.observe(&snapshot, live);
+        assert!(state.invitation().is_some());
+        let deadline = state.fresh_until;
+        let mut old = event(
+            Stamp {
+                operation: 99,
+                ..live
+            },
+            owner(),
+        );
+        old.snapshot.metadata = snapshot.snapshot.metadata.clone();
+        assert!(!state.observe(&old, live));
+        assert_eq!(state.fresh_until, deadline);
+        state.invitation_open = true;
+        state.qr = Some(
+            qrcodegen::QrCode::encode_text(
+                state.invitation().unwrap(),
+                qrcodegen::QrCodeEcc::Medium,
+            )
+            .unwrap(),
+        );
+        let mut unknown = event(live, Membership::Unknown);
+        unknown.snapshot.fresh_until = None;
+        unknown.snapshot.reconcile_required = true;
+        state.observe(&unknown, live);
+        assert!(state.metadata.invitation.is_none() && state.qr.is_none());
+        assert!(state.owner_id().is_none());
+    }
     fn event(stamp: Stamp, membership: Membership) -> Event {
         Event {
             stamp,
             phase: Phase::Complete(Kind::Current),
             snapshot: Snapshot {
+                metadata: Default::default(),
                 membership,
                 reconcile_required: false,
                 error: None,

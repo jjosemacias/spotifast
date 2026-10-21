@@ -731,6 +731,53 @@ pub(crate) fn jam_fixture(app: &mut App, scene: &str) {
         },
         ..State::default()
     };
+    if matches!(
+        scene,
+        "jam-invitation" | "jam-qr" | "jam-members" | "jam-members-empty"
+    ) {
+        use crate::backend::jam::metadata::{Invitation, Member, Metadata};
+        app.jam.metadata = Metadata {
+            owner: Some("synthetic-host".into()),
+            members: Some(if scene == "jam-members-empty" {
+                vec![]
+            } else {
+                [
+                    "Alex (synthetic)",
+                    "Morgan (synthetic)",
+                    "Taylor with a deliberately long participant name (synthetic)",
+                ]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| Member {
+                    id: Some(if i == 0 {
+                        "synthetic-host".into()
+                    } else {
+                        format!("synthetic-{i}")
+                    }),
+                    username: None,
+                    name: Some((*name).into()),
+                    image: None,
+                    listening: Some(true),
+                    controlling: None,
+                })
+                .collect()
+            }),
+            invitation: Invitation::parse(
+                "https://open.spotify.com/socialsession/SyntheticInvite08",
+            ),
+        };
+        if scene == "jam-invitation" || scene == "jam-qr" {
+            app.jam.invitation_open = true;
+            app.jam.qr = Some(
+                qrcodegen::QrCode::encode_text(
+                    app.jam.invitation().unwrap(),
+                    qrcodegen::QrCodeEcc::Medium,
+                )
+                .unwrap(),
+            );
+            app.jam.qr_expanded = scene == "jam-qr";
+        }
+    }
     if scene == "jam-pending" {
         app.jam.start(Kind::Create);
         app.jam.membership = Membership::Absent;
@@ -1025,7 +1072,8 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             #[cfg(feature = "jam-host")]
             "jam-unknown" | "jam-absent" | "jam-owner" | "jam-participant" | "jam-pending"
             | "jam-error" | "jam-end" | "jam-join" | "jam-join-invalid" | "jam-join-pending"
-            | "jam-join-uncertain" => jam_fixture(app, surface),
+            | "jam-join-uncertain" | "jam-invitation" | "jam-qr" | "jam-members"
+            | "jam-members-empty" => jam_fixture(app, surface),
             #[cfg(feature = "jam-host")]
             "jam-connect" => app.show_devices = true,
             #[cfg(feature = "jam-host")]
@@ -1409,6 +1457,159 @@ mod tests {
     use crate::paths::AppDirs;
     use crate::settings::Settings;
     use std::sync::Arc;
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_invitation_copy_requires_current_intention_and_retires_qr() {
+        use crate::backend::jam::metadata::Invitation;
+        use crate::model::jam::{Intent, UiAction};
+        let (ctx, mut app) = accessible_app("jam-invitation-intention");
+        let apply = |app: &mut App, intent: Intent, expected| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.apply(
+                    Action::Jam(UiAction {
+                        intent: intent.clone(),
+                        expected,
+                    }),
+                    ui.ctx(),
+                );
+            });
+            output.textures_delta.clear();
+            output.platform_output.commands
+        };
+        jam_fixture(&mut app, "jam-members");
+        let stamp = app.jam.stamp;
+        assert!(apply(&mut app, Intent::CopyInvitation, stamp).is_empty());
+        assert!(apply(&mut app, Intent::OpenInvitation, stamp).is_empty());
+        assert!(app.jam.invitation_open && app.jam.qr.is_some());
+        let url = app.jam.invitation().unwrap().to_owned();
+        assert_eq!(
+            apply(&mut app, Intent::CopyInvitation, stamp),
+            vec![egui::OutputCommand::CopyText(url)]
+        );
+        assert!(app.jam.notice.unwrap().contains("unconfirmed"));
+        let stale = crate::backend::jam::lifecycle::Stamp {
+            operation: stamp.operation.wrapping_add(1),
+            ..stamp
+        };
+        assert!(apply(&mut app, Intent::CopyInvitation, stale).is_empty());
+        apply(&mut app, Intent::CloseInvitation, stamp);
+        assert!(app.jam.qr.is_none());
+        assert!(apply(&mut app, Intent::CopyInvitation, stamp).is_empty());
+        app.jam.metadata.invitation =
+            Invitation::parse("https://evil.test/socialsession/Synthetic08");
+        apply(&mut app, Intent::OpenInvitation, stamp);
+        assert!(!app.jam.invitation_open);
+        jam_fixture(&mut app, "jam-invitation");
+        if let crate::backend::jam::Membership::Present(p) = &mut app.jam.membership {
+            p.is_session_owner = false;
+        }
+        assert!(apply(&mut app, Intent::CopyInvitation, stamp).is_empty());
+        jam_fixture(&mut app, "jam-invitation");
+        app.jam.fresh_until = Some(tokio::time::Instant::now());
+        assert!(apply(&mut app, Intent::CopyInvitation, stamp).is_empty());
+        assert!(
+            app.jam.metadata.invitation.is_none()
+                && app.jam.qr.is_none()
+                && !app.jam.invitation_open
+        );
+        jam_fixture(&mut app, "jam-qr");
+        app.jam.sync(crate::backend::jam::lifecycle::Stamp {
+            account: stamp.account.wrapping_add(1),
+            ..stamp
+        });
+        assert!(app.jam.metadata.members.is_none() && app.jam.qr.is_none());
+        assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        app.backend.shutdown();
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_metadata_and_invitation_draw_without_implicit_copy_or_requests() {
+        for scene in [
+            "jam-members",
+            "jam-members-empty",
+            "jam-invitation",
+            "jam-qr",
+        ] {
+            for palette in [
+                crate::theme::Palette::dark(),
+                crate::theme::Palette::light(),
+            ] {
+                for size in [egui::vec2(1200.0, 760.0), egui::vec2(760.0, 520.0)] {
+                    let (ctx, mut app) = accessible_app("jam-metadata-geometry");
+                    app.palette = palette;
+                    app.history = vec![Page::Queue];
+                    jam_fixture(&mut app, scene);
+                    for _ in 0..2 {
+                        let output = jam_frame(&ctx, &mut app, size, vec![]);
+                        assert!(output.platform_output.commands.is_empty());
+                    }
+                    assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+                    app.backend.shutdown();
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_qr_keyboard_closes_one_layer_without_playback_or_copy() {
+        use crate::model::jam::Intent;
+        let (ctx, mut app) = accessible_app("jam-qr-keyboard");
+        jam_fixture(&mut app, "jam-qr");
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        jam_frame(&ctx, &mut app, egui::vec2(760.0, 520.0), vec![]);
+        app.actions.clear();
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+        let output = jam_frame(
+            &ctx,
+            &mut app,
+            egui::vec2(760.0, 520.0),
+            vec![key(egui::Key::Space)],
+        );
+        assert!(app.actions.is_empty() && output.platform_output.commands.is_empty());
+        jam_frame(
+            &ctx,
+            &mut app,
+            egui::vec2(760.0, 520.0),
+            vec![key(egui::Key::Escape)],
+        );
+        assert_eq!(app.actions.len(), 1);
+        assert!(
+            matches!(&app.actions[0], Action::Jam(action) if matches!(action.intent, Intent::CloseQr))
+        );
+        for action in std::mem::take(&mut app.actions) {
+            app.apply(action, &ctx);
+        }
+        assert!(!app.jam.qr_expanded && app.jam.invitation_open && app.show_queue_panel);
+        jam_frame(
+            &ctx,
+            &mut app,
+            egui::vec2(760.0, 520.0),
+            vec![key(egui::Key::Escape)],
+        );
+        assert_eq!(app.actions.len(), 1);
+        assert!(
+            matches!(&app.actions[0], Action::Jam(action) if matches!(action.intent, Intent::CloseInvitation))
+        );
+        for action in std::mem::take(&mut app.actions) {
+            app.apply(action, &ctx);
+        }
+        assert!(!app.jam.invitation_open && app.jam.qr.is_none() && app.show_queue_panel);
+        assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        app.backend.shutdown();
+    }
 
     #[cfg(feature = "jam-host")]
     #[test]

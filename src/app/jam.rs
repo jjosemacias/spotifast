@@ -10,6 +10,7 @@ impl App {
     pub(super) fn consume_jam(&mut self, ctx: &egui::Context) {
         let had_confirmation = self.jam.confirmation.is_some();
         let had_join = self.jam.join.is_some();
+        let had_invitation = self.jam.invitation_open;
         let event = self.backend.poll_jam();
         let live = self.backend.jam_stamp();
         if let Some(event) = event
@@ -39,6 +40,12 @@ impl App {
             }
         }
         self.jam.sync(live);
+        if !self.jam.fresh() || !self.backend.jam_context_valid(live) {
+            self.jam.clear_metadata();
+        }
+        if had_invitation && !self.jam.invitation_open {
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
+        }
         if !self.jam.can_create() || !self.local.connected {
             self.jam.join = None;
         }
@@ -83,6 +90,46 @@ impl App {
             return;
         }
         match intent {
+            Intent::OpenInvitation => {
+                if let Some(url) = self.jam.invitation() {
+                    let qr = qrcodegen::QrCode::encode_text(url, qrcodegen::QrCodeEcc::Medium).ok();
+                    self.jam.qr = qr;
+                    self.jam.invitation_open = true;
+                    ctx.data_mut(|data| {
+                        data.insert_temp(egui::Id::new("jam-invitation-focus"), true)
+                    });
+                }
+                return;
+            }
+            Intent::CloseInvitation => {
+                self.jam.close_invitation();
+                ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-invitation-return"), true));
+                return;
+            }
+            Intent::ExpandQr => {
+                if self.jam.invitation().is_some()
+                    && self.jam.invitation_open
+                    && self.jam.qr.is_some()
+                {
+                    self.jam.qr_expanded = true;
+                }
+                return;
+            }
+            Intent::CloseQr => {
+                self.jam.qr_expanded = false;
+                ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-qr-return"), true));
+                return;
+            }
+            Intent::CopyInvitation => {
+                let jam = &mut self.jam;
+                let _ = self.backend.with_jam_context(action.expected, || {
+                    if let Some(url) = jam.invitation().filter(|_| jam.invitation_open) {
+                        ctx.copy_text(url.to_owned());
+                        jam.notice = Some("Copy requested. Clipboard delivery is unconfirmed.");
+                    }
+                });
+                return;
+            }
             Intent::Manage => {
                 self.open_jam_management(ctx);
                 return;

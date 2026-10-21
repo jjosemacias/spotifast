@@ -74,7 +74,7 @@ impl<'de> Visitor<'de> for Seed<'_> {
     }
 }
 
-pub(super) fn read(body: &[u8]) -> Result<Projection, Error> {
+pub(super) fn json(body: &[u8]) -> Result<Value, Error> {
     if body.len() > MAX_BODY {
         return Err(Error::InvalidResponse);
     }
@@ -89,6 +89,16 @@ pub(super) fn read(body: &[u8]) -> Result<Projection, Error> {
     if !root.is_object() {
         return Err(Error::InvalidResponse);
     }
+    Ok(root)
+}
+
+#[cfg(test)]
+pub(super) fn read(body: &[u8]) -> Result<Projection, Error> {
+    let root = json(body)?;
+    from_value(root)
+}
+
+pub(super) fn from_value(root: Value) -> Result<Projection, Error> {
     let projection: Projection =
         serde_json::from_value(root).map_err(|_| Error::InvalidResponse)?;
     let id = &projection.session_id;

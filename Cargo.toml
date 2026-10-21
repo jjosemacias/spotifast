@@ -180,6 +180,9 @@ hmac = "0.12"
 pbkdf2 = "0.12"
 aes = "0.8"
 ctr = "0.9"
+# Local invitation QR only: small pure Rust encoder, no transitive dependencies
+# or external QR service. Optional with the experimental Jam UI.
+qrcodegen = { version = "1.8.0", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
@@ -234,7 +237,7 @@ default = ["milkdrop"]
 # Sample data and screenshot flags; never part of a release build.
 demo = []
 # Experimental host UI in Connect. Deliberate reads/writes only; off by default.
-jam-host = ["dep:http-body-util"]
+jam-host = ["dep:http-body-util", "dep:qrcodegen"]
 # MilkDrop, through libprojectM: a C++ library that CMake builds into the
 # binary at compile time, so building needs cmake, a C++ compiler, and
 # libclang. `--no-default-features` leaves it out.

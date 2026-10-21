@@ -128,11 +128,15 @@ sends no Jam request or audio command. Check Jam state is deliberate. The strip
 is green only for fresh confirmed membership; unconfirmed state is neutral.
 Closing a view never leaves or ends a Jam. End requires fresh host authority and
 confirmation, and verifies only this account's absence, not an end for everyone.
-The feature is off by default with offline validation only. Invitations,
-participants, Leave, permissions, shared queue and synchronized audio remain
+The feature is off by default with offline validation only. Leave,
+permissions, shared queue and synchronized audio remain
 unavailable. Join accepts only strict Spotify HTTPS long invitations, after a fresh
 absence check and an explicit request. Membership confirmation does not confirm
-local audio or host controls. Short links and other modes remain pending. See the [candidate contract](docs/_reference/jam-host-kernel.md).
+local audio or host controls. Short links and other modes remain pending.
+Fresh responses may also supply a partial participant list and a validated host
+invitation. Its queue card offers a deliberate native copy request and a local,
+temporary QR; unavailable data stays visibly unavailable. These experimental
+paths still need a real invitation-to-Join test. See the [candidate contract](docs/_reference/jam-host-kernel.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull
 request. To look at the interface without a Spotify account, run:

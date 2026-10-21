@@ -181,8 +181,9 @@ the account alone cannot revive old results or intentions. The latest Unknown
 invalidation remains consumable while verification or context is unavailable.
 
 On engine acceptance, two listeners reuse its Dealer before a read is allowed:
-social-connect/v2/session_update and hm://pusher/v1/connections/. Jam payloads
-are discarded, not parsed as member/owner truth. Every notification conservatively
+social-connect/v2/session_update and hm://pusher/v1/connections/. JSON Jam payloads
+have a separate bounded delta decoder, never the HTTP membership profile. No
+delta is applied as member/owner truth: ordering is not demonstrated. Every notification conservatively
 invalidates to Unknown, cancels pending work and fences already queued results.
 This includes notifications caused by our own writes: they can leave the outcome
 uncertain, requiring a new deliberate Current, without retrying the mutation.
@@ -277,3 +278,53 @@ turn a possibly outstanding write into permission to transfer. A Current404 does
 not remove that safety block. The scalar local fence grants no remote identity,
 role, freshness or capability. Without uncertain Jam activity, ordinary Connect
 and fresh confirmed absence keep their existing behavior.
+
+## Experimental participants and invitation (J02-08)
+
+The opt-in Jam section can show display names, declared host and avatars from
+optional fields on the same strict HTTP membership response. This presentation
+DTO is separate from the four mandatory membership fields. Optional names and
+owner IDs grant no command authority. A supplied member list is explicitly
+partial, with no claimed global count. An omitted list is unavailable; an explicit
+empty list means only that this response lists nobody. Names without a member
+identity cannot create a participant. Unknown fields remain bounded and duplicate
+keys, conflicting aliases, duplicate identities and wrong types are rejected.
+
+Current, Create and Join responses use the same strict HTTP parser and MIME
+policy. For mutations the final verifying Current supplies the displayed metadata;
+metadata from the earlier mutation response is not merged into an omitted field
+of a later snapshot. No format, completeness or ordering guarantee is invented.
+Dealer's delta envelope validates optional session/member fields separately;
+all Dealer notifications still invalidate and require deliberate Current. An
+omitted delta list is never interpreted as an empty snapshot. Applying partial
+Dealer changes without a demonstrated ordering contract remains pending.
+
+Only a fresh confirmed owner can open the invitation card in the existing queue.
+`join_session_url` accepts the exact long HTTPS form already supported for Join,
+or the exact `spotify://sessions/join/{alphanumeric-token}` form, converted to
+that long URL. Arbitrary HTTPS origins, short links, fragments, encoded tokens,
+unknown parameters and token fields used as a fallback are unavailable. This
+format evidence is the candidate implementation at Tu2525/spotifast 5fca13ce,
+not an official Spotify guarantee. Other forms need evidence before support.
+
+Opening the card generates a local QR using the small optional qrcodegen encoder
+(no transitive dependencies). The QR represents exactly the validated URL offered
+to Copy link. It is painted directly with a quiet zone, retained only in memory,
+and discarded on close, expiry, pending/Unknown or any binding change. Enlarge QR
+opens a native modal; Escape closes it and returns focus. No URL is printed in
+the card or used as a texture/cache key. Copy link emits a native clipboard
+request only after the application revalidates its stamp, role and deadline.
+The existing clipboard integration has no delivery acknowledgement, so the
+notice states that delivery is unconfirmed, never that copying succeeded.
+
+Avatar input accepts only a 40-hex Spotify image identifier or its exact
+`https://i.scdn.co/image/{id}` form, with no query/credentials/arbitrary hosts.
+It uses the existing artwork loader and its ordinary bounded image cache;
+no member identity, name, invitation or QR is persisted. Unsupported/missing
+pictures use the existing neutral user icon, without a new profile lookup.
+
+Native demo scenes `jam-members`, `jam-members-empty`, `jam-invitation`, and
+`jam-qr` contain synthetic identities and a synthetic URL only. They demonstrate
+presentation and local actions, not a usable Spotify invitation. Acceptance of
+R02 and the invitation-to-Join-to-same-Jam flow with real members remains J02-12.
+Permissions, moderation, Leave, remote queue edits and audio are separate gates.

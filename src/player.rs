@@ -308,6 +308,8 @@ pub enum EngineEvent {
 pub type Notify = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
 pub struct Engine {
+    #[cfg(feature = "jam-host")]
+    jam_listeners: Mutex<Option<crate::backend::jam::lifecycle::PreparedListeners>>,
     player: Arc<Player>,
     spirc: Arc<Spirc>,
     session: Session,
@@ -321,6 +323,15 @@ pub struct Engine {
 }
 
 impl Engine {
+    #[cfg(feature = "jam-host")]
+    pub(crate) fn take_jam_listeners(
+        &self,
+    ) -> Option<crate::backend::jam::lifecycle::PreparedListeners> {
+        self.jam_listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
     pub(crate) fn credentials(&self) -> Option<Credentials> {
         self.session.cache().and_then(|cache| cache.credentials())
     }
@@ -370,6 +381,8 @@ impl Engine {
             ..LocalState::default()
         }));
         let session = Session::new(session_config, Some(cache));
+        #[cfg(feature = "jam-host")]
+        let jam_listeners = crate::backend::jam::lifecycle::PreparedListeners::new(session.clone());
         let audio = AudioControl::new(config.buffer_ms);
         let (sink_builder, volume) = sink_builder(
             config,
@@ -438,6 +451,8 @@ impl Engine {
         });
 
         Ok(Self {
+            #[cfg(feature = "jam-host")]
+            jam_listeners: Mutex::new(Some(jam_listeners)),
             player,
             spirc: Arc::new(spirc),
             session,

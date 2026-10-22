@@ -12,6 +12,15 @@ requests, automatic refreshes or added audio commands. Compiling, constructing
 a kernel and opening Connect send no Jam request. Only synthetic offline
 validation is available; this is an incomplete local development unit.
 
+Jam's two local Dealer subscriptions are reserved on the newly constructed
+Session before Spirc's event loop can launch Dealer. They travel with that same
+Session in the engine and are consumed on backend acceptance, without registering
+again. Dealer startup temporarily owns neither an available builder nor a
+published connection; subscribing at acceptance used to race that interval and
+leave Jam unready even after playback connected. Reservation performs no network
+work and does not establish membership, connection readiness or authority. Failed
+or closed subscriptions still block requests, without retry or repair.
+
 ## Queue, membership strip and Connect
 
 - Choose **Check Jam state** deliberately. It is a read, never creation. A fresh

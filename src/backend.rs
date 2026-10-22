@@ -3627,6 +3627,8 @@ impl Worker {
                     });
                 }
                 let device_id = engine.device_id().to_string();
+                #[cfg(feature = "jam-host")]
+                let jam_listeners = engine.take_jam_listeners();
                 let engine = Arc::new(engine);
                 self.heard = Some(engine.heard());
                 if let Some(spec) = self.resume.take() {
@@ -3637,12 +3639,17 @@ impl Worker {
                     self.schedule_resume_check(1_500);
                 }
                 #[cfg(feature = "jam-host")]
-                self.jam.attach(
-                    engine.session().clone(),
-                    self.session.subscribe(),
-                    Arc::clone(&self.api),
-                    Arc::clone(&self.background_session),
-                );
+                if let Some(listeners) = jam_listeners {
+                    self.jam.attach(
+                        listeners,
+                        self.session.subscribe(),
+                        Arc::clone(&self.api),
+                        Arc::clone(&self.background_session),
+                    );
+                } else {
+                    self.jam
+                        .retire(*self.session.borrow(), jam::lifecycle::Cause::Engine);
+                }
                 self.engine = Some(engine);
                 self.start_rootlist();
                 self.reconnects.clear();

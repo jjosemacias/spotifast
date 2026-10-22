@@ -663,6 +663,90 @@ fn attachment_and_notifications_are_passive_and_bounded() {
 }
 
 #[test]
+fn listeners_are_reserved_on_the_real_dealer_before_spirc_launch_and_do_not_claim_readiness() {
+    let (runtime, mut worker, _fake, _commands, events) = setup("jam-reserved-listeners");
+    let _entered = runtime.enter();
+    let session = Session::new(
+        librespot_core::config::SessionConfig {
+            device_id: "synthetic-device".into(),
+            ..Default::default()
+        },
+        None,
+    );
+    session.set_username("alice");
+    assert!(!session.dealer().handles("social-connect/v2/session_update"));
+    assert!(!session.dealer().handles("hm://pusher/v1/connections/"));
+    let prepared = PreparedListeners::new(session.clone());
+    assert!(prepared.jam.is_ok() && prepared.connections.is_ok());
+    assert!(session.dealer().handles("social-connect/v2/session_update"));
+    assert!(session.dealer().handles("hm://pusher/v1/connections/"));
+    // Spirc reserves these same prefixes. SubscriberMap supports both receivers;
+    // this is not the exclusive request-handler map.
+    let _spirc_jam = session
+        .dealer()
+        .add_listen_for("social-connect/v2/session_update")
+        .unwrap();
+    let _spirc_connections = session
+        .dealer()
+        .add_listen_for("hm://pusher/v1/connections/")
+        .unwrap();
+    worker.jam.attach(
+        prepared,
+        worker.session.subscribe(),
+        Arc::clone(&worker.api),
+        Arc::clone(&worker.background_session),
+    );
+    assert!(worker.jam.gate.lock().listening);
+    assert!(latest(&events).snapshot.membership == Membership::Unknown);
+    assert!(latest(&events).snapshot.reconcile_required);
+    // No connection has been announced. Registered listeners are not permission
+    // to skip SessionTransport's nonempty connection check or issue Current.
+    let probe = diagnose(&mut worker);
+    assert_eq!(
+        probe.snapshot().to_string(),
+        "class=preflight_not_ready; http=none; schema=none"
+    );
+    assert!(worker.jam.gate.lock().pending.is_none());
+    assert!(latest(&events).snapshot.membership == Membership::Unknown);
+}
+
+#[test]
+fn failed_listener_reservation_remains_blocked_when_connection_later_becomes_ready() {
+    let (runtime, mut worker, _fake, _commands, events) = setup("jam-listener-install-failure");
+    let _entered = runtime.enter();
+    let session = Session::new(
+        librespot_core::config::SessionConfig {
+            device_id: "synthetic-device".into(),
+            ..Default::default()
+        },
+        None,
+    );
+    session.set_username("alice");
+    let mut prepared = PreparedListeners::new(session.clone());
+    // Inject only the local reservation failure, without launching Dealer or
+    // simulating its network. The private start-window is verified statically.
+    prepared.jam = Err(librespot_core::Error::failed_precondition(
+        "synthetic local reservation failure",
+    ));
+    worker.jam.attach(
+        prepared,
+        worker.session.subscribe(),
+        Arc::clone(&worker.api),
+        Arc::clone(&worker.background_session),
+    );
+    session.set_connection_id("synthetic-later-connection");
+    let probe = diagnose(&mut worker);
+    assert_eq!(
+        probe.snapshot().to_string(),
+        "class=preflight_not_ready; http=none; schema=none"
+    );
+    assert!(!worker.jam.gate.lock().listening);
+    assert!(worker.jam.gate.lock().pending.is_none());
+    assert!(worker.jam.gate.lock().kernel.is_none());
+    assert!(latest(&events).snapshot.membership == Membership::Unknown);
+}
+
+#[test]
 fn pending_then_verified_result_and_no_implicit_http() {
     let (runtime, mut worker, fake, mut commands, events) = setup("jam-event-order");
     runtime.block_on(async {

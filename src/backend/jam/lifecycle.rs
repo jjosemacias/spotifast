@@ -7,6 +7,43 @@ use tokio::task::AbortHandle;
 use super::*;
 use crate::backend::{Command, Waker};
 
+/// Reserve local subscriptions while the Session still owns its Dealer builder,
+/// before Spirc's event loop can take it to launch the connection. The streams
+/// travel with that same Session; accepting an engine must not subscribe again.
+pub(crate) struct PreparedListeners {
+    session: Session,
+    jam: Result<librespot_core::dealer::manager::BoxedStreamResult<()>, librespot_core::Error>,
+    connections: Result<
+        librespot_core::dealer::manager::BoxedStreamResult<Option<String>>,
+        librespot_core::Error,
+    >,
+}
+
+impl PreparedListeners {
+    pub(crate) fn new(session: Session) -> Self {
+        let jam = session
+            .dealer()
+            .listen_for("social-connect/v2/session_update", |message| {
+                if let librespot_core::dealer::protocol::PayloadValue::Json(json) = &message.payload
+                {
+                    // A decoded delta still cannot establish membership or ordering.
+                    let _ = metadata::dealer(json.as_bytes());
+                }
+                Ok(())
+            });
+        let connections = session
+            .dealer()
+            .listen_for("hm://pusher/v1/connections/", |message| {
+                Ok(message.headers.get("Spotify-Connection-Id").cloned())
+            });
+        Self {
+            session,
+            jam,
+            connections,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stamp {
     pub account: u64,
@@ -449,15 +486,20 @@ impl Bridge {
         );
     }
 
-    /// Local subscriptions only, on the engine's existing Dealer. No HTTP,
-    /// owner inference, subscription repair or connection of another Session.
+    /// Consume the engine's already reserved local subscriptions. No HTTP,
+    /// late Dealer registration, subscription repair or new Session connection.
     pub(crate) fn attach(
         &mut self,
-        session: Session,
+        prepared: PreparedListeners,
         account_epoch: watch::Receiver<u64>,
         api: Arc<crate::api::ApiGateway>,
         budget: Arc<Semaphore>,
     ) {
+        let PreparedListeners {
+            session,
+            jam,
+            connections,
+        } = prepared;
         let Some(account) = api.account() else {
             self.retire(*account_epoch.borrow(), Cause::Account);
             return;
@@ -468,22 +510,6 @@ impl Bridge {
             api.account()
                 .is_some_and(|account| account.as_str() == verified)
         });
-        let jam = session
-            .dealer()
-            .listen_for("social-connect/v2/session_update", |message| {
-                if let librespot_core::dealer::protocol::PayloadValue::Json(json) = &message.payload
-                {
-                    // Strict separate decoder; no delta may establish membership or
-                    // ordering. Invalid payloads must also retire the old binding.
-                    let _ = metadata::dealer(json.as_bytes());
-                }
-                Ok(())
-            });
-        let connections = session
-            .dealer()
-            .listen_for("hm://pusher/v1/connections/", |message| {
-                Ok(message.headers.get("Spotify-Connection-Id").cloned())
-            });
         let epoch = *account_epoch.borrow();
         let connection = session.connection_id();
         let make = factory(

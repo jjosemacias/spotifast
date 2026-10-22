@@ -40,7 +40,12 @@ impl Invitation {
         if value.len() > 2048 {
             return None;
         }
-        let input = if let Some(token) = value.strip_prefix("spotify://sessions/join/") {
+        // PR935 at 5fca13ce also supplies this exact HTTPS join path in its
+        // Session fixture. Normalize metadata only; Join still takes long links.
+        let input = if let Some(token) = value
+            .strip_prefix("spotify://sessions/join/")
+            .or_else(|| value.strip_prefix("https://open.spotify.com/sessions/join/"))
+        {
             if token.is_empty()
                 || token.len() > 1024
                 || !token.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -318,6 +323,54 @@ mod tests {
                 .invitation
                 .is_none()
         );
+    }
+
+    #[test]
+    fn https_join_address_normalizes_only_exact_origin_path_and_alphanumeric_token() {
+        let address = "https://open.spotify.com/sessions/join/Tok9";
+        let invitation = Invitation::parse(address).unwrap();
+        assert_eq!(
+            invitation.url(),
+            "https://open.spotify.com/socialsession/Tok9"
+        );
+        // This is a metadata normalization, not another accepted Join input.
+        assert_eq!(Link::parse(address).err(), Some(Error::InvalidLink));
+        assert!(Link::parse(invitation.url()).is_ok());
+        for address in [
+            "http://open.spotify.com/sessions/join/Tok9",
+            "https://evil.test/sessions/join/Tok9",
+            "https://open.spotify.com.evil/sessions/join/Tok9",
+            "https://user@open.spotify.com/sessions/join/Tok9",
+            "https://open.spotify.com:443/sessions/join/Tok9",
+            "https://OPEN.spotify.com/sessions/join/Tok9",
+            "https://open.spotify.com/Sessions/join/Tok9",
+            "https://open.spotify.com/x/../sessions/join/Tok9",
+            "https://open.spotify.com//sessions/join/Tok9",
+            "https://spclient/sessions/join/Tok9",
+            "https://open.spotify.com/sessions/join/",
+            "https://open.spotify.com/sessions/join/Tok9/",
+            "https://open.spotify.com/sessions/join/Tok9?si=x",
+            "https://open.spotify.com/sessions/join/Tok9?utm_source=x",
+            "https://open.spotify.com/sessions/join/Tok9?unknown=x",
+            "https://open.spotify.com/sessions/join/Tok9#x",
+            "https://open.spotify.com/sessions/join/Tok_9",
+            "https://open.spotify.com/sessions/join/Tok-9",
+            "https://open.spotify.com/sessions/join/%54ok9",
+            "https://open.spotify.com/sessions/join/Toké",
+            " https://open.spotify.com/sessions/join/Tok9",
+            "https://open.spotify.com/sessions/join/Tok9 ",
+            "https://open.spotify.com/sessions/join/Tok\n9",
+            r#"{"url":"https://open.spotify.com/sessions/join/Tok9"}"#,
+        ] {
+            assert!(Invitation::parse(address).is_none());
+        }
+        for (length, valid) in [(1024, true), (1025, false), (2049, false)] {
+            let address = format!(
+                "https://open.spotify.com/sessions/join/{}",
+                "A".repeat(length)
+            );
+            assert_eq!(Invitation::parse(&address).is_some(), valid);
+        }
     }
 
     #[test]

@@ -293,6 +293,18 @@ async fn diagnostic_invitation_classifies_only_the_parsed_field_without_changing
             false,
         ),
         (
+            json!({"join_session_url":"https://open.spotify.com/sessions/join/PrivateSentinel"}),
+            Accepted,
+            true,
+            false,
+        ),
+        (
+            json!({"join_session_url":"https://open.spotify.com/sessions/join/PrivateSentinel?si=x"}),
+            FormatRejected,
+            false,
+            false,
+        ),
+        (
             json!({"join_session_url":"https://untrusted.invalid/PrivateSentinel"}),
             FormatRejected,
             false,

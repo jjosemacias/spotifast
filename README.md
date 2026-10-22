@@ -138,6 +138,10 @@ Ordinary Check does not enable diagnostics. The record describes
 the last accepted observation, not the first failure or a network trace. Retirement
 seals it; account/engine replacement clears it. No diagnostic data is logged or
 saved, and it never enables a Jam action.
+Invitation metadata also recognizes the exact Spotify HTTPS `/sessions/join/`
+address with a bounded alphanumeric token and no query or fragment, converting it
+locally to the long `/socialsession/` link. This does not extend accepted Join
+input formats or resolve short links.
 End requires fresh host authority and confirmation, and verifies only this
 account's absence, not an end for everyone.
 The feature is off by default with offline validation only. Leave,

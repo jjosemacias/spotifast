@@ -266,6 +266,10 @@ async fn diagnostic_current_preserves_parser_results_and_reports_validation_boun
         assert_eq!(probe.snapshot().schema, schema);
         assert_eq!(probe.snapshot().http, Some(http));
         assert_eq!(probe.snapshot().url_field, url_field);
+        assert_eq!(
+            probe.snapshot().format_boundary,
+            diagnostic::FormatBoundary::NotApplicable
+        );
         assert_eq!((fake.count(), control.count(), fake.writes()), (1, 1, 0));
         assert!(!probe.snapshot().to_string().contains("private-sentinel"));
     }
@@ -376,6 +380,12 @@ async fn diagnostic_invitation_classifies_only_the_parsed_field_without_changing
         assert!(result == ordinary.current().await);
         assert_eq!(result.is_err(), rejected);
         assert_eq!(probe.snapshot().url_field, expected);
+        if expected != FormatRejected {
+            assert_eq!(
+                probe.snapshot().format_boundary,
+                diagnostic::FormatBoundary::NotApplicable
+            );
+        }
         assert_eq!(probe.snapshot().http, Some(200));
         let actual = observed.snapshot();
         let baseline = ordinary.snapshot();
@@ -422,9 +432,274 @@ async fn diagnostic_invitation_late_response_cannot_restore_retired_context() {
         probe.snapshot().url_field,
         diagnostic::UrlField::NotObserved
     );
+    assert_eq!(
+        probe.snapshot().format_boundary,
+        diagnostic::FormatBoundary::NotApplicable
+    );
     assert!(kernel.snapshot().metadata.invitation.is_none());
     assert!(kernel.snapshot().membership == Membership::Unknown);
     assert_eq!((fake.count(), fake.writes()), (1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn format_boundaries_preserve_golden_acceptance_state_and_single_current_dispatch() {
+    use super::diagnostic::FormatBoundary::*;
+    use metadata::Invitation;
+    // Expected acceptance is the 3646 contract, independent of the new reason.
+    let cases = [
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel",
+            NotApplicable,
+            true,
+            true,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel?si=x&utm_source=y",
+            NotApplicable,
+            true,
+            true,
+        ),
+        (
+            "spotify://sessions/join/PrivateSentinel",
+            NotApplicable,
+            true,
+            false,
+        ),
+        (
+            "https://open.spotify.com/sessions/join/PrivateSentinel",
+            NotApplicable,
+            true,
+            false,
+        ),
+        (
+            "https://open.spotify.com/other/PrivateSentinel?bad",
+            PrefixOpenOtherPath,
+            false,
+            false,
+        ),
+        (
+            "spotify:other:PrivateSentinel",
+            PrefixSpotifyOther,
+            false,
+            false,
+        ),
+        (
+            "https://untrusted.invalid/PrivateSentinel",
+            PrefixHttpsOther,
+            false,
+            false,
+        ),
+        (
+            r#" {"url":"https://open.spotify.com/socialsession/PrivateSentinel"}"#,
+            PrefixStructured,
+            false,
+            false,
+        ),
+        ("[PrivateSentinel]", PrefixStructured, false, false),
+        (
+            "http://open.spotify.com/socialsession/PrivateSentinel",
+            PrefixOther,
+            false,
+            false,
+        ),
+        (
+            " https://open.spotify.com/socialsession/PrivateSentinel",
+            PrefixOther,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/",
+            TokenEmptyOrLimit,
+            false,
+            false,
+        ),
+        ("spotify://sessions/join/", TokenEmptyOrLimit, false, false),
+        (
+            "https://open.spotify.com/socialsession/{PrivateSentinel}",
+            TokenPlaceholderMarker,
+            false,
+            false,
+        ),
+        (
+            "spotify://sessions/join/<PrivateSentinel>",
+            TokenPlaceholderMarker,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/sessions/join/PrivateSentinel?si=x#more",
+            TokenQuery,
+            false,
+            false,
+        ),
+        (
+            "spotify://sessions/join/PrivateSentinel?{more}",
+            TokenQuery,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel#more?si=x",
+            TokenFragment,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/%50rivateSentinel",
+            TokenPercentMarker,
+            false,
+            false,
+        ),
+        (
+            "spotify://sessions/join/%7BPrivateSentinel%7D?more",
+            TokenPercentMarker,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/Private-Sentinel?unknown=x",
+            TokenOtherCharacters,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateéSentinel",
+            TokenOtherCharacters,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel?",
+            QueryShape,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel?si",
+            QueryShape,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel?privatekey=",
+            QueryKeyOrDuplicate,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel?si=x&si=",
+            QueryKeyOrDuplicate,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel?si=&unknown=x",
+            QueryValueRejected,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel?si=%41",
+            QueryValueRejected,
+            false,
+            false,
+        ),
+        (
+            "https://open.spotify.com/socialsession/PrivateSentinel?si=x#fragment",
+            QueryValueRejected,
+            false,
+            false,
+        ),
+    ];
+    let mut cases = cases
+        .into_iter()
+        .map(|(value, boundary, invitation, join)| (value.to_owned(), boundary, invitation, join))
+        .collect::<Vec<_>>();
+    cases.push((
+        format!(
+            "https://open.spotify.com/socialsession/{}",
+            "A".repeat(1024)
+        ),
+        NotApplicable,
+        true,
+        true,
+    ));
+    cases.push((
+        format!(
+            "https://open.spotify.com/socialsession/{}%",
+            "A".repeat(1024)
+        ),
+        TokenEmptyOrLimit,
+        false,
+        false,
+    ));
+    cases.push((
+        format!(
+            "https://open.spotify.com/socialsession/PrivateSentinel?si={}",
+            "x".repeat(257)
+        ),
+        QueryValueRejected,
+        false,
+        false,
+    ));
+    let mut seen = Vec::new();
+    for (value, expected, invitation, join) in cases {
+        assert_eq!(Invitation::parse(&value).is_some(), invitation);
+        assert_eq!(Link::parse(&value).is_ok(), join);
+        if !join {
+            assert_eq!(Link::parse(&value).err(), Some(Error::InvalidLink));
+        }
+        let fields = serde_json::json!({"join_session_url":value});
+        let fake = Fake::new(vec![metadata_reply(true, fields.clone())]);
+        let control = Fake::new(vec![metadata_reply(true, fields)]);
+        let observed = kernel(&fake);
+        let ordinary = kernel(&control);
+        let probe = Probe::default();
+        let result = observed
+            .run_observed(Operation::Current, Some(&probe))
+            .await;
+        assert!(result == ordinary.current().await);
+        assert!(result.is_ok());
+        assert_eq!(probe.snapshot().format_boundary, expected);
+        assert_eq!(
+            probe.snapshot().url_field,
+            if invitation {
+                diagnostic::UrlField::Accepted
+            } else {
+                diagnostic::UrlField::FormatRejected
+            }
+        );
+        let actual = observed.snapshot();
+        let baseline = ordinary.snapshot();
+        assert!(actual.metadata == baseline.metadata);
+        assert!(actual.membership == baseline.membership);
+        assert_eq!(actual.metadata.invitation.is_some(), invitation);
+        if invitation && value.starts_with("spotify://sessions/join/") {
+            assert_eq!(
+                actual.metadata.invitation.as_ref().unwrap().url(),
+                "https://open.spotify.com/socialsession/PrivateSentinel"
+            );
+        }
+        assert_eq!(actual.fresh_until, baseline.fresh_until);
+        assert_eq!(actual.reconcile_required, baseline.reconcile_required);
+        assert_eq!(actual.error, baseline.error);
+        assert_eq!((fake.count(), control.count(), fake.writes()), (1, 1, 0));
+        let output = probe.snapshot().to_string();
+        for private in [
+            "PrivateSentinel",
+            "privatekey",
+            "untrusted.invalid",
+            "https://",
+            "spotify://",
+        ] {
+            assert!(!output.contains(private));
+        }
+        if !seen.contains(&expected) {
+            seen.push(expected);
+        }
+    }
+    assert_eq!(seen.len(), 15);
 }
 
 #[tokio::test]
@@ -446,6 +721,7 @@ async fn diagnostic_headers_survive_body_failure_limit_and_context_refusal() {
             http: Some(405),
             schema: Schema::None,
             url_field: diagnostic::UrlField::NotObserved,
+            format_boundary: diagnostic::FormatBoundary::NotApplicable,
         }
     );
     let body = vec![b'x'; MAX_BODY + 1];

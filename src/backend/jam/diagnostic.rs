@@ -36,6 +36,25 @@ pub enum UrlField {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormatBoundary {
+    NotApplicable,
+    PrefixOpenOtherPath,
+    PrefixSpotifyOther,
+    PrefixHttpsOther,
+    PrefixStructured,
+    PrefixOther,
+    TokenEmptyOrLimit,
+    TokenPlaceholderMarker,
+    TokenQuery,
+    TokenFragment,
+    TokenPercentMarker,
+    TokenOtherCharacters,
+    QueryShape,
+    QueryKeyOrDuplicate,
+    QueryValueRejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     Waiting(Stage),
     Failed(Stage, Error),
@@ -51,6 +70,7 @@ pub struct Diagnostic {
     pub http: Option<u16>,
     pub schema: Schema,
     pub url_field: UrlField,
+    pub format_boundary: FormatBoundary,
 }
 
 struct Slot {
@@ -72,6 +92,7 @@ impl Default for Probe {
                 http: None,
                 schema: Schema::None,
                 url_field: UrlField::NotObserved,
+                format_boundary: FormatBoundary::NotApplicable,
             },
             closed: false,
             waker: Default::default(),
@@ -112,7 +133,20 @@ impl Probe {
         self.update(|d| d.schema = schema);
     }
     pub(super) fn url_field(&self, value: UrlField) {
-        self.update(|d| d.url_field = value);
+        self.update(|d| {
+            d.url_field = value;
+            d.format_boundary = FormatBoundary::NotApplicable;
+        });
+    }
+    pub(super) fn invitation_format(&self, result: Result<(), FormatBoundary>) {
+        self.update(|d| {
+            d.url_field = if result.is_ok() {
+                UrlField::Accepted
+            } else {
+                UrlField::FormatRejected
+            };
+            d.format_boundary = result.err().unwrap_or(FormatBoundary::NotApplicable);
+        });
     }
     pub(super) fn finish(&self, result: Result<&Membership, Error>) {
         self.update(|d| {
@@ -144,6 +178,7 @@ impl Probe {
             slot.value.http = None;
             slot.value.schema = Schema::None;
             slot.value.url_field = UrlField::NotObserved;
+            slot.value.format_boundary = FormatBoundary::NotApplicable;
         } else if slot.closed {
             return;
         }
@@ -192,7 +227,7 @@ impl std::fmt::Display for Diagnostic {
         }
         write!(
             f,
-            "; schema={}; source=deliberate_current; url_field={}",
+            "; schema={}; source=deliberate_current; url_field={}; format_boundary={}",
             match self.schema {
                 Schema::None => "none",
                 Schema::BodyLimit => "body_limit",
@@ -201,8 +236,31 @@ impl std::fmt::Display for Diagnostic {
                 Schema::Metadata => "metadata",
                 Schema::Projection => "projection",
             },
-            self.url_field.label()
+            self.url_field.label(),
+            self.format_boundary.label()
         )
+    }
+}
+
+impl FormatBoundary {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::PrefixOpenOtherPath => "prefix_open_other_path",
+            Self::PrefixSpotifyOther => "prefix_spotify_other",
+            Self::PrefixHttpsOther => "prefix_https_other",
+            Self::PrefixStructured => "prefix_structured",
+            Self::PrefixOther => "prefix_other",
+            Self::TokenEmptyOrLimit => "token_empty_or_limit",
+            Self::TokenPlaceholderMarker => "token_placeholder_marker",
+            Self::TokenQuery => "token_query",
+            Self::TokenFragment => "token_fragment",
+            Self::TokenPercentMarker => "token_percent_marker",
+            Self::TokenOtherCharacters => "token_other_characters",
+            Self::QueryShape => "query_shape",
+            Self::QueryKeyOrDuplicate => "query_key_or_duplicate",
+            Self::QueryValueRejected => "query_value_rejected",
+        }
     }
 }
 
@@ -270,36 +328,70 @@ mod tests {
             UrlField::AliasConflict,
             UrlField::BoundsOrControlRejected,
         ];
+        let boundaries = [
+            FormatBoundary::NotApplicable,
+            FormatBoundary::PrefixOpenOtherPath,
+            FormatBoundary::PrefixSpotifyOther,
+            FormatBoundary::PrefixHttpsOther,
+            FormatBoundary::PrefixStructured,
+            FormatBoundary::PrefixOther,
+            FormatBoundary::TokenEmptyOrLimit,
+            FormatBoundary::TokenPlaceholderMarker,
+            FormatBoundary::TokenQuery,
+            FormatBoundary::TokenFragment,
+            FormatBoundary::TokenPercentMarker,
+            FormatBoundary::TokenOtherCharacters,
+            FormatBoundary::QueryShape,
+            FormatBoundary::QueryKeyOrDuplicate,
+            FormatBoundary::QueryValueRejected,
+        ];
         for stage in stages {
             for error in errors {
                 for url_field in fields {
-                    let d = Diagnostic {
-                        class: Class::Failed(stage, error),
-                        http: Some(405),
-                        schema: Schema::None,
-                        url_field,
-                    };
-                    let text = d.to_string();
-                    assert!(text.len() < 192);
-                    assert_eq!(text.split(';').count(), 5);
-                    assert!(text.contains("; source=deliberate_current; url_field="));
-                    assert!(text.ends_with(url_field.label()));
-                    assert!(text.bytes().all(|b| b.is_ascii_lowercase()
-                        || b.is_ascii_digit()
-                        || b"_=; ".contains(&b)));
+                    for format_boundary in boundaries {
+                        let d = Diagnostic {
+                            class: Class::Failed(stage, error),
+                            http: Some(405),
+                            schema: Schema::None,
+                            url_field,
+                            format_boundary,
+                        };
+                        let text = d.to_string();
+                        assert!(text.len() < 256);
+                        assert_eq!(text.split(';').count(), 6);
+                        assert_eq!(
+                            text.split(';')
+                                .map(|field| field.trim().split_once('=').unwrap().0)
+                                .collect::<Vec<_>>(),
+                            [
+                                "class",
+                                "http",
+                                "schema",
+                                "source",
+                                "url_field",
+                                "format_boundary"
+                            ]
+                        );
+                        assert!(text.contains("; source=deliberate_current; url_field="));
+                        assert!(text.ends_with(format_boundary.label()));
+                        assert!(text.bytes().all(|b| b.is_ascii_lowercase()
+                            || b.is_ascii_digit()
+                            || b"_=; ".contains(&b)));
+                    }
                 }
             }
         }
         let probe = Probe::default();
         probe.status(200);
         probe.schema(Schema::Metadata);
-        probe.url_field(UrlField::Accepted);
+        probe.invitation_format(Err(FormatBoundary::TokenQuery));
         probe.retire(Cause::Connection);
         let retired = probe.snapshot();
         probe.stage(Stage::Transport);
         probe.status(404);
         probe.schema(Schema::None);
         probe.url_field(UrlField::FormatRejected);
+        probe.invitation_format(Err(FormatBoundary::PrefixOther));
         probe.finish(Ok(&Membership::Absent));
         probe.retire(Cause::Jam);
         assert_eq!(probe.snapshot(), retired);
@@ -307,6 +399,10 @@ mod tests {
         assert_eq!(probe.snapshot().http, None);
         assert_eq!(probe.snapshot().schema, Schema::None);
         assert_eq!(probe.snapshot().url_field, UrlField::NotObserved);
+        assert_eq!(
+            probe.snapshot().format_boundary,
+            FormatBoundary::NotApplicable
+        );
         assert_eq!(probe.snapshot().class, Class::Invalidated(Cause::Context));
     }
 
@@ -314,11 +410,41 @@ mod tests {
     fn account_engine_and_context_retirement_clear_the_url_category_and_seal_late_updates() {
         for cause in [Cause::Account, Cause::Engine, Cause::Context] {
             let probe = Probe::default();
-            probe.url_field(UrlField::Accepted);
+            probe.invitation_format(Err(FormatBoundary::TokenQuery));
             probe.retire(cause);
-            probe.url_field(UrlField::Accepted);
+            probe.invitation_format(Err(FormatBoundary::TokenFragment));
             assert_eq!(probe.snapshot().url_field, UrlField::NotObserved);
+            assert_eq!(
+                probe.snapshot().format_boundary,
+                FormatBoundary::NotApplicable
+            );
             assert_eq!(probe.snapshot().class, Class::Invalidated(cause));
         }
+    }
+
+    #[test]
+    fn a_new_field_result_clears_an_earlier_boundary_in_the_same_slot() {
+        let probe = Probe::default();
+        for field in [
+            UrlField::Absent,
+            UrlField::Blank,
+            UrlField::TypeRejected,
+            UrlField::AliasConflict,
+            UrlField::BoundsOrControlRejected,
+        ] {
+            probe.invitation_format(Err(FormatBoundary::TokenQuery));
+            probe.url_field(field);
+            assert_eq!(
+                probe.snapshot().format_boundary,
+                FormatBoundary::NotApplicable
+            );
+        }
+        probe.invitation_format(Err(FormatBoundary::TokenQuery));
+        probe.invitation_format(Ok(()));
+        assert_eq!(probe.snapshot().url_field, UrlField::Accepted);
+        assert_eq!(
+            probe.snapshot().format_boundary,
+            FormatBoundary::NotApplicable
+        );
     }
 }

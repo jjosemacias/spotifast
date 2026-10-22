@@ -377,8 +377,12 @@ fn diagnostic_result_and_late_completion_never_replace_context_retirement() {
         assert_eq!(sanitized.http, None);
         assert_eq!(sanitized.schema, Schema::None);
         assert_eq!(sanitized.url_field, diagnostic::UrlField::NotObserved);
+        assert_eq!(
+            sanitized.format_boundary,
+            diagnostic::FormatBoundary::NotApplicable
+        );
         worker.finish_jam(complete);
-        probe.url_field(diagnostic::UrlField::Accepted);
+        probe.invitation_format(Err(diagnostic::FormatBoundary::TokenQuery));
         assert_eq!(probe.snapshot(), sanitized);
         assert!(latest(&events).snapshot.membership == Membership::Unknown);
         assert_eq!((fake.calls(), fake.writes()), (2, 0));
@@ -707,7 +711,7 @@ fn listeners_are_reserved_on_the_real_dealer_before_spirc_launch_and_do_not_clai
     let probe = diagnose(&mut worker);
     assert_eq!(
         probe.snapshot().to_string(),
-        "class=preflight_not_ready; http=none; schema=none; source=deliberate_current; url_field=not_observed"
+        "class=preflight_not_ready; http=none; schema=none; source=deliberate_current; url_field=not_observed; format_boundary=not_applicable"
     );
     assert!(worker.jam.gate.lock().pending.is_none());
     assert!(latest(&events).snapshot.membership == Membership::Unknown);
@@ -741,7 +745,7 @@ fn failed_listener_reservation_remains_blocked_when_connection_later_becomes_rea
     let probe = diagnose(&mut worker);
     assert_eq!(
         probe.snapshot().to_string(),
-        "class=preflight_not_ready; http=none; schema=none; source=deliberate_current; url_field=not_observed"
+        "class=preflight_not_ready; http=none; schema=none; source=deliberate_current; url_field=not_observed; format_boundary=not_applicable"
     );
     assert!(!worker.jam.gate.lock().listening);
     assert!(worker.jam.gate.lock().pending.is_none());

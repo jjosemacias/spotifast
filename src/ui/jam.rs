@@ -351,7 +351,7 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui) {
         text(
             app,
             ui,
-            "This check only. url_field classifies the invitation field; not_observed means not reached or cleared on context retirement. http=none means no status captured. Retirement seals this record; it cannot confirm membership or invitation availability now.",
+            "This check only. format_boundary labels the first format rejection; not_applicable means accepted, not reached, or cleared. url_field=not_observed means not reached or cleared on context retirement. http=none means no status captured. Retirement seals this record; it cannot confirm membership or invitation availability now.",
         );
     }
 }

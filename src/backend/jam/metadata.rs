@@ -2,7 +2,7 @@
 //! Field provenance: social_connect_v2.proto at 4118319; J02-05, row R02.
 use serde_json::Value;
 
-use super::diagnostic::{Probe, UrlField};
+use super::diagnostic::{FormatBoundary, Probe, UrlField};
 use super::{Error, Link, projection};
 
 /// No Debug/Serialize: names, identities and invitation tokens stay ephemeral.
@@ -37,8 +37,12 @@ pub struct Invitation(String);
 impl Invitation {
     /// Exact known forms only. Never extract a marker from an arbitrary origin.
     pub fn parse(value: &str) -> Option<Self> {
+        Self::parse_classified(value).ok()
+    }
+
+    fn parse_classified(value: &str) -> Result<Self, FormatBoundary> {
         if value.len() > 2048 {
-            return None;
+            return Err(FormatBoundary::NotApplicable);
         }
         // PR935 at 5fca13ce also supplies this exact HTTPS join path in its
         // Session fixture. Normalize metadata only; Join still takes long links.
@@ -46,18 +50,13 @@ impl Invitation {
             .strip_prefix("spotify://sessions/join/")
             .or_else(|| value.strip_prefix("https://open.spotify.com/sessions/join/"))
         {
-            if token.is_empty()
-                || token.len() > 1024
-                || !token.bytes().all(|b| b.is_ascii_alphanumeric())
-            {
-                return None;
-            }
+            Link::validate_token(token)?;
             format!("https://open.spotify.com/socialsession/{token}")
         } else {
             value.to_owned()
         };
-        Link::parse(&input).ok()?;
-        Some(Self(input))
+        Link::parse_classified(&input)?;
+        Ok(Self(input))
     }
     pub fn url(&self) -> &str {
         &self.0
@@ -190,15 +189,11 @@ pub(super) fn snapshot_observed(
         )?
         .as_deref()
         .and_then(|value| {
-            let invitation = Invitation::parse(value);
+            let invitation = Invitation::parse_classified(value);
             if let Some(probe) = diagnostic {
-                probe.url_field(if invitation.is_some() {
-                    UrlField::Accepted
-                } else {
-                    UrlField::FormatRejected
-                });
+                probe.invitation_format(invitation.as_ref().map(|_| ()).map_err(|error| *error));
             }
-            invitation
+            invitation.ok()
         }),
     };
     if let (Some(owner), Some(members)) = (&metadata.owner, &metadata.members)

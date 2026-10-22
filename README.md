@@ -134,6 +134,10 @@ parsing did not reach that field or context retirement cleared it;
 `absent` and `blank` differ from a rejected
 format or type. `accepted` describes that field in that check, not current
 invitation availability or permission. No link value is displayed by diagnostics.
+`format_boundary` labels the first local format rejection using fixed categories
+for prefix, token or query. `not_applicable` means accepted, not reached or cleared
+on context retirement. Placeholder and percent markers describe syntax only;
+they neither decode a value nor identify the server's intended format.
 Ordinary Check does not enable diagnostics. The record describes
 the last accepted observation, not the first failure or a network trace. Retirement
 seals it; account/engine replacement clears it. No diagnostic data is logged or

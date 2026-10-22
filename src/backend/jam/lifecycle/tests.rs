@@ -369,13 +369,16 @@ fn diagnostic_result_and_late_completion_never_replace_context_retirement() {
         let probe = diagnose(&mut worker);
         let complete = queued(&mut commands).await;
         assert_eq!(probe.snapshot().class, Class::Present);
+        assert_eq!(probe.snapshot().url_field, diagnostic::UrlField::Absent);
         // Verification can disappear before any lifecycle watch notification.
         worker.jam.gate.lock().verify = Arc::new(|| false);
         let sanitized = worker.jam.gate.diagnostic().unwrap();
         assert_eq!(sanitized.class, Class::Invalidated(Cause::Context));
         assert_eq!(sanitized.http, None);
         assert_eq!(sanitized.schema, Schema::None);
+        assert_eq!(sanitized.url_field, diagnostic::UrlField::NotObserved);
         worker.finish_jam(complete);
+        probe.url_field(diagnostic::UrlField::Accepted);
         assert_eq!(probe.snapshot(), sanitized);
         assert!(latest(&events).snapshot.membership == Membership::Unknown);
         assert_eq!((fake.calls(), fake.writes()), (2, 0));
@@ -704,7 +707,7 @@ fn listeners_are_reserved_on_the_real_dealer_before_spirc_launch_and_do_not_clai
     let probe = diagnose(&mut worker);
     assert_eq!(
         probe.snapshot().to_string(),
-        "class=preflight_not_ready; http=none; schema=none"
+        "class=preflight_not_ready; http=none; schema=none; source=deliberate_current; url_field=not_observed"
     );
     assert!(worker.jam.gate.lock().pending.is_none());
     assert!(latest(&events).snapshot.membership == Membership::Unknown);
@@ -738,7 +741,7 @@ fn failed_listener_reservation_remains_blocked_when_connection_later_becomes_rea
     let probe = diagnose(&mut worker);
     assert_eq!(
         probe.snapshot().to_string(),
-        "class=preflight_not_ready; http=none; schema=none"
+        "class=preflight_not_ready; http=none; schema=none; source=deliberate_current; url_field=not_observed"
     );
     assert!(!worker.jam.gate.lock().listening);
     assert!(worker.jam.gate.lock().pending.is_none());

@@ -128,8 +128,13 @@ sends no Jam request or audio command. Check Jam state is deliberate. The strip
 is green only for fresh confirmed membership; unconfirmed state is neutral.
 Closing a view never leaves or ends a Jam. The experimental local diagnostic
 button performs one deliberate Current check and shows only a fixed class,
-captured HTTP status and validation
-stage in memory. Ordinary Check does not enable diagnostics. The record describes
+captured HTTP status, validation stage and invitation-field classification in
+memory, with source fixed to `deliberate_current`. `url_field=not_observed` means
+parsing did not reach that field or context retirement cleared it;
+`absent` and `blank` differ from a rejected
+format or type. `accepted` describes that field in that check, not current
+invitation availability or permission. No link value is displayed by diagnostics.
+Ordinary Check does not enable diagnostics. The record describes
 the last accepted observation, not the first failure or a network trace. Retirement
 seals it; account/engine replacement clears it. No diagnostic data is logged or
 saved, and it never enables a Jam action.

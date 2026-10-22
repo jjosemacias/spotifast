@@ -351,7 +351,7 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui) {
         text(
             app,
             ui,
-            "Last accepted observation. http=none means no status captured. Retirement seals this record; it cannot confirm membership.",
+            "This check only. url_field classifies the invitation field; not_observed means not reached or cleared on context retirement. http=none means no status captured. Retirement seals this record; it cannot confirm membership or invitation availability now.",
         );
     }
 }

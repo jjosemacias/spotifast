@@ -472,7 +472,8 @@ fn read_reply_observed(
     } else {
         Schema::JsonStructure
     }))?;
-    let metadata = metadata::snapshot(&root).map_err(classify(Schema::Metadata))?;
+    let metadata =
+        metadata::snapshot_observed(&root, diagnostic).map_err(classify(Schema::Metadata))?;
     let projection = projection::from_value(root).map_err(classify(Schema::Projection))?;
     Ok(Read {
         membership: Membership::Present(projection),

@@ -2,6 +2,7 @@
 //! Field provenance: social_connect_v2.proto at 4118319; J02-05, row R02.
 use serde_json::Value;
 
+use super::diagnostic::{Probe, UrlField};
 use super::{Error, Link, projection};
 
 /// No Debug/Serialize: names, identities and invitation tokens stay ephemeral.
@@ -66,16 +67,44 @@ fn field<'a>(value: &'a Value, snake: &str, camel: &str) -> Result<Option<&'a Va
 }
 
 fn string(value: &Value, snake: &str, camel: &str, max: usize) -> Result<Option<String>, Error> {
-    field(value, snake, camel)?
-        .map(|v| {
-            let s = v.as_str().ok_or(Error::InvalidResponse)?;
-            if s.len() > max || s.chars().any(char::is_control) {
-                return Err(Error::InvalidResponse);
-            }
-            Ok((!s.trim().is_empty()).then(|| s.to_owned()))
-        })
-        .transpose()
-        .map(Option::flatten)
+    string_observed(value, snake, camel, max, None)
+}
+
+/// Only the invitation field supplies a probe. This is the same string parser
+/// for observed and ordinary snapshots, not a second pass after a failure.
+fn string_observed(
+    value: &Value,
+    snake: &str,
+    camel: &str,
+    max: usize,
+    diagnostic: Option<&Probe>,
+) -> Result<Option<String>, Error> {
+    let observe = |class| {
+        if let Some(probe) = diagnostic {
+            probe.url_field(class);
+        }
+    };
+    let Some(value) = field(value, snake, camel).inspect_err(|_| {
+        observe(UrlField::AliasConflict);
+    })?
+    else {
+        observe(UrlField::Absent);
+        return Ok(None);
+    };
+    let s = value.as_str().ok_or_else(|| {
+        observe(UrlField::TypeRejected);
+        Error::InvalidResponse
+    })?;
+    if s.len() > max || s.chars().any(char::is_control) {
+        observe(UrlField::BoundsOrControlRejected);
+        return Err(Error::InvalidResponse);
+    }
+    if s.trim().is_empty() {
+        observe(UrlField::Blank);
+        Ok(None)
+    } else {
+        Ok(Some(s.to_owned()))
+    }
 }
 
 fn flag(value: &Value, snake: &str, camel: &str) -> Result<Option<bool>, Error> {
@@ -137,12 +166,35 @@ fn members(value: &Value, snake: &str, camel: &str) -> Result<Option<Vec<Member>
 }
 
 pub(super) fn snapshot(value: &Value) -> Result<Metadata, Error> {
+    snapshot_observed(value, None)
+}
+
+pub(super) fn snapshot_observed(
+    value: &Value,
+    diagnostic: Option<&Probe>,
+) -> Result<Metadata, Error> {
     let metadata = Metadata {
         owner: string(value, "session_owner_id", "sessionOwnerId", 256)?,
         members: members(value, "session_members", "sessionMembers")?,
-        invitation: string(value, "join_session_url", "joinSessionUrl", 2048)?
-            .as_deref()
-            .and_then(Invitation::parse),
+        invitation: string_observed(
+            value,
+            "join_session_url",
+            "joinSessionUrl",
+            2048,
+            diagnostic,
+        )?
+        .as_deref()
+        .and_then(|value| {
+            let invitation = Invitation::parse(value);
+            if let Some(probe) = diagnostic {
+                probe.url_field(if invitation.is_some() {
+                    UrlField::Accepted
+                } else {
+                    UrlField::FormatRejected
+                });
+            }
+            invitation
+        }),
     };
     if let (Some(owner), Some(members)) = (&metadata.owner, &metadata.members)
         && members.iter().filter(|m| m.named_by(owner)).count() > 1

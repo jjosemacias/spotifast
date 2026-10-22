@@ -201,6 +201,7 @@ fn kernel(fake: &Arc<Fake>) -> Kernel<Fake> {
 
 #[tokio::test]
 async fn diagnostic_current_preserves_parser_results_and_reports_validation_boundary() {
+    use super::diagnostic::UrlField;
     let mut mime = session("private-sentinel", true);
     mime.content_type = Some(b"application/x-protobuf".to_vec());
     let mut json = session("private-sentinel", true);
@@ -208,19 +209,45 @@ async fn diagnostic_current_preserves_parser_results_and_reports_validation_boun
     let mut projection = session("private-sentinel", true);
     projection.body = br#"{"session_id":"private-sentinel"}"#.to_vec();
     let cases = [
-        (status(404), Schema::None, None),
-        (session("private-sentinel", false), Schema::None, None),
-        (status(405), Schema::None, Some(Error::Http(405))),
-        (mime, Schema::Mime, Some(Error::InvalidResponse)),
-        (json, Schema::JsonStructure, Some(Error::InvalidResponse)),
+        (status(404), Schema::None, None, UrlField::NotObserved),
+        (
+            session("private-sentinel", false),
+            Schema::None,
+            None,
+            UrlField::Absent,
+        ),
+        (
+            status(405),
+            Schema::None,
+            Some(Error::Http(405)),
+            UrlField::NotObserved,
+        ),
+        (
+            mime,
+            Schema::Mime,
+            Some(Error::InvalidResponse),
+            UrlField::NotObserved,
+        ),
+        (
+            json,
+            Schema::JsonStructure,
+            Some(Error::InvalidResponse),
+            UrlField::NotObserved,
+        ),
         (
             metadata_reply(true, serde_json::json!({"session_members":null})),
             Schema::Metadata,
             Some(Error::InvalidResponse),
+            UrlField::NotObserved,
         ),
-        (projection, Schema::Projection, Some(Error::InvalidResponse)),
+        (
+            projection,
+            Schema::Projection,
+            Some(Error::InvalidResponse),
+            UrlField::Absent,
+        ),
     ];
-    for (reply, schema, expected_error) in cases {
+    for (reply, schema, expected_error, url_field) in cases {
         let ordinary = Reply {
             status: reply.status,
             content_type: reply.content_type.clone(),
@@ -238,9 +265,154 @@ async fn diagnostic_current_preserves_parser_results_and_reports_validation_boun
         assert!(result == baseline);
         assert_eq!(probe.snapshot().schema, schema);
         assert_eq!(probe.snapshot().http, Some(http));
+        assert_eq!(probe.snapshot().url_field, url_field);
         assert_eq!((fake.count(), control.count(), fake.writes()), (1, 1, 0));
         assert!(!probe.snapshot().to_string().contains("private-sentinel"));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn diagnostic_invitation_classifies_only_the_parsed_field_without_changing_state_or_requests()
+{
+    use super::diagnostic::UrlField::*;
+    use serde_json::json;
+    let cases = [
+        (json!({}), Absent, false, false),
+        (json!({"join_session_url":""}), Blank, false, false),
+        (json!({"join_session_url":"  "}), Blank, false, false),
+        (
+            json!({"join_session_url":"https://open.spotify.com/socialsession/PrivateSentinel"}),
+            Accepted,
+            true,
+            false,
+        ),
+        (
+            json!({"joinSessionUrl":"spotify://sessions/join/PrivateSentinel"}),
+            Accepted,
+            true,
+            false,
+        ),
+        (
+            json!({"join_session_url":"https://untrusted.invalid/PrivateSentinel"}),
+            FormatRejected,
+            false,
+            false,
+        ),
+        (
+            json!({"join_session_url":" https://open.spotify.com/socialsession/PrivateSentinel"}),
+            FormatRejected,
+            false,
+            false,
+        ),
+        (
+            json!({"join_session_url":"https://open.spotify.com/socialsession/PrivateSentinel?unknown=x"}),
+            FormatRejected,
+            false,
+            false,
+        ),
+        (json!({"join_session_url":null}), TypeRejected, false, true),
+        (json!({"join_session_url":false}), TypeRejected, false, true),
+        (json!({"join_session_url":[]}), TypeRejected, false, true),
+        (
+            json!({"join_session_url":"x","joinSessionUrl":"x"}),
+            AliasConflict,
+            false,
+            true,
+        ),
+        (
+            json!({"join_session_url":"x".repeat(2049)}),
+            BoundsOrControlRejected,
+            false,
+            true,
+        ),
+        (
+            json!({"join_session_url":"\n"}),
+            BoundsOrControlRejected,
+            false,
+            true,
+        ),
+        // A prior metadata failure must not inspect the invitation separately.
+        (
+            json!({"session_members":null,"join_session_url":null}),
+            NotObserved,
+            false,
+            true,
+        ),
+        (
+            json!({"session_owner_id":false,"join_session_url":"x"}),
+            NotObserved,
+            false,
+            true,
+        ),
+        (
+            json!({"join_session_uri":"spotify://sessions/join/PrivateSentinel"}),
+            Absent,
+            false,
+            false,
+        ),
+    ];
+    for (fields, expected, has_invitation, rejected) in cases {
+        let make_reply = || metadata_reply(true, fields.clone());
+        let fake = Fake::new(vec![make_reply()]);
+        let control = Fake::new(vec![make_reply()]);
+        let observed = kernel(&fake);
+        let ordinary = kernel(&control);
+        let probe = Probe::default();
+        let result = observed
+            .run_observed(Operation::Current, Some(&probe))
+            .await;
+        assert!(result == ordinary.current().await);
+        assert_eq!(result.is_err(), rejected);
+        assert_eq!(probe.snapshot().url_field, expected);
+        assert_eq!(probe.snapshot().http, Some(200));
+        let actual = observed.snapshot();
+        let baseline = ordinary.snapshot();
+        assert!(actual.metadata == baseline.metadata);
+        assert!(actual.membership == baseline.membership);
+        assert_eq!(actual.metadata.invitation.is_some(), has_invitation);
+        assert_eq!(actual.fresh_until, baseline.fresh_until);
+        assert_eq!(actual.reconcile_required, baseline.reconcile_required);
+        assert_eq!(actual.error, baseline.error);
+        assert_eq!((fake.count(), control.count(), fake.writes()), (1, 1, 0));
+        let output = probe.snapshot().to_string();
+        assert!(output.contains("source=deliberate_current"));
+        assert!(!output.contains("PrivateSentinel"));
+    }
+}
+
+#[tokio::test]
+async fn diagnostic_invitation_late_response_cannot_restore_retired_context() {
+    let fake = Fake::new(vec![]);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    fake.push(Step::Wait(receive));
+    let kernel = Arc::new(kernel(&fake));
+    let probe = Probe::default();
+    let task = tokio::spawn({
+        let kernel = Arc::clone(&kernel);
+        let probe = probe.clone();
+        async move { kernel.run_observed(Operation::Current, Some(&probe)).await }
+    });
+    while fake.count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    probe.retire(lifecycle::Cause::Context);
+    kernel.invalidate();
+    send.send(metadata_reply(
+        true,
+        serde_json::json!({
+            "join_session_url":"https://open.spotify.com/socialsession/PrivateSentinel"
+        }),
+    ))
+    .ok()
+    .unwrap();
+    assert_eq!(task.await.unwrap().err(), Some(Error::Stale));
+    assert_eq!(
+        probe.snapshot().url_field,
+        diagnostic::UrlField::NotObserved
+    );
+    assert!(kernel.snapshot().metadata.invitation.is_none());
+    assert!(kernel.snapshot().membership == Membership::Unknown);
+    assert_eq!((fake.count(), fake.writes()), (1, 0));
 }
 
 #[tokio::test]
@@ -261,6 +433,7 @@ async fn diagnostic_headers_survive_body_failure_limit_and_context_refusal() {
             class: diagnostic::Class::Failed(Stage::Body, Error::Transport),
             http: Some(405),
             schema: Schema::None,
+            url_field: diagnostic::UrlField::NotObserved,
         }
     );
     let body = vec![b'x'; MAX_BODY + 1];
@@ -277,6 +450,10 @@ async fn diagnostic_headers_survive_body_failure_limit_and_context_refusal() {
     );
     assert_eq!(probe.snapshot().schema, Schema::BodyLimit);
     assert_eq!(probe.snapshot().http, Some(404));
+    assert_eq!(
+        probe.snapshot().url_field,
+        diagnostic::UrlField::NotObserved
+    );
     let response = http::Response::builder()
         .status(404)
         .body(Full::new(&b""[..]))
@@ -293,6 +470,10 @@ async fn diagnostic_headers_survive_body_failure_limit_and_context_refusal() {
     probe.status(200);
     assert_eq!(probe.snapshot().http, None);
     assert_eq!(probe.snapshot().schema, Schema::None);
+    assert_eq!(
+        probe.snapshot().url_field,
+        diagnostic::UrlField::NotObserved
+    );
 }
 
 #[tokio::test]

@@ -24,6 +24,18 @@ pub enum Schema {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UrlField {
+    NotObserved,
+    Absent,
+    Blank,
+    Accepted,
+    FormatRejected,
+    TypeRejected,
+    AliasConflict,
+    BoundsOrControlRejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     Waiting(Stage),
     Failed(Stage, Error),
@@ -32,12 +44,13 @@ pub enum Class {
     Invalidated(Cause),
 }
 
-/// These are the only three fields exposed to the presenter.
+/// Fixed classifications for one deliberate Current, never field values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub class: Class,
     pub http: Option<u16>,
     pub schema: Schema,
+    pub url_field: UrlField,
 }
 
 struct Slot {
@@ -58,6 +71,7 @@ impl Default for Probe {
                 class: Class::Waiting(Stage::Queued),
                 http: None,
                 schema: Schema::None,
+                url_field: UrlField::NotObserved,
             },
             closed: false,
             waker: Default::default(),
@@ -97,6 +111,9 @@ impl Probe {
     pub(super) fn schema(&self, schema: Schema) {
         self.update(|d| d.schema = schema);
     }
+    pub(super) fn url_field(&self, value: UrlField) {
+        self.update(|d| d.url_field = value);
+    }
     pub(super) fn finish(&self, result: Result<&Membership, Error>) {
         self.update(|d| {
             d.class = match result {
@@ -126,6 +143,7 @@ impl Probe {
         if matches!(cause, Cause::Account | Cause::Engine | Cause::Context) {
             slot.value.http = None;
             slot.value.schema = Schema::None;
+            slot.value.url_field = UrlField::NotObserved;
         } else if slot.closed {
             return;
         }
@@ -174,7 +192,7 @@ impl std::fmt::Display for Diagnostic {
         }
         write!(
             f,
-            "; schema={}",
+            "; schema={}; source=deliberate_current; url_field={}",
             match self.schema {
                 Schema::None => "none",
                 Schema::BodyLimit => "body_limit",
@@ -182,8 +200,24 @@ impl std::fmt::Display for Diagnostic {
                 Schema::JsonStructure => "json_structure",
                 Schema::Metadata => "metadata",
                 Schema::Projection => "projection",
-            }
+            },
+            self.url_field.label()
         )
+    }
+}
+
+impl UrlField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::Absent => "absent",
+            Self::Blank => "blank",
+            Self::Accepted => "accepted",
+            Self::FormatRejected => "format_rejected",
+            Self::TypeRejected => "type_rejected",
+            Self::AliasConflict => "alias_conflict",
+            Self::BoundsOrControlRejected => "bounds_or_control_rejected",
+        }
     }
 }
 
@@ -206,7 +240,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn output_is_bounded_to_three_fixed_fields_and_retirement_seals_all_updates() {
+    fn output_is_bounded_to_fixed_fields_and_retirement_seals_all_updates() {
         let stages = [
             Stage::Queued,
             Stage::Preflight,
@@ -226,37 +260,65 @@ mod tests {
             Error::Http(405),
             Error::InvalidLink,
         ];
+        let fields = [
+            UrlField::NotObserved,
+            UrlField::Absent,
+            UrlField::Blank,
+            UrlField::Accepted,
+            UrlField::FormatRejected,
+            UrlField::TypeRejected,
+            UrlField::AliasConflict,
+            UrlField::BoundsOrControlRejected,
+        ];
         for stage in stages {
             for error in errors {
-                let d = Diagnostic {
-                    class: Class::Failed(stage, error),
-                    http: Some(405),
-                    schema: Schema::None,
-                };
-                let text = d.to_string();
-                assert!(text.len() < 128);
-                assert_eq!(text.split(';').count(), 3);
-                assert!(
-                    text.bytes().all(|b| b.is_ascii_lowercase()
+                for url_field in fields {
+                    let d = Diagnostic {
+                        class: Class::Failed(stage, error),
+                        http: Some(405),
+                        schema: Schema::None,
+                        url_field,
+                    };
+                    let text = d.to_string();
+                    assert!(text.len() < 192);
+                    assert_eq!(text.split(';').count(), 5);
+                    assert!(text.contains("; source=deliberate_current; url_field="));
+                    assert!(text.ends_with(url_field.label()));
+                    assert!(text.bytes().all(|b| b.is_ascii_lowercase()
                         || b.is_ascii_digit()
-                        || b"_=; ".contains(&b))
-                );
+                        || b"_=; ".contains(&b)));
+                }
             }
         }
         let probe = Probe::default();
         probe.status(200);
         probe.schema(Schema::Metadata);
+        probe.url_field(UrlField::Accepted);
         probe.retire(Cause::Connection);
         let retired = probe.snapshot();
         probe.stage(Stage::Transport);
         probe.status(404);
         probe.schema(Schema::None);
+        probe.url_field(UrlField::FormatRejected);
         probe.finish(Ok(&Membership::Absent));
         probe.retire(Cause::Jam);
         assert_eq!(probe.snapshot(), retired);
         probe.retire(Cause::Context);
         assert_eq!(probe.snapshot().http, None);
         assert_eq!(probe.snapshot().schema, Schema::None);
+        assert_eq!(probe.snapshot().url_field, UrlField::NotObserved);
         assert_eq!(probe.snapshot().class, Class::Invalidated(Cause::Context));
+    }
+
+    #[test]
+    fn account_engine_and_context_retirement_clear_the_url_category_and_seal_late_updates() {
+        for cause in [Cause::Account, Cause::Engine, Cause::Context] {
+            let probe = Probe::default();
+            probe.url_field(UrlField::Accepted);
+            probe.retire(cause);
+            probe.url_field(UrlField::Accepted);
+            assert_eq!(probe.snapshot().url_field, UrlField::NotObserved);
+            assert_eq!(probe.snapshot().class, Class::Invalidated(cause));
+        }
     }
 }

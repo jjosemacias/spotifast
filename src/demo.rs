@@ -2143,6 +2143,224 @@ mod tests {
     }
 
     #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_official_paste_replaces_hidden_input_and_preserves_strict_tracking() {
+        use crate::model::jam::{Intent, UiAction};
+        for value in [
+            "https://open.spotify.com/socialsession/Synthetic9",
+            "https://open.spotify.com/socialsession/Synthetic9?si=Ab_9-~.x",
+            "https://open.spotify.com/socialsession/Synthetic9?utm_source=copy-link&si=Ab9",
+        ] {
+            let (ctx, mut app) = accessible_app("jam-official-paste-replace");
+            jam_fixture(&mut app, "jam-owner");
+            let size = egui::vec2(1200.0, 1000.0);
+            app.apply(
+                Action::Jam(UiAction {
+                    intent: Intent::AskCompare,
+                    expected: app.jam.stamp,
+                }),
+                &ctx,
+            );
+            jam_frame(&ctx, &mut app, size, vec![]);
+            app.actions.clear();
+            let id = ctx
+                .data(|data| data.get_temp::<egui::Id>(egui::Id::new("jam-official-focus-id")))
+                .unwrap();
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            // Replacing a hidden value must not concatenate two URLs. Ctrl+A
+            // is a common precursor to paste, but this capture has no selection.
+            for events in [
+                vec![egui::Event::Paste(
+                    "https://open.spotify.com/socialsession/Previous9".into(),
+                )],
+                vec![
+                    keyboard(egui::Key::A, egui::Modifiers::COMMAND),
+                    keyboard(egui::Key::V, egui::Modifiers::COMMAND),
+                    egui::Event::Paste(value.into()),
+                ],
+            ] {
+                let output = jam_frame(&ctx, &mut app, size, events);
+                assert!(output.platform_output.commands.is_empty());
+                for action in std::mem::take(&mut app.actions) {
+                    app.apply(action, &ctx);
+                }
+            }
+            app.apply(
+                Action::Jam(UiAction {
+                    intent: Intent::CompareOfficial,
+                    expected: app.jam.stamp,
+                }),
+                &ctx,
+            );
+            assert_eq!(
+                *app.backend.jam_requests.lock().unwrap(),
+                vec![crate::backend::jam::lifecycle::Kind::Current]
+            );
+            assert!(app.jam.official.is_none());
+            app.backend.shutdown();
+        }
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[tokio::test(start_paused = true)]
+    async fn jam_official_expiry_keeps_empty_surface_but_retires_input_focus_and_authority() {
+        use crate::model::jam::{Intent, UiAction};
+        let (ctx, mut app) = accessible_app("jam-official-expiry-surface");
+        jam_fixture(&mut app, "jam-owner");
+        let size = egui::vec2(1200.0, 1000.0);
+        app.apply(
+            Action::Jam(UiAction {
+                intent: Intent::AskCompare,
+                expected: app.jam.stamp,
+            }),
+            &ctx,
+        );
+        jam_frame(&ctx, &mut app, size, vec![]);
+        app.actions.clear();
+        let id = ctx
+            .data(|data| data.get_temp::<egui::Id>(egui::Id::new("jam-official-focus-id")))
+            .unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        jam_frame(
+            &ctx,
+            &mut app,
+            size,
+            vec![egui::Event::Paste(
+                "https://open.spotify.com/socialsession/Synthetic9?si=Ab9".into(),
+            )],
+        );
+        for action in std::mem::take(&mut app.actions) {
+            app.apply(action, &ctx);
+        }
+        assert!(app.jam.official.as_ref().unwrap().has_input());
+        let until = app.jam.fresh_until;
+        tokio::time::advance(std::time::Duration::from_secs(15)).await;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![
+                    egui::Event::Text("Synthetic9".into()),
+                    egui::Event::Paste("Synthetic9".into()),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                app.apply(Action::SetQueueTab(QueueTab::Queue), ui.ctx());
+                crate::ui::show(&mut app, ui);
+                ui.ctx().input(|input| {
+                    assert!(
+                        !input
+                            .events
+                            .iter()
+                            .chain(input.raw.events.iter())
+                            .any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Paste(_)))
+                    )
+                });
+            },
+        );
+        output.textures_delta.clear();
+        assert!(app.show_queue_panel && app.jam.official_open);
+        assert!(app.jam.official.is_none() && app.jam.owner_id().is_none());
+        assert_eq!(app.jam.fresh_until, until, "no renewed authority");
+        assert!(!ctx.memory(|memory| memory.has_focus(id)));
+        fn painted_text(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    text.push_str(t.galley.text());
+                    text.push(' ');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        painted_text(shape, text);
+                    }
+                }
+                _ => (),
+            }
+        }
+        let mut painted = String::new();
+        for shape in &output.shapes {
+            painted_text(&shape.shape, &mut painted);
+        }
+        assert!(painted.contains("Jam state changed or expired. Hidden input was discarded."));
+        assert!(!painted.contains("Synthetic9"));
+        assert!(app.actions.is_empty() && app.backend.jam_requests.lock().unwrap().is_empty());
+        app.apply(
+            Action::Jam(UiAction {
+                intent: Intent::CompareOfficial,
+                expected: app.jam.stamp,
+            }),
+            &ctx,
+        );
+        assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        jam_frame(
+            &ctx,
+            &mut app,
+            size,
+            vec![keyboard(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        let actions = std::mem::take(&mut app.actions);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::Jam(UiAction {
+                intent: Intent::CancelCompare,
+                ..
+            })
+        ));
+        for action in actions {
+            app.apply(action, &ctx);
+        }
+        assert!(app.show_queue_panel && !app.jam.official_open);
+        app.backend.shutdown();
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_official_full_ui_rejects_unlisted_link_grammar_without_requests() {
+        use crate::model::jam::{Intent, UiAction};
+        for value in [
+            "https://spotify.link/Synthetic9",
+            "https://open.spotify.com/socialsession/Synthetic9?pi=Unknown9",
+            "https://open.spotify.com/socialsession/Synthetic9?si=One&si=Two",
+            "https://open.spotify.com/socialsession/Synthetic9?si=%41",
+            " https://open.spotify.com/socialsession/Synthetic9",
+            "https://open.spotify.com/socialsession/Synthetic9\n",
+        ] {
+            let (ctx, mut app) = accessible_app("jam-official-invalid-grammar");
+            jam_fixture(&mut app, "jam-owner");
+            let size = egui::vec2(1200.0, 1000.0);
+            app.apply(
+                Action::Jam(UiAction {
+                    intent: Intent::AskCompare,
+                    expected: app.jam.stamp,
+                }),
+                &ctx,
+            );
+            jam_frame(&ctx, &mut app, size, vec![]);
+            app.actions.clear();
+            let id = ctx
+                .data(|data| data.get_temp::<egui::Id>(egui::Id::new("jam-official-focus-id")))
+                .unwrap();
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            jam_frame(&ctx, &mut app, size, vec![egui::Event::Paste(value.into())]);
+            for action in std::mem::take(&mut app.actions) {
+                app.apply(action, &ctx);
+            }
+            app.apply(
+                Action::Jam(UiAction {
+                    intent: Intent::CompareOfficial,
+                    expected: app.jam.stamp,
+                }),
+                &ctx,
+            );
+            let draft = app.jam.official.as_ref().unwrap();
+            assert!(draft.invalid && !draft.has_input());
+            assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+            app.backend.shutdown();
+        }
+    }
+
+    #[cfg(feature = "jam-host")]
     fn jam_frame(
         ctx: &egui::Context,
         app: &mut App,

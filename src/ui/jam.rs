@@ -371,7 +371,12 @@ fn official_capture(ui: &mut egui::Ui, label: &str) -> (egui::Response, Vec<Inte
         let mut edits = Vec::new();
         for event in std::mem::take(&mut input.events) {
             match event {
-                egui::Event::Text(value) | egui::Event::Paste(value) => {
+                egui::Event::Paste(value) => {
+                    edits.push(Intent::PasteOfficial(crate::model::jam::OfficialEdit::new(
+                        value,
+                    )));
+                }
+                egui::Event::Text(value) => {
                     edits.push(Intent::EditOfficial(crate::model::jam::OfficialEdit::new(
                         value,
                     )));
@@ -414,30 +419,50 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui, allow_comparison: bool) {
         Intent::DiagnoseCurrent,
     );
     if allow_comparison {
-        if let Some(draft) = &app.jam.official {
-            let present = draft.has_input();
-            let invalid = draft.invalid;
+        if app.jam.official_open {
             text(
                 app,
                 ui,
                 "Local comparison only. Use a fresh official long link for this same Jam. Never send it to chat. No invitation is enabled by the result.",
             );
-            hidden_official_input(app, ui, present);
-            if invalid {
+            if let Some(draft) = &app.jam.official {
+                let present = draft.has_input();
+                let invalid = draft.invalid;
                 text(
                     app,
                     ui,
-                    "official_relation=not_comparable; unsupported input was discarded.",
+                    "Paste one complete link. Pasting again replaces the hidden input.",
+                );
+                hidden_official_input(app, ui, present);
+                if invalid {
+                    text(
+                        app,
+                        ui,
+                        "official_relation=not_comparable; unsupported input was discarded.",
+                    );
+                }
+                button(app, ui, "Clear hidden input", true, Intent::ClearOfficial);
+                button(
+                    app,
+                    ui,
+                    "Compare with one Current",
+                    app.jam.owner_id().is_some() && present,
+                    Intent::CompareOfficial,
+                );
+            } else {
+                text(
+                    app,
+                    ui,
+                    "Jam state changed or expired. Hidden input was discarded.",
+                );
+                button(
+                    app,
+                    ui,
+                    "Compare an official link locally…",
+                    app.jam.owner_id().is_some(),
+                    Intent::AskCompare,
                 );
             }
-            button(app, ui, "Clear hidden input", true, Intent::ClearOfficial);
-            button(
-                app,
-                ui,
-                "Compare with one Current",
-                app.jam.owner_id().is_some() && present,
-                Intent::CompareOfficial,
-            );
             button(
                 app,
                 ui,
@@ -1070,7 +1095,7 @@ mod official_tests {
             },
         );
         assert_eq!(edits.len(), 1);
-        let Intent::EditOfficial(value) = edits.pop().unwrap() else {
+        let Intent::PasteOfficial(value) = edits.pop().unwrap() else {
             panic!("edit expected");
         };
         assert_eq!(value.take().as_deref(), Some("SyntheticSecret9"));

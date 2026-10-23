@@ -117,7 +117,12 @@ read, an existing fresh owner can explicitly enter a strict supported official
 long link for the same Jam. The dedicated hidden capture shows only fixed
 empty/present/invalid states: no characters, proportional bullets, cursor position,
 editor undo, autofill or automatic clipboard read. Explicit native text/paste events
-are consumed while focused and both egui event copies are discarded. Input edits
+are consumed while focused and both egui event copies are discarded. A paste
+replaces the entire hidden input; typing appends, without selection or undo.
+The open surface is separate from private input: expiry or retirement discards
+input/focus immediately and leaves only an empty explanatory view in the same
+account/engine. That view grants no authority, extends no deadline and performs
+no automatic check. Closing/hiding it or changing account/engine removes it. Input edits
 are one-use even when UI actions are cloned; private buffers have no Debug or
 serialization. Invalid input is discarded locally with no request. Memory is
 released, not guaranteed physically zeroized.

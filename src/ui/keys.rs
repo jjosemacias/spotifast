@@ -19,7 +19,7 @@ pub(super) const MILKDROP_SHORTCUT: &str = platform_shortcut("Ctrl+Shift+K", "Cm
 
 pub fn handle(app: &mut App, ctx: &egui::Context) {
     #[cfg(feature = "jam-host")]
-    if app.jam.official.is_some() {
+    if app.jam.official_open {
         // The hidden capture is a Button, so text_edit_focused cannot guard it.
         // Keep native text/paste events for the capture, but bypass global keys.
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {

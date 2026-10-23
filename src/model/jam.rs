@@ -10,6 +10,7 @@ pub enum Intent {
     DiagnoseCurrent,
     AskCompare,
     EditOfficial(OfficialEdit),
+    PasteOfficial(OfficialEdit),
     BackspaceOfficial,
     ClearOfficial,
     CompareOfficial,
@@ -53,6 +54,7 @@ impl std::fmt::Debug for Intent {
             Self::DiagnoseCurrent => "DiagnoseCurrent",
             Self::AskCompare => "AskCompare",
             Self::EditOfficial(_) => "EditOfficial([hidden])",
+            Self::PasteOfficial(_) => "PasteOfficial([hidden])",
             Self::BackspaceOfficial => "BackspaceOfficial",
             Self::ClearOfficial => "ClearOfficial",
             Self::CompareOfficial => "CompareOfficial",
@@ -144,6 +146,8 @@ pub struct JoinDraft {
 }
 
 pub struct State {
+    // Surface state only: never preserves input or authority after retirement.
+    pub official_open: bool,
     pub official: Option<OfficialDraft>,
     pub diagnostic: Option<crate::backend::jam::diagnostic::Diagnostic>,
     pub metadata: crate::backend::jam::metadata::Metadata,
@@ -165,6 +169,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            official_open: false,
             official: None,
             diagnostic: None,
             metadata: Default::default(),
@@ -210,7 +215,11 @@ impl State {
                 .confirmation
                 .is_some()
                 .then_some("The Jam changed. Check its state before continuing.");
+            let official_open = self.official_open
+                && self.stamp.account == live.account
+                && self.stamp.engine == live.engine;
             *self = Self {
+                official_open,
                 stamp: live,
                 notice,
                 engaged: self.engaged,
@@ -313,6 +322,7 @@ impl State {
         !self.fresh() || !matches!(self.membership, Membership::Absent)
     }
     pub fn start(&mut self, kind: Kind) {
+        self.official_open = false;
         self.engaged = true;
         self.pending = Some(kind);
         self.confirmation = None;
@@ -613,6 +623,42 @@ mod official_tests {
         draft.clear();
         assert!(!draft.has_input());
     }
+    #[test]
+    fn official_surface_is_non_authoritative_and_closes_across_account_or_engine() {
+        for live in [
+            Stamp {
+                revision: 1,
+                ..Default::default()
+            },
+            Stamp {
+                account: 1,
+                ..Default::default()
+            },
+            Stamp {
+                engine: 1,
+                ..Default::default()
+            },
+        ] {
+            let mut state = State {
+                official_open: true,
+                official: Some(OfficialDraft::default()),
+                ..Default::default()
+            };
+            state.official.as_mut().unwrap().append("Synthetic9".into());
+            state.sync(live);
+            assert!(state.official.is_none() && state.owner_id().is_none());
+            assert_eq!(state.official_open, live.account == 0 && live.engine == 0);
+        }
+        let edit = OfficialEdit::new("Synthetic9".into());
+        let action = Intent::PasteOfficial(edit.clone());
+        assert!(!format!("{action:?}").contains("Synthetic9"));
+        assert!(edit.take().is_some());
+        let Intent::PasteOfficial(cloned) = action else {
+            unreachable!()
+        };
+        assert!(cloned.take().is_none());
+    }
+
     #[test]
     fn official_draft_never_survives_context_retirement_or_pending() {
         let mut state = State {

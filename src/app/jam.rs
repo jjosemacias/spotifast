@@ -47,6 +47,9 @@ impl App {
         let comparison_visible = self.lyrics_fullscreen.is_none()
             && ((self.show_queue_panel && self.queue_tab == QueueTab::Queue)
                 || matches!(self.page(), Page::Queue));
+        if !comparison_visible {
+            self.jam.official_open = false;
+        }
         if !comparison_visible || !context_valid {
             self.jam.official = None;
             self.backend.cancel_jam_comparison();
@@ -98,7 +101,7 @@ impl App {
     pub(super) fn apply_jam(&mut self, action: crate::model::jam::UiAction, ctx: &egui::Context) {
         // Drain edits even when a stale intention is refused; clones hold no replayable text.
         let edit = match &action.intent {
-            Intent::EditOfficial(value) => value.take(),
+            Intent::EditOfficial(value) | Intent::PasteOfficial(value) => value.take(),
             _ => None,
         };
         self.consume_jam(ctx);
@@ -107,11 +110,13 @@ impl App {
             intent,
             Intent::AskCompare
                 | Intent::EditOfficial(_)
+                | Intent::PasteOfficial(_)
                 | Intent::BackspaceOfficial
                 | Intent::ClearOfficial
                 | Intent::CompareOfficial
                 | Intent::CancelCompare
         ) {
+            self.jam.official_open = false;
             self.jam.official = None;
             self.backend.cancel_jam_comparison();
         }
@@ -126,15 +131,19 @@ impl App {
             Intent::AskCompare => {
                 if self.jam.owner_id().is_some() {
                     self.backend.cancel_jam_comparison();
+                    self.jam.official_open = true;
                     self.jam.official = Some(Default::default());
                 }
                 return;
             }
-            Intent::EditOfficial(_) => {
+            Intent::EditOfficial(_) | Intent::PasteOfficial(_) => {
                 if self.jam.owner_id().is_some()
                     && let Some(draft) = &mut self.jam.official
                     && let Some(value) = edit
                 {
+                    if matches!(intent, Intent::PasteOfficial(_)) {
+                        draft.clear();
+                    }
                     draft.append(value);
                 }
                 return;
@@ -152,6 +161,7 @@ impl App {
                 return;
             }
             Intent::CancelCompare => {
+                self.jam.official_open = false;
                 self.jam.official = None;
                 clear_official_focus(ctx);
                 self.backend.cancel_jam_comparison();

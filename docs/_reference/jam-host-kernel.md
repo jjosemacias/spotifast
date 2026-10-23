@@ -222,10 +222,23 @@ invalidation remains consumable while verification or context is unavailable.
 On engine acceptance, two listeners reuse its Dealer before a read is allowed:
 social-connect/v2/session_update and hm://pusher/v1/connections/. JSON Jam payloads
 have a separate bounded delta decoder, never the HTTP membership profile. No
-delta is applied as member/owner truth: ordering is not demonstrated. Every notification conservatively
-invalidates to Unknown, cancels pending work and fences already queued results.
-This includes notifications caused by our own writes: they can leave the outcome
-uncertain, requiring a new deliberate Current, without retrying the mutation.
+delta is applied as member/owner truth: ordering is not demonstrated. Every
+notification immediately invalidates authority, metadata, freshness and the
+old stamp to Unknown. Account, engine, connection, context or listener retirement
+also cancels pending work. Jam alone may retain only observation of an already
+emitted Create, on the same physical Session and within its original deadline,
+while its single verifier remains unissued. Its complete valid owner reply is a
+private ID/context witness, never membership or invitation authority. Bridge
+uses it only to compare one Current under a live binding; only delivery with
+matching ID/owner, context, stamp, freshness and deadline can commit and clear
+uncertainty. There is no direct generic-kernel Create publication path.
+
+Jam during the verifier or its delivery keeps the outcome uncertain without a
+second GET. If Jam retires a verifier waiting for read budget, releasing the
+budget emits no GET and does not rebind it. A pending observation keeps other
+intentions Busy until result or the original deadline. An ordinary deliberate
+Current, even Present or 404, cannot clear an uncertain-write fence. No mutation
+is replayed, and no notification is assumed to come from our own write.
 The connection header is compared with the Session's installed connection ID;
 it is not exposed in events. A missing header blocks readiness. Stream end/error
 leaves NotReady until a new engine binding; no subscription repair or polling
@@ -334,9 +347,10 @@ policy. For mutations the final verifying Current supplies the displayed metadat
 metadata from the earlier mutation response is not merged into an omitted field
 of a later snapshot. No format, completeness or ordering guarantee is invented.
 Dealer's delta envelope validates optional session/member fields separately;
-all Dealer notifications still invalidate and require deliberate Current. An
-omitted delta list is never interpreted as an empty snapshot. Applying partial
-Dealer changes without a demonstrated ordering contract remains pending.
+all Dealer notifications still invalidate. Apart from the bounded Create
+verification described above, a deliberate Current is required for a new
+projection and cannot clear write uncertainty. An omitted delta list is never
+interpreted as an empty snapshot. Applying partial Dealer changes without a demonstrated ordering contract remains pending.
 
 Only a fresh confirmed owner can open the invitation card in the existing queue.
 `join_session_url` accepts the exact long HTTPS form already supported for Join,

@@ -102,6 +102,7 @@ pub enum Operation {
 
 /// Freshness must still hold after token preparation, immediately before send.
 pub struct Dispatch {
+    create: Option<Arc<lifecycle::CreateLease>>,
     pub operation: Operation,
     pub fresh_until: Option<Instant>,
     uncertainty: Option<Arc<AtomicBool>>,
@@ -136,6 +137,13 @@ impl Dispatch {
         if let Some(fence) = &self.uncertainty {
             fence.store(true, Ordering::SeqCst);
         }
+        if let Some(lease) = &self.create {
+            if self.operation == Operation::Current {
+                lease.verifier_emitted.store(true, Ordering::SeqCst);
+            } else if self.operation == Operation::Create {
+                lease.emitted.store(true, Ordering::SeqCst);
+            }
+        }
     }
     pub fn check_freshness(&self) -> Result<(), Error> {
         if self
@@ -162,6 +170,11 @@ pub type Check<'a> = &'a (dyn Fn() -> Result<(), Error> + Send + Sync);
 pub trait Transport: Send + Sync {
     /// Must reflect logout, engine replacement and Dealer connection changes.
     fn context(&self) -> Result<Context, Error>;
+    /// Physical binding for observing an already emitted Create; grants no authority
+    /// or permission to dispatch another request through a retired epoch.
+    fn observation_context(&self) -> Result<Context, Error> {
+        self.context()
+    }
     /// Check `permit` after awaits and both it and dispatch freshness just before
     /// the single application dispatch, calling `Dispatch::mark_emitted` at that
     /// boundary. Never retry or reconnect a mutation.
@@ -421,6 +434,12 @@ struct Read {
     metadata: metadata::Metadata,
 }
 
+// Private correlation witness only. No metadata or authority survives in it.
+struct CreateAck {
+    context: Context,
+    session_id: String,
+}
+
 #[cfg(test)]
 fn membership(reply: Reply, profile: &Profile) -> Result<Membership, Error> {
     read_reply(reply, profile).map(|read| read.membership)
@@ -524,6 +543,136 @@ pub struct Kernel<T: Transport> {
 }
 
 impl<T: Transport> Kernel<T> {
+    async fn capture_create(&self, lease: Arc<lifecycle::CreateLease>) -> Result<CreateAck, Error> {
+        let _gate = self.gate.try_lock().map_err(|_| Error::Busy)?;
+        let context = self.sync_context()?;
+        let (revision, fresh_until) = {
+            let mut state = self.state();
+            if self.write_uncertain.load(Ordering::SeqCst) {
+                return Err(Error::WriteUncertain);
+            }
+            if state.reconcile {
+                return Err(Error::ReconcileRequired);
+            }
+            if !state.current_at.is_some_and(|at| at.elapsed() < FRESH_FOR) {
+                return Err(Error::SnapshotExpired);
+            }
+            if state.membership != Membership::Absent {
+                return Err(Error::NotAbsent);
+            }
+            let fresh_until = state.current_at.map(|at| at + FRESH_FOR);
+            state.invalidate();
+            (state.revision, fresh_until)
+        };
+        let permit = || {
+            lease.check()?;
+            if lease.emitted.load(Ordering::SeqCst) {
+                if self.transport.observation_context()? == context {
+                    Ok(())
+                } else {
+                    Err(Error::Stale)
+                }
+            } else {
+                self.check(&context, revision)
+            }
+        };
+        let reply = self
+            .transport
+            .send(
+                Dispatch {
+                    create: Some(Arc::clone(&lease)),
+                    operation: Operation::Create,
+                    fresh_until,
+                    uncertainty: Some(Arc::clone(&self.write_uncertain)),
+                    diagnostic: None,
+                },
+                &context,
+                &permit,
+            )
+            .await?;
+        permit()?;
+        if (400..500).contains(&reply.status)
+            && reply.status != 408
+            && self.check(&context, revision).is_ok()
+        {
+            self.write_uncertain.store(false, Ordering::SeqCst);
+        }
+        success(&reply)?;
+        match read_reply(reply, &self.profile)?.membership {
+            Membership::Present(session) if session.is_session_owner => Ok(CreateAck {
+                context,
+                session_id: session.session_id,
+            }),
+            _ => Err(Error::VerificationFailed),
+        }
+    }
+
+    async fn verify_create(
+        &self,
+        ack: CreateAck,
+        lease: Arc<lifecycle::CreateLease>,
+    ) -> Result<Snapshot, Error> {
+        let _gate = self.gate.try_lock().map_err(|_| Error::Busy)?;
+        lease.check()?;
+        let context = self.sync_context()?;
+        if context != ack.context {
+            return Err(Error::Stale);
+        }
+        let revision = {
+            let mut state = self.state();
+            state.invalidate();
+            state.revision
+        };
+        let permit = || {
+            lease.check()?;
+            self.check(&context, revision)
+        };
+        let reply = self
+            .transport
+            .send(
+                Dispatch {
+                    create: Some(Arc::clone(&lease)),
+                    operation: Operation::Current,
+                    fresh_until: None,
+                    uncertainty: None,
+                    diagnostic: None,
+                },
+                &context,
+                &permit,
+            )
+            .await?;
+        permit()?;
+        let read = read_reply(reply, &self.profile)?;
+        if !matches!(&read.membership, Membership::Present(session) if session.is_session_owner && session.session_id == ack.session_id)
+        {
+            return Err(Error::VerificationFailed);
+        }
+        let mut state = self.state();
+        if state.revision != revision || state.context.as_ref() != Some(&context) {
+            return Err(Error::Stale);
+        }
+        let at = Instant::now();
+        state.membership = read.membership.clone();
+        state.metadata = read.metadata.clone();
+        state.current_at = Some(at);
+        state.reconcile = true;
+        state.error = Some(Error::WriteUncertain);
+        lease.verified.store(true, Ordering::SeqCst);
+        Ok(Snapshot {
+            membership: read.membership,
+            metadata: read.metadata,
+            fresh_until: Some(at + FRESH_FOR),
+            reconcile_required: false,
+            error: None,
+        })
+    }
+
+    fn commit_create(&self) {
+        self.write_uncertain.store(false, Ordering::SeqCst);
+        let mut state = self.state();
+        state.reconcile = false;
+        state.error = None;
+    }
     pub fn new(transport: Arc<T>, profile: Profile) -> Self {
         Self {
             transport,
@@ -610,6 +759,7 @@ impl<T: Transport> Kernel<T> {
             .transport
             .send(
                 Dispatch {
+                    create: None,
                     operation: Operation::Current,
                     fresh_until: None,
                     uncertainty: None,
@@ -628,10 +778,6 @@ impl<T: Transport> Kernel<T> {
 
     pub async fn current(&self) -> Result<Membership, Error> {
         self.run(Operation::Current).await
-    }
-
-    pub async fn create(&self, _intent: CreateIntent) -> Result<Membership, Error> {
-        self.run(Operation::Create).await
     }
 
     pub async fn join(&self, link: Link, _intent: JoinIntent) -> Result<Membership, Error> {
@@ -655,6 +801,10 @@ impl<T: Transport> Kernel<T> {
         operation: Operation,
         diagnostic: Option<&Probe>,
     ) -> Result<Membership, Error> {
+        // Create is owned by Bridge: capture/verify cannot publish or commit here.
+        if operation == Operation::Create {
+            return Err(Error::NotReady);
+        }
         let _gate = self.gate.try_lock().map_err(|_| Error::Busy)?;
         let context = self.sync_context()?;
         let (revision, fresh_until) = {
@@ -670,8 +820,8 @@ impl<T: Transport> Kernel<T> {
                     return Err(Error::SnapshotExpired);
                 }
                 match (&operation, &state.membership) {
-                    (Operation::Create | Operation::Join(_), Membership::Absent) => (),
-                    (Operation::Create | Operation::Join(_), _) => return Err(Error::NotAbsent),
+                    (Operation::Join(_), Membership::Absent) => (),
+                    (Operation::Join(_), _) => return Err(Error::NotAbsent),
                     (Operation::End(id), Membership::Present(session))
                         if session.is_session_owner && session.session_id == *id => {}
                     _ => return Err(Error::NotOwner),
@@ -693,6 +843,7 @@ impl<T: Transport> Kernel<T> {
                 .transport
                 .send(
                     Dispatch {
+                        create: None,
                         operation: operation.clone(),
                         fresh_until,
                         uncertainty: Some(Arc::clone(&self.write_uncertain)),
@@ -708,27 +859,19 @@ impl<T: Transport> Kernel<T> {
                 self.write_uncertain.store(false, Ordering::SeqCst);
             }
             success(&reply)?;
-            let created =
-                if operation == Operation::Create || matches!(operation, Operation::Join(_)) {
-                    match read_reply(reply, &self.profile)? {
-                        Read {
-                            membership: Membership::Present(session),
-                            metadata: _,
-                        } if session.is_session_owner == (operation == Operation::Create) => {
-                            Some(session.session_id)
-                        }
-                        _ => return Err(Error::VerificationFailed),
-                    }
-                } else {
-                    None
-                };
-            let current = self.read_current(&context, revision, None).await?;
-            match (&operation, created, &current.membership) {
-                (Operation::Create, Some(id), Membership::Present(session))
-                    if session.is_session_owner && session.session_id == id =>
-                {
-                    Ok(current)
+            let joined = if matches!(operation, Operation::Join(_)) {
+                match read_reply(reply, &self.profile)? {
+                    Read {
+                        membership: Membership::Present(session),
+                        metadata: _,
+                    } if !session.is_session_owner => Some(session.session_id),
+                    _ => return Err(Error::VerificationFailed),
                 }
+            } else {
+                None
+            };
+            let current = self.read_current(&context, revision, None).await?;
+            match (&operation, joined, &current.membership) {
                 (Operation::End(_), _, Membership::Absent) => Ok(current),
                 (Operation::Join(_), Some(id), Membership::Present(session))
                     if !session.is_session_owner && session.session_id == id =>

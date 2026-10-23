@@ -199,6 +199,46 @@ fn kernel(fake: &Arc<Fake>) -> Kernel<Fake> {
     Kernel::new(Arc::clone(fake), Profile::ObservedFourFields)
 }
 
+// Test-only orchestration of the production steps, with no Jam retirement exemption.
+// Publication under a live Bridge gate is covered by lifecycle tests, not this helper.
+async fn create_fixture(kernel: &Kernel<Fake>) -> Result<Membership, Error> {
+    let context = kernel.sync_context()?;
+    let revision = kernel.state().revision.wrapping_add(1);
+    let (_hard_epoch, epoch) = watch::channel(0);
+    let lease = Arc::new(lifecycle::CreateLease::new(epoch));
+    let result = tokio::time::timeout_at(lease.deadline, async {
+        let ack = kernel.capture_create(Arc::clone(&lease)).await?;
+        kernel.check(&context, revision)?;
+        let snapshot = kernel.verify_create(ack, Arc::clone(&lease)).await?;
+        kernel.check(&context, revision.wrapping_add(1))?;
+        lease.check()?;
+        kernel.commit_create();
+        Ok(snapshot.membership)
+    })
+    .await
+    .unwrap_or(Err(Error::Timeout));
+    if let Err(error) = result {
+        let mut state = kernel.state();
+        if state.reconcile {
+            state.error = Some(error);
+        }
+    }
+    result
+}
+
+#[tokio::test]
+async fn generic_executor_cannot_dispatch_or_commit_create() {
+    let fake = Fake::new(vec![]);
+    let kernel = kernel(&fake);
+    assert_eq!(
+        kernel.run(Operation::Create).await.err(),
+        Some(Error::NotReady)
+    );
+    assert_eq!(fake.count(), 0);
+    assert!(kernel.snapshot().membership == Membership::Unknown);
+    assert!(kernel.snapshot().reconcile_required);
+}
+
 #[tokio::test]
 async fn diagnostic_current_preserves_parser_results_and_reports_validation_boundary() {
     use super::diagnostic::UrlField;
@@ -769,6 +809,7 @@ async fn diagnostic_prepared_refusal_is_not_reported_as_a_polled_transport() {
     let probe = Probe::default();
     probe.stage(Stage::Preparation);
     let dispatch = Dispatch {
+        create: None,
         operation: Operation::Current,
         fresh_until: None,
         uncertainty: None,
@@ -905,6 +946,7 @@ async fn prepared_future_checks_before_poll_and_retains_possible_emission_on_can
     let polls = AtomicUsize::new(0);
     for expired in [false, true] {
         let dispatch = Dispatch {
+            create: None,
             diagnostic: None,
             operation: Operation::Join(link()),
             fresh_until: Some(Instant::now() + if expired { Duration::ZERO } else { FRESH_FOR }),
@@ -927,6 +969,7 @@ async fn prepared_future_checks_before_poll_and_retains_possible_emission_on_can
     }
     assert_eq!(polls.load(Ordering::SeqCst), 0);
     let dispatch = Dispatch {
+        create: None,
         diagnostic: None,
         operation: Operation::Join(link()),
         fresh_until: None,
@@ -1180,7 +1223,7 @@ async fn ambiguous_join_cannot_be_replayed_after_current_404_or_invalidation() {
         assert_eq!(kernel.snapshot().error, Some(Error::WriteUncertain));
         assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
         assert_eq!(
-            kernel.create(CreateIntent::Requested).await.err(),
+            create_fixture(&kernel).await.err(),
             Some(Error::WriteUncertain)
         );
         kernel.invalidate();
@@ -1339,26 +1382,23 @@ async fn construction_is_passive_and_create_is_one_mutation_with_owner_verificat
     let kernel = kernel(&fake);
     fn assert_send<T: Send>(_: T) {}
     assert_send(kernel.current());
-    assert_send(kernel.create(CreateIntent::Requested));
+    assert_send(create_fixture(&kernel));
     assert_send(kernel.end("host", EndIntent::ForEveryone));
     assert_eq!(fake.count(), 0);
     assert_eq!(
-        kernel.create(CreateIntent::Requested).await.err(),
+        create_fixture(&kernel).await.err(),
         Some(Error::ReconcileRequired)
     );
     assert!(kernel.current().await.unwrap() == Membership::Absent);
     assert!(
-        matches!(kernel.create(CreateIntent::Requested).await, Ok(Membership::Present(p)) if p.is_session_owner)
+        matches!(create_fixture(&kernel).await, Ok(Membership::Present(p)) if p.is_session_owner)
     );
     assert_eq!(fake.writes(), 1);
     assert!(
         *fake.calls.lock().unwrap() == [Operation::Current, Operation::Create, Operation::Current]
     );
     assert!(!kernel.snapshot().reconcile_required);
-    assert_eq!(
-        kernel.create(CreateIntent::Requested).await.err(),
-        Some(Error::NotAbsent)
-    );
+    assert_eq!(create_fixture(&kernel).await.err(), Some(Error::NotAbsent));
     assert_eq!(fake.writes(), 1);
 }
 
@@ -1410,7 +1450,7 @@ async fn expired_current_cannot_authorize_a_write() {
     kernel.current().await.unwrap();
     tokio::time::advance(FRESH_FOR).await;
     assert_eq!(
-        kernel.create(CreateIntent::Requested).await.err(),
+        create_fixture(&kernel).await.err(),
         Some(Error::SnapshotExpired)
     );
     kernel.current().await.unwrap();
@@ -1436,14 +1476,14 @@ async fn rejected_and_uncertain_writes_never_verify_retry_or_publish_success() {
         let kernel = kernel(&fake);
         kernel.current().await.unwrap();
         fake.push(step);
-        assert!(kernel.create(CreateIntent::Requested).await.is_err());
+        assert!(create_fixture(&kernel).await.is_err());
         assert_eq!(fake.count(), 2, "no verification read after failure");
         let snapshot = kernel.snapshot();
         assert!(snapshot.membership == Membership::Unknown);
         assert!(snapshot.reconcile_required && snapshot.error.is_some());
         let uncertain = !matches!(snapshot.error, Some(Error::Http(403 | 405 | 429)));
         assert_eq!(
-            kernel.create(CreateIntent::Requested).await.err(),
+            create_fixture(&kernel).await.err(),
             Some(if uncertain {
                 Error::WriteUncertain
             } else {
@@ -1472,7 +1512,7 @@ async fn verification_must_match_the_created_owner_or_confirm_departure() {
         let fake = Fake::new(vec![status(404), session("host", true), followup]);
         let kernel = kernel(&fake);
         kernel.current().await.unwrap();
-        assert!(kernel.create(CreateIntent::Requested).await.is_err());
+        assert!(create_fixture(&kernel).await.is_err());
         assert!(kernel.snapshot().membership == Membership::Unknown);
         assert!(kernel.snapshot().reconcile_required);
     }
@@ -1488,7 +1528,7 @@ async fn verification_must_match_the_created_owner_or_confirm_departure() {
     let kernel = kernel(&fake);
     kernel.current().await.unwrap();
     assert_eq!(
-        kernel.create(CreateIntent::Requested).await.err(),
+        create_fixture(&kernel).await.err(),
         Some(Error::VerificationFailed)
     );
     assert_eq!(
@@ -1506,7 +1546,7 @@ async fn timeout_and_cancellation_require_explicit_reconciliation() {
         kernel.current().await.unwrap();
         fake.push(Step::Pending);
         if cancel {
-            let mut future = Box::pin(kernel.create(CreateIntent::Requested));
+            let mut future = Box::pin(create_fixture(&kernel));
             assert!(
                 tokio::time::timeout(Duration::from_secs(1), &mut future)
                     .await
@@ -1514,10 +1554,7 @@ async fn timeout_and_cancellation_require_explicit_reconciliation() {
             );
             drop(future);
         } else {
-            assert_eq!(
-                kernel.create(CreateIntent::Requested).await.err(),
-                Some(Error::Timeout)
-            );
+            assert_eq!(create_fixture(&kernel).await.err(), Some(Error::Timeout));
         }
         assert!(kernel.snapshot().membership == Membership::Unknown);
         assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
@@ -1525,7 +1562,7 @@ async fn timeout_and_cancellation_require_explicit_reconciliation() {
         kernel.current().await.unwrap();
         assert!(kernel.snapshot().reconcile_required);
         assert_eq!(
-            kernel.create(CreateIntent::Requested).await.err(),
+            create_fixture(&kernel).await.err(),
             Some(Error::WriteUncertain)
         );
         assert_eq!(join(&kernel).await.err(), Some(Error::WriteUncertain));
@@ -1557,7 +1594,7 @@ async fn lifecycle_changes_fence_replies_and_snapshots_without_followup_io() {
         kernel.current().await.unwrap();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         fake.push(Step::Wait(receiver));
-        let mut future = Box::pin(kernel.create(CreateIntent::Requested));
+        let mut future = Box::pin(create_fixture(&kernel));
         tokio::select! {
             result = &mut future => panic!("unexpected completion: {:?}", result.err()),
             _ = tokio::task::yield_now() => (),
@@ -1591,10 +1628,7 @@ async fn gate_serializes_reads_and_writes_and_invalidation_discards_current() {
         _ = tokio::task::yield_now() => (),
     }
     assert_eq!(kernel.current().await.err(), Some(Error::Busy));
-    assert_eq!(
-        kernel.create(CreateIntent::Requested).await.err(),
-        Some(Error::Busy)
-    );
+    assert_eq!(create_fixture(&kernel).await.err(), Some(Error::Busy));
     kernel.invalidate();
     sender.send(status(404)).ok().unwrap();
     assert_eq!(future.await.err(), Some(Error::Stale));
@@ -1609,7 +1643,7 @@ async fn invalidation_during_preparation_prevents_the_mutating_dispatch() {
     kernel.current().await.unwrap();
     let (sender, receiver) = tokio::sync::oneshot::channel();
     fake.push(Step::Preparing(receiver, session("host", true)));
-    let mut future = Box::pin(kernel.create(CreateIntent::Requested));
+    let mut future = Box::pin(create_fixture(&kernel));
     tokio::select! {
         result = &mut future => panic!("unexpected completion: {:?}", result.err()),
         _ = tokio::task::yield_now() => (),
@@ -1628,7 +1662,7 @@ async fn freshness_must_hold_after_asynchronous_preparation() {
     kernel.current().await.unwrap();
     let (sender, receiver) = tokio::sync::oneshot::channel();
     fake.push(Step::Preparing(receiver, session("host", true)));
-    let mut future = Box::pin(kernel.create(CreateIntent::Requested));
+    let mut future = Box::pin(create_fixture(&kernel));
     tokio::select! {
         result = &mut future => panic!("unexpected completion: {:?}", result.err()),
         _ = tokio::task::yield_now() => (),

@@ -117,14 +117,61 @@ pub struct Event {
 }
 
 type Work<'a> = Pin<Box<dyn Future<Output = Result<Membership, Error>> + Send + 'a>>;
+type AckWork<'a> = Pin<Box<dyn Future<Output = Result<CreateAck, Error>> + Send + 'a>>;
+type VerifyWork<'a> = Pin<Box<dyn Future<Output = Result<Snapshot, Error>> + Send + 'a>>;
+
+pub(super) struct CreateLease {
+    hard_epoch: watch::Receiver<u64>,
+    pub(super) deadline: Instant,
+    pub(super) emitted: AtomicBool,
+    pub(super) verifier_emitted: AtomicBool,
+    cancelled: AtomicBool,
+    pub(super) verified: AtomicBool,
+}
+impl CreateLease {
+    pub(super) fn new(hard_epoch: watch::Receiver<u64>) -> Self {
+        Self {
+            hard_epoch,
+            deadline: Instant::now() + DEADLINE,
+            emitted: AtomicBool::new(false),
+            verifier_emitted: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            verified: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn check(&self) -> Result<(), Error> {
+        if self.cancelled.load(Ordering::SeqCst)
+            || !matches!(self.hard_epoch.has_changed(), Ok(false))
+        {
+            return Err(Error::Stale);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(Error::Timeout);
+        }
+        Ok(())
+    }
+}
 trait Host: Send + Sync {
     fn context(&self) -> Result<Context, Error>;
     fn invalidate(&self);
     fn snapshot(&self) -> Snapshot;
     fn run(&self, action: Action) -> Work<'_>;
+    fn capture_create(&self, lease: Arc<CreateLease>) -> AckWork<'_>;
+    fn verify_create(&self, ack: CreateAck, lease: Arc<CreateLease>) -> VerifyWork<'_>;
+    fn commit_create(&self);
 }
 
 impl<T: Transport> Host for Kernel<T> {
+    fn capture_create(&self, lease: Arc<CreateLease>) -> AckWork<'_> {
+        Box::pin(self.capture_create(lease))
+    }
+    fn verify_create(&self, ack: CreateAck, lease: Arc<CreateLease>) -> VerifyWork<'_> {
+        Box::pin(self.verify_create(ack, lease))
+    }
+    fn commit_create(&self) {
+        self.commit_create();
+    }
     fn context(&self) -> Result<Context, Error> {
         self.transport.context()
     }
@@ -141,7 +188,8 @@ impl<T: Transport> Host for Kernel<T> {
                 Action::DiagnoseCurrent(probe) => {
                     self.run_observed(Operation::Current, Some(&probe)).await
                 }
-                Action::Create(intent) => self.create(intent).await,
+                // No generic Create path: only Bridge owns its lease and commit gate.
+                Action::Create(_) => Err(Error::NotReady),
                 Action::Join { link, intent } => self.join(link, intent).await,
                 Action::End { session_id, intent } => self.end(&session_id, intent).await,
             }
@@ -158,6 +206,12 @@ struct EpochTransport<T> {
 }
 
 impl<T: Transport> Transport for EpochTransport<T> {
+    fn observation_context(&self) -> Result<Context, Error> {
+        if !(self.verify)() {
+            return Err(Error::Stale);
+        }
+        self.inner.observation_context()
+    }
     fn context(&self) -> Result<Context, Error> {
         if !matches!(self.epoch.has_changed(), Ok(false)) || !(self.verify)() {
             return Err(Error::Stale);
@@ -171,8 +225,21 @@ impl<T: Transport> Transport for EpochTransport<T> {
         permit: Check<'a>,
     ) -> Response<'a> {
         Box::pin(async move {
+            let create = dispatch.create.clone();
+            let is_create = dispatch.operation == Operation::Create;
             let check = || {
-                self.context()?;
+                if let Some(lease) = &create {
+                    lease.check()?;
+                    if is_create && lease.emitted.load(Ordering::SeqCst) {
+                        if self.observation_context()? != *context {
+                            return Err(Error::Stale);
+                        }
+                    } else {
+                        self.context()?;
+                    }
+                } else {
+                    self.context()?;
+                }
                 permit()
             };
             check()?;
@@ -198,7 +265,7 @@ impl<T: Transport> Transport for EpochTransport<T> {
     }
 }
 
-type Factory = Box<dyn Fn(watch::Receiver<u64>) -> Result<Arc<dyn Host>, Error> + Send + Sync>;
+type Factory = Arc<dyn Fn(watch::Receiver<u64>) -> Result<Arc<dyn Host>, Error> + Send + Sync>;
 
 fn factory<T: Transport + 'static>(
     make: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
@@ -206,7 +273,7 @@ fn factory<T: Transport + 'static>(
     budget: Arc<Semaphore>,
     write_uncertain: Arc<AtomicBool>,
 ) -> Factory {
-    Box::new(move |mut epoch| {
+    Arc::new(move |mut epoch| {
         epoch.borrow_and_update();
         let transport = EpochTransport {
             inner: Arc::new(make()?),
@@ -232,6 +299,8 @@ fn unknown(error: Option<Error>) -> Snapshot {
 }
 
 struct Shared {
+    hard_epoch: watch::Sender<u64>,
+    pending_create: Option<Arc<CreateLease>>,
     diagnostic: Option<Probe>,
     write_uncertain: Arc<AtomicBool>,
     stamp: Stamp,
@@ -262,6 +331,19 @@ impl Shared {
     }
 
     fn invalidate(&mut self, cause: Cause) {
+        let preserve_observation = cause == Cause::Jam
+            && self.pending_create.as_ref().is_some_and(|lease| {
+                lease.emitted.load(Ordering::SeqCst)
+                    && !lease.verifier_emitted.load(Ordering::SeqCst)
+                    && lease.check().is_ok()
+            });
+        if cause != Cause::Jam {
+            self.hard_epoch
+                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        }
+        if !preserve_observation && let Some(lease) = self.pending_create.take() {
+            lease.cancelled.store(true, Ordering::SeqCst);
+        }
         if let Some(probe) = &self.diagnostic {
             probe.retire(cause);
         }
@@ -272,7 +354,7 @@ impl Shared {
         if let Some(kernel) = self.kernel.take() {
             kernel.invalidate();
         }
-        if let Some(task) = self.pending.take() {
+        if !preserve_observation && let Some(task) = self.pending.take() {
             task.abort();
         }
         self.context = None;
@@ -411,6 +493,8 @@ impl Bridge {
     pub(crate) fn channel(waker: Waker) -> (Self, watch::Receiver<Option<Arc<Event>>>) {
         let (output, receiver) = watch::channel(None);
         let state = Shared {
+            hard_epoch: watch::channel(0).0,
+            pending_create: None,
             diagnostic: None,
             write_uncertain: Arc::new(AtomicBool::new(false)),
             stamp: Stamp::default(),
@@ -656,6 +740,75 @@ impl Bridge {
         state.stamp.operation = state.stamp.operation.wrapping_add(1);
         let stamp = state.stamp;
         let kind = request.action.kind();
+        if kind == Kind::Create {
+            let lease = Arc::new(CreateLease::new(state.hard_epoch.subscribe()));
+            state.pending_create = Some(Arc::clone(&lease));
+            state.publish(Phase::Pending(kind), unknown(None));
+            let factory = Arc::clone(self.factory.as_ref().expect("bound factory"));
+            let gate = self.gate.clone();
+            let task = tokio::spawn(async move {
+                let result = tokio::time::timeout_at(lease.deadline, async {
+                    let ack = kernel.capture_create(Arc::clone(&lease)).await?;
+                    lease.check()?;
+                    let (verifier, stamp) = {
+                        let mut state = gate.lock();
+                        if !state
+                            .pending_create
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &lease))
+                            || !(state.verify)()
+                        {
+                            return Err(Error::Stale);
+                        }
+                        lease.check()?;
+                        let verifier = factory(state.epoch.subscribe())?;
+                        let context = verifier.context()?;
+                        if context != ack.context {
+                            return Err(Error::Stale);
+                        }
+                        state.kernel = Some(Arc::clone(&verifier));
+                        state.context = Some(context);
+                        state.stamp.operation = state.stamp.operation.wrapping_add(1);
+                        let stamp = state.stamp;
+                        state.publish(Phase::Pending(Kind::Create), unknown(None));
+                        (verifier, stamp)
+                    };
+                    let snapshot = verifier.verify_create(ack, Arc::clone(&lease)).await?;
+                    Ok::<_, Error>((stamp, snapshot))
+                })
+                .await
+                .unwrap_or(Err(Error::Timeout));
+                let completed = {
+                    let state = gate.lock();
+                    if !state
+                        .pending_create
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &lease))
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok((stamp, snapshot)) => Completed {
+                            stamp,
+                            kind: Kind::Create,
+                            snapshot,
+                        },
+                        Err(error) => {
+                            // A queued failure has no observation left to preserve.
+                            lease.cancelled.store(true, Ordering::SeqCst);
+                            Completed {
+                                stamp: state.stamp,
+                                kind: Kind::Create,
+                                snapshot: unknown(Some(error)),
+                            }
+                        }
+                    }
+                };
+                let _ = commands.send(Command::JamFinished(Box::new(completed)));
+            });
+            state.pending = Some(task.abort_handle());
+            return;
+        }
         state.publish(Phase::Pending(kind), unknown(None));
         let gate = self.gate.clone();
         let task = tokio::spawn(async move {
@@ -707,6 +860,27 @@ impl Bridge {
             return;
         }
         state.pending = None;
+        if completed.kind == Kind::Create
+            && let Some(lease) = state.pending_create.take()
+            && completed.snapshot.error.is_none()
+        {
+            if lease.check().is_err()
+                || !completed
+                    .snapshot
+                    .fresh_until
+                    .is_some_and(|until| Instant::now() < until)
+                || !lease.verified.load(Ordering::SeqCst)
+                || !lease.verifier_emitted.load(Ordering::SeqCst)
+            {
+                state.publish(Phase::Complete(Kind::Create), unknown(Some(Error::Stale)));
+                return;
+            }
+            state
+                .kernel
+                .as_ref()
+                .expect("verified kernel")
+                .commit_create();
+        }
         state.publish(Phase::Complete(completed.kind), completed.snapshot);
     }
 }

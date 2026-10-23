@@ -210,6 +210,373 @@ fn diagnose(worker: &mut Worker) -> Probe {
 }
 
 #[test]
+fn create_observation_survives_jam_until_one_live_verifier() {
+    for notices in 0..4 {
+        let (runtime, mut worker, fake, mut commands, events) = setup("spike-create-positive");
+        runtime.block_on(async {
+            fake.push(absent());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            let release = fake.wait();
+            let mut current = owner();
+            let mut body: serde_json::Value = serde_json::from_slice(&current.body).unwrap();
+            // Same deliberately rejected invitation as the baseline characterization.
+            body["join_session_url"] = serde_json::json!(
+                "https://open.spotify.com/socialsession/SyntheticPrivate?unknown=x"
+            );
+            current.body = serde_json::to_vec(&body).unwrap();
+            fake.push(current);
+            request(&mut worker, Action::Create(CreateIntent::Requested));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fake.calls() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let gate = worker.jam.gate();
+            let old = gate.stamp();
+            let lease = Arc::clone(gate.lock().pending_create.as_ref().unwrap());
+            let deadline = lease.deadline;
+            for _ in 0..notices {
+                gate.signal(old.engine, Notice::Jam);
+                assert!(latest(&events).phase == Phase::Invalidated(Cause::Jam));
+                assert!(latest(&events).snapshot.membership == Membership::Unknown);
+                assert!(latest(&events).snapshot.metadata.invitation.is_none());
+                assert!(!gate.accepts(old));
+                assert_eq!(lease.deadline, deadline);
+            }
+            assert!(!release.is_closed());
+            assert!(gate.write_uncertain());
+            assert_eq!(fake.calls(), 2, "no read before valid reply");
+            let mut created = owner();
+            let mut body: serde_json::Value = serde_json::from_slice(&created.body).unwrap();
+            body["join_session_url"] =
+                serde_json::json!("https://open.spotify.com/socialsession/SyntheticPrivate");
+            created.body = serde_json::to_vec(&body).unwrap();
+            release.send(created).ok().unwrap();
+            let completed = queued(&mut commands).await;
+            assert!(
+                gate.write_uncertain(),
+                "ack and read alone do not publish authority"
+            );
+            assert!(latest(&events).snapshot.membership == Membership::Unknown);
+            worker.finish_jam(completed);
+            assert!(!gate.write_uncertain());
+            assert_eq!(latest(&events).snapshot.error, None);
+            assert!(!latest(&events).snapshot.reconcile_required);
+            let mut model = crate::model::jam::State::default();
+            assert!(model.observe(&latest(&events), gate.stamp()));
+            assert!(model.fresh() && model.owner_id().is_some());
+            assert!(
+                model.invitation().is_none(),
+                "never retain invitation from Create"
+            );
+            assert_eq!((fake.calls(), fake.writes()), (3, 1));
+        });
+    }
+}
+
+#[test]
+fn create_hard_retire_errors_deadlines_and_late_results_remain_blocked() {
+    // 0..4: hard retire; 5..9: missing/invalid reply or discordant verifier;
+    // 10: Jam in verifier; 11..12: original deadline; 13: late Jam delivery;
+    // 14: getter changed; 15: Jam then hard retire; 16..17: delivery expiry.
+    for case in 0..18 {
+        let (runtime, mut worker, fake, mut commands, events) = setup("spike-create-negative");
+        runtime.block_on(async {
+            if matches!(case, 11 | 12 | 16 | 17) {
+                tokio::time::pause();
+            }
+            fake.push(absent());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            let mut release = fake.wait();
+            let mut verifier = if matches!(case, 10 | 12) {
+                Some(fake.wait())
+            } else {
+                if !matches!(case, 5 | 6 | 7 | 11 | 14) {
+                    let mut reply = if case == 8 { absent() } else { owner() };
+                    if case == 9 {
+                        let mut body: serde_json::Value =
+                            serde_json::from_slice(&reply.body).unwrap();
+                        body["session_id"] = serde_json::json!("synthetic-other");
+                        reply.body = serde_json::to_vec(&body).unwrap();
+                    }
+                    fake.push(reply);
+                }
+                None
+            };
+            request(&mut worker, Action::Create(CreateIntent::Requested));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fake.calls() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let gate = worker.jam.gate();
+            let old = gate.stamp();
+            if case < 5 || case == 15 {
+                match case {
+                    0 => worker.jam.retire(old.account + 1, Cause::Account),
+                    1 => worker.take_engine_for_resume(),
+                    2 => gate.signal(
+                        old.engine,
+                        Notice::Connection(Some("other-connection".into())),
+                    ),
+                    3 => gate.lock().invalidate(Cause::Context),
+                    4 => gate.signal(old.engine, Notice::Closed),
+                    _ => {
+                        gate.signal(old.engine, Notice::Jam);
+                        gate.signal(old.engine, Notice::Jam);
+                        gate.lock().invalidate(Cause::Context);
+                    }
+                }
+                tokio::time::timeout(Duration::from_secs(2), release.closed())
+                    .await
+                    .unwrap();
+                assert!(release.send(owner()).is_err());
+                assert!(commands.try_recv().is_err());
+            } else if case == 11 {
+                gate.signal(old.engine, Notice::Jam);
+                tokio::time::advance(Duration::from_secs(21)).await;
+                finish(&mut worker, &mut commands).await;
+                assert!(release.send(owner()).is_err());
+                assert_eq!(latest(&events).snapshot.error, Some(Error::Timeout));
+            } else {
+                if case == 14 {
+                    fake.0.context.lock().unwrap().connection = "changed-without-notice".into();
+                }
+                if case == 12 {
+                    tokio::time::advance(Duration::from_secs(19)).await;
+                }
+                if case == 5 {
+                    drop(release);
+                } else {
+                    let mut reply = if case == 6 { empty(200) } else { owner() };
+                    if case == 7 {
+                        let mut body: serde_json::Value =
+                            serde_json::from_slice(&reply.body).unwrap();
+                        body["is_session_owner"] = serde_json::json!(false);
+                        reply.body = serde_json::to_vec(&body).unwrap();
+                    }
+                    release.send(reply).ok().unwrap();
+                }
+                if matches!(case, 10 | 12) {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while fake.calls() < 3 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let mut sender = verifier.take().unwrap();
+                    if case == 10 {
+                        gate.signal(old.engine, Notice::Jam);
+                        gate.signal(old.engine, Notice::Jam);
+                        tokio::time::timeout(Duration::from_secs(2), sender.closed())
+                            .await
+                            .unwrap();
+                        assert!(commands.try_recv().is_err());
+                    } else {
+                        tokio::time::advance(Duration::from_secs(2)).await;
+                        finish(&mut worker, &mut commands).await;
+                        assert_eq!(latest(&events).snapshot.error, Some(Error::Timeout));
+                    }
+                    assert!(sender.send(owner()).is_err());
+                } else if matches!(case, 13 | 16 | 17) {
+                    let completed = queued(&mut commands).await;
+                    assert!(gate.write_uncertain());
+                    if case == 13 {
+                        gate.signal(old.engine, Notice::Jam);
+                    } else {
+                        tokio::time::advance(Duration::from_secs(if case == 16 { 21 } else { 16 }))
+                            .await;
+                    }
+                    worker.finish_jam(completed);
+                    assert!(latest(&events).snapshot.membership == Membership::Unknown);
+                } else {
+                    finish(&mut worker, &mut commands).await;
+                }
+            }
+            assert!(gate.write_uncertain(), "case {case}");
+            assert!(latest(&events).snapshot.membership == Membership::Unknown);
+            assert!(latest(&events).snapshot.metadata.invitation.is_none());
+            assert!(latest(&events).snapshot.reconcile_required);
+            assert_eq!(fake.writes(), 1);
+            assert!(fake.calls() <= 3, "no verification retry");
+        });
+    }
+}
+
+#[test]
+fn jam_before_create_emission_does_not_preserve_a_permission() {
+    let (runtime, mut worker, fake, mut commands, events) = setup("spike-create-before-emission");
+    runtime.block_on(async {
+        fake.push(absent());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        request(&mut worker, Action::Create(CreateIntent::Requested));
+        let gate = worker.jam.gate();
+        gate.signal(gate.stamp().engine, Notice::Jam);
+        tokio::task::yield_now().await;
+        assert_eq!((fake.calls(), fake.writes()), (1, 0));
+        assert!(!gate.write_uncertain());
+        assert!(latest(&events).snapshot.membership == Membership::Unknown);
+        assert!(commands.try_recv().is_err());
+    });
+}
+
+#[test]
+fn failed_witness_or_verifier_and_ordinary_current_cannot_clear_uncertainty() {
+    for case in 0..10 {
+        let (runtime, mut worker, fake, mut commands, events) = setup("spike-create-failed-proof");
+        runtime.block_on(async {
+            fake.push(absent());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            let release = fake.wait();
+            if case >= 6 {
+                let mut reply = if case == 6 { absent() } else { owner() };
+                if matches!(case, 7 | 8) {
+                    let mut body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+                    if case == 7 {
+                        body["session_id"] = serde_json::json!("synthetic-other");
+                    } else {
+                        body["is_session_owner"] = serde_json::json!(false);
+                    }
+                    reply.body = serde_json::to_vec(&body).unwrap();
+                }
+                if case == 9 {
+                    drop(fake.wait());
+                } else {
+                    fake.push(reply);
+                }
+            }
+            request(&mut worker, Action::Create(CreateIntent::Requested));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fake.calls() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let gate = worker.jam.gate();
+            if case != 0 {
+                gate.signal(gate.stamp().engine, Notice::Jam);
+                gate.signal(gate.stamp().engine, Notice::Jam);
+            }
+            if case == 0 {
+                drop(release);
+            } else {
+                let mut reply = match case {
+                    1 => empty(200),
+                    4 => empty(500),
+                    5 => empty(403),
+                    _ => owner(),
+                };
+                if matches!(case, 2 | 3) {
+                    let mut body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+                    if case == 2 {
+                        body["is_session_owner"] = serde_json::json!(false);
+                    } else {
+                        body["session_id"] = serde_json::json!("");
+                    }
+                    reply.body = serde_json::to_vec(&body).unwrap();
+                }
+                release.send(reply).ok().unwrap();
+            }
+            let completed = queued(&mut commands).await;
+            if case == 0 {
+                // Failure is already queued: a Jam must not leave a finished task Busy.
+                gate.signal(gate.stamp().engine, Notice::Jam);
+            }
+            worker.finish_jam(completed);
+            assert!(gate.lock().pending.is_none(), "case {case}");
+            assert!(gate.lock().pending_create.is_none(), "case {case}");
+            assert!(gate.write_uncertain());
+            assert!(latest(&events).snapshot.membership == Membership::Unknown);
+            assert_eq!(fake.calls(), if case < 6 { 2 } else { 3 });
+            for reply in [absent(), owner()] {
+                fake.push(reply);
+                request(&mut worker, Action::Current);
+                finish(&mut worker, &mut commands).await;
+                assert!(gate.write_uncertain());
+                assert_eq!(latest(&events).snapshot.error, Some(Error::WriteUncertain));
+                let mut model = crate::model::jam::State::default();
+                assert!(model.observe(&latest(&events), gate.stamp()));
+                assert!(!model.fresh() && model.owner_id().is_none());
+            }
+            let calls = fake.calls();
+            request(&mut worker, Action::Create(CreateIntent::Requested));
+            finish(&mut worker, &mut commands).await;
+            assert_eq!(latest(&events).snapshot.error, Some(Error::WriteUncertain));
+            assert_eq!(
+                fake.calls(),
+                calls,
+                "a new intention cannot replay uncertain Create"
+            );
+            assert_eq!(fake.writes(), 1);
+        });
+    }
+}
+
+#[test]
+fn jam_while_verifier_waits_for_budget_does_not_rebind_or_emit_a_get() {
+    let (runtime, mut worker, fake, mut commands, events) = setup("spike-create-budget-retired");
+    runtime.block_on(async {
+        fake.push(absent());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        let held = Arc::clone(&worker.background_session)
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        fake.push(owner());
+        request(&mut worker, Action::Create(CreateIntent::Requested));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fake.calls() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let gate = worker.jam.gate();
+        let lease = Arc::clone(gate.lock().pending_create.as_ref().unwrap());
+        assert!(lease.emitted.load(Ordering::SeqCst));
+        assert!(!lease.verifier_emitted.load(Ordering::SeqCst));
+        let deadline = lease.deadline;
+        gate.signal(gate.stamp().engine, Notice::Jam);
+        gate.signal(gate.stamp().engine, Notice::Jam);
+        drop(held);
+        finish(&mut worker, &mut commands).await;
+        assert!(gate.write_uncertain());
+        assert!(latest(&events).snapshot.membership == Membership::Unknown);
+        assert_eq!((fake.calls(), fake.writes()), (2, 1));
+        assert_eq!(lease.deadline, deadline);
+        assert_eq!(worker.background_session.available_permits(), 4);
+    });
+}
+
+#[test]
+fn generic_host_cannot_dispatch_or_commit_create() {
+    let (runtime, _worker, fake, _commands, _events) = setup("jam-create-generic-refused");
+    runtime.block_on(async {
+        let kernel = Kernel::new(Arc::new(fake.clone()), Profile::ObservedFourFields);
+        assert_eq!(
+            Host::run(&kernel, Action::Create(CreateIntent::Requested))
+                .await
+                .err(),
+            Some(Error::NotReady)
+        );
+        assert_eq!(fake.calls(), 0);
+        assert!(kernel.snapshot().membership == Membership::Unknown);
+        assert!(kernel.snapshot().reconcile_required);
+    });
+}
+
+#[test]
 fn diagnostic_preflight_refusals_are_local_and_do_not_change_the_guards() {
     use crate::backend::jam::diagnostic::Class;
     for error in [Error::NotReady, Error::Stale, Error::Busy] {

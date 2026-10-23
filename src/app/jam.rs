@@ -11,6 +11,7 @@ impl App {
         let had_confirmation = self.jam.confirmation.is_some();
         let had_join = self.jam.join.is_some();
         let had_invitation = self.jam.invitation_open;
+        let had_generation = self.jam.generation.is_some();
         let event = self.backend.poll_jam();
         let live = self.backend.jam_stamp();
         if let Some(event) = event
@@ -40,6 +41,9 @@ impl App {
             }
         }
         self.jam.sync(live);
+        if had_generation && self.jam.generation.is_none() {
+            self.backend.cancel_jam_generation();
+        }
         let context_valid = self.backend.jam_context_valid(live);
         if !self.jam.fresh() || !context_valid {
             self.jam.clear_metadata();
@@ -62,6 +66,7 @@ impl App {
             clear_official_focus(ctx);
         }
         self.jam.diagnostic = self.backend.jam_diagnostic();
+        self.sync_generation_view(ctx);
         if had_invitation && !self.jam.invitation_open {
             ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
         }
@@ -82,6 +87,54 @@ impl App {
             self.jam.confirmation = None;
             self.jam.notice = Some("The Jam changed. Check its state before continuing.");
             ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
+        }
+    }
+
+    pub(super) fn cancel_generation_view(&mut self) {
+        self.jam.generation = None;
+        self.jam.generation_ready = false;
+        self.backend.cancel_jam_generation();
+    }
+
+    /// Read-only backend checks and local retirement; never sends or refreshes.
+    pub(super) fn sync_generation_view(&mut self, ctx: &egui::Context) {
+        let live = self.backend.jam_stamp();
+        let visible = !self.window_hidden
+            && !self.hide_intent
+            && !self.quit_requested
+            && !self.switch_intent
+            && !self.settings.winamp_window
+            && !self.show_devices
+            && self.lyrics_fullscreen.is_none()
+            && !ctx.input(|input| {
+                input.viewport().minimized.unwrap_or(false) || input.viewport().close_requested()
+            })
+            && ((self.show_queue_panel && self.queue_tab == QueueTab::Queue)
+                || matches!(self.page(), Page::Queue));
+        let host = self.jam.owner_id().is_some() && self.backend.jam_context_valid(live);
+        let current = self.jam.generation.as_ref().is_none_or(|view| {
+            view.expected.account == live.account
+                && view.expected.engine == live.engine
+                && view.expected.revision == live.revision
+                && (view.expected.operation == live.operation
+                    || (view.sent && live.operation == view.expected.operation.wrapping_add(1)))
+        });
+        // A queued start event can race poll_jam/stamp. Retain only the readonly
+        // progress surface within its original TTL; this grants no membership
+        // or confirmation capability while the model awaits that event.
+        let progress = self.jam.generation.as_ref().is_some_and(|view| {
+            view.sent
+                && tokio::time::Instant::now() < view.until
+                && self.backend.jam_context_valid(live)
+        });
+        if self.jam.generation.is_some() && (!visible || (!host && !progress) || !current) {
+            self.cancel_generation_view();
+        }
+        self.jam.generation_ready = visible && host && self.backend.jam_generation_available(live);
+        if let Some(view) = &mut self.jam.generation
+            && view.sent
+        {
+            view.report = self.backend.jam_generation_report();
         }
     }
 
@@ -108,6 +161,13 @@ impl App {
         let intent = action.intent;
         if !matches!(
             intent,
+            Intent::AskGeneration | Intent::ConfirmGeneration | Intent::CancelGeneration
+        ) && self.jam.generation.is_some()
+        {
+            self.cancel_generation_view();
+        }
+        if !matches!(
+            intent,
             Intent::AskCompare
                 | Intent::EditOfficial(_)
                 | Intent::PasteOfficial(_)
@@ -122,12 +182,54 @@ impl App {
         }
         if !matches!(
             intent,
-            Intent::Close | Intent::CancelEnd | Intent::CancelJoin | Intent::CancelCompare
+            Intent::Close
+                | Intent::CancelEnd
+                | Intent::CancelJoin
+                | Intent::CancelCompare
+                | Intent::CancelGeneration
         ) && action.expected != self.jam.stamp
         {
             return;
         }
         match intent {
+            Intent::AskGeneration => {
+                if self.jam.generation.is_none() && self.jam.generation_ready {
+                    let Some(until) = self.jam.fresh_until else {
+                        return;
+                    };
+                    self.jam.generation = Some(crate::model::jam::GenerationView {
+                        expected: self.jam.stamp,
+                        until,
+                        sent: false,
+                        report: None,
+                    });
+                }
+                return;
+            }
+            Intent::ConfirmGeneration => {
+                if !self.jam.generation_ready
+                    || !self.backend.jam_generation_available(action.expected)
+                {
+                    return;
+                }
+                let Some(view) = &mut self.jam.generation else {
+                    return;
+                };
+                if view.sent || view.expected != action.expected {
+                    return;
+                }
+                view.sent = true;
+                view.report = Some(crate::backend::jam::generation::Terminal::Waiting);
+                self.backend.send(Command::JamGenerate(
+                    crate::backend::jam::generation::Intent::explicitly_authorized(action.expected),
+                ));
+                self.jam.generation_ready = false;
+                return;
+            }
+            Intent::CancelGeneration => {
+                self.cancel_generation_view();
+                return;
+            }
             Intent::AskCompare => {
                 if self.jam.owner_id().is_some() {
                     self.backend.cancel_jam_comparison();

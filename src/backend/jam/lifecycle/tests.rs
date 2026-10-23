@@ -442,6 +442,346 @@ fn generation_cancelled_in_backend_queue_cannot_dispatch_or_replace_newer_intent
     });
 }
 
+fn caller_app(
+    worker: &Worker,
+    events: watch::Receiver<Option<Arc<Event>>>,
+) -> (egui::Context, crate::app::App) {
+    let root =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/e08b1-caller-fixture");
+    let ctx = egui::Context::default();
+    let mut app = crate::app::App::new(
+        &Waker::default(),
+        crate::paths::AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        },
+        crate::settings::Settings::default(),
+        crate::app::AppOptions {
+            media_controls: false,
+            restore_sign_in: false,
+            tray: false,
+        },
+    );
+    crate::demo::populate(&mut app);
+    app.backend.shutdown(); // No background app worker participates in this fixture.
+    app.backend.commands = worker.commands.clone();
+    app.backend.jam_gate = worker.jam.gate();
+    app.backend.jam_events = events;
+    app.backend.set_offline(false); // Every command now goes only to the fixture Worker.
+    app.jam = Default::default();
+    app.show_queue_panel = true;
+    app.show_devices = false;
+    app.queue_tab = crate::model::QueueTab::Queue;
+    app.settings.winamp_window = false;
+    app.locale = crate::i18n::Locale::English;
+    (ctx, app)
+}
+fn caller_apply(app: &mut crate::app::App, ctx: &egui::Context) {
+    for action in std::mem::take(&mut app.actions) {
+        app.apply(action, ctx);
+    }
+}
+fn caller_sync(app: &mut crate::app::App, ctx: &egui::Context) {
+    app.apply(
+        crate::model::Action::Jam(crate::model::jam::UiAction {
+            expected: app.backend.jam_stamp(),
+            intent: crate::model::jam::Intent::CancelEnd,
+        }),
+        ctx,
+    );
+}
+fn caller_frame(
+    app: &mut crate::app::App,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+) -> Vec<(String, egui::Pos2)> {
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ui| crate::ui::jam::generation_diagnostic(app, ui),
+    );
+    assert!(
+        output.platform_output.commands.is_empty(),
+        "no clipboard or URL commands"
+    );
+    fn texts(shape: &egui::Shape, result: &mut Vec<(String, egui::Pos2)>) {
+        match shape {
+            egui::Shape::Text(text) => result.push((
+                text.galley.text().to_owned(),
+                text.pos + text.galley.size() * 0.5,
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    texts(shape, result);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut labels = Vec::new();
+    for shape in &output.shapes {
+        texts(&shape.shape, &mut labels);
+    }
+    for (label, _) in &labels {
+        for private in [
+            "SyntheticJam08B",
+            "SyntheticInvite08B",
+            "hm:synthetic",
+            "spotify://",
+            "https://",
+            "Bearer ",
+        ] {
+            assert!(
+                !label.contains(private),
+                "private fixture value reached a text shape"
+            );
+        }
+    }
+    output.textures_delta.clear(); // Headless fixture deliberately has no renderer.
+    labels
+}
+fn caller_click(app: &mut crate::app::App, ctx: &egui::Context, label: &str) {
+    let pos = caller_frame(app, ctx, Vec::new())
+        .into_iter()
+        .find(|(text, _)| text == label)
+        .expect("control present")
+        .1;
+    for pressed in [true, false] {
+        caller_frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+}
+
+#[test]
+fn generation_caller_ui_confirm_routes_one_backend_command_and_sanitized_result() {
+    let (runtime, mut worker, fake, mut commands, events) = setup("generation-caller-positive");
+    let (ctx, mut app) = caller_app(&worker, events);
+    runtime.block_on(async {
+        fake.push(generation_owner());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        caller_sync(&mut app, &ctx);
+        assert!(app.jam.generation_ready);
+        for _ in 0..2 {
+            caller_frame(&mut app, &ctx, Vec::new());
+        }
+        assert!(app.actions.is_empty() && app.jam.generation.is_none());
+        assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
+        caller_click(&mut app, &ctx, "Generate link (experimental test)");
+        assert!(matches!(
+            app.actions.as_slice(),
+            [crate::model::Action::Jam(crate::model::jam::UiAction {
+                intent: crate::model::jam::Intent::AskGeneration,
+                ..
+            })]
+        ));
+        caller_apply(&mut app, &ctx);
+        assert!(app.jam.generation.as_ref().is_some_and(|view| !view.sent));
+        let labels = caller_frame(&mut app, &ctx, Vec::new());
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text.contains("at most one POST")
+                    && text.contains("authorization")
+                    && text.contains("cannot be shared"))
+        );
+        assert_eq!(fake.0.generation_prepares.load(Ordering::SeqCst), 0);
+        caller_click(&mut app, &ctx, "Run one experimental request");
+        // Duplicate the action to exercise same-frame duplicate confirmation.
+        app.actions.push(app.actions.last().unwrap().clone());
+        caller_apply(&mut app, &ctx);
+        let intent = match commands.recv().await.unwrap() {
+            Command::JamGenerate(intent) => intent,
+            _ => panic!("explicit command required"),
+        };
+        assert!(worker.jam.gate.lock().generation_queued.is_some()); // Backend::send really armed it.
+        assert!(commands.try_recv().is_err());
+        worker.generate_jam(intent);
+        worker.finish_jam_generation(generation_complete(&mut commands).await);
+        caller_frame(&mut app, &ctx, Vec::new());
+        // Consume the backend publication through the ordinary App path.
+        app.apply(
+            crate::model::Action::Jam(crate::model::jam::UiAction {
+                expected: app.backend.jam_stamp(),
+                intent: crate::model::jam::Intent::ConfirmGeneration,
+            }),
+            &ctx,
+        );
+        let labels = caller_frame(&mut app, &ctx, Vec::new());
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "generation=Accepted(Short)")
+        );
+        assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.calls(), 1);
+        assert!(app.jam.metadata.invitation.is_none() && app.jam.qr.is_none());
+        caller_click(&mut app, &ctx, "Cancel generation test");
+        caller_apply(&mut app, &ctx);
+        assert!(app.jam.generation.is_none() && !app.jam.generation_ready);
+    });
+}
+
+#[test]
+fn generation_caller_ui_cancel_hide_context_and_deadline_retire_queue_and_auth() {
+    for stage in 0..2 {
+        for exit in 0..5 {
+            let (runtime, mut worker, fake, mut commands, events) =
+                setup("generation-caller-retire");
+            let (ctx, mut app) = caller_app(&worker, events);
+            runtime.block_on(async {
+                fake.push(generation_owner());
+                request(&mut worker, Action::Current);
+                finish(&mut worker, &mut commands).await;
+                caller_sync(&mut app, &ctx);
+                caller_click(&mut app, &ctx, "Generate link (experimental test)");
+                caller_apply(&mut app, &ctx);
+                caller_click(&mut app, &ctx, "Run one experimental request");
+                caller_apply(&mut app, &ctx);
+                let intent = match commands.recv().await.unwrap() {
+                    Command::JamGenerate(intent) => intent,
+                    _ => panic!("expected command"),
+                };
+                let (send, receive) = tokio::sync::oneshot::channel();
+                if stage == 1 {
+                    *fake.0.generation_auth.lock().unwrap() = Some(receive);
+                    worker.generate_jam(intent);
+                    generation_started(&fake, false).await;
+                } else {
+                    // Keep the queued command outside the receiver while closing.
+                    *fake.0.generation_auth.lock().unwrap() = Some(receive);
+                    // Process it only after the UI has withdrawn its cancellation token.
+                    match exit {
+                        0 => {
+                            caller_click(&mut app, &ctx, "Cancel generation test");
+                            caller_apply(&mut app, &ctx);
+                        }
+                        1 => {
+                            app.show_queue_panel = false;
+                        }
+                        2 => app.window_gone(),
+                        3 => {
+                            let stamp = worker.jam.gate.stamp();
+                            worker.jam.gate.signal(stamp.engine, Notice::Jam);
+                        }
+                        _ => {
+                            tokio::time::pause();
+                            tokio::time::advance(FRESH_FOR).await;
+                        }
+                    }
+                    app.apply(
+                        crate::model::Action::Jam(crate::model::jam::UiAction {
+                            expected: app.backend.jam_stamp(),
+                            intent: crate::model::jam::Intent::ConfirmGeneration,
+                        }),
+                        &ctx,
+                    );
+                    worker.generate_jam(intent);
+                    assert!(app.jam.generation.is_none());
+                    let _ = send.send(());
+                    tokio::task::yield_now().await;
+                    assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
+                    return;
+                }
+                match exit {
+                    0 => {
+                        caller_click(&mut app, &ctx, "Cancel generation test");
+                        caller_apply(&mut app, &ctx);
+                    }
+                    1 => {
+                        app.show_queue_panel = false;
+                    }
+                    2 => app.window_gone(),
+                    3 => {
+                        let stamp = worker.jam.gate.stamp();
+                        worker.jam.gate.signal(stamp.engine, Notice::Jam);
+                    }
+                    _ => {
+                        tokio::time::pause();
+                        tokio::time::advance(FRESH_FOR).await;
+                    }
+                }
+                app.apply(
+                    crate::model::Action::Jam(crate::model::jam::UiAction {
+                        expected: app.backend.jam_stamp(),
+                        intent: crate::model::jam::Intent::ConfirmGeneration,
+                    }),
+                    &ctx,
+                );
+                let _ = send.send(());
+                tokio::task::yield_now().await;
+                assert!(app.jam.generation.is_none());
+                assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
+                assert_eq!(fake.calls(), 1);
+            });
+        }
+    }
+}
+
+#[test]
+fn generation_caller_ui_disabled_without_explicit_uri_freshness_or_host() {
+    for missing in 0..3 {
+        let (runtime, mut worker, fake, mut commands, events) = setup("generation-caller-disabled");
+        let (ctx, mut app) = caller_app(&worker, events);
+        runtime.block_on(async {
+            let mut current = generation_owner();
+            let mut root: serde_json::Value = serde_json::from_slice(&current.body).unwrap();
+            if missing == 0 {
+                root.as_object_mut().unwrap().remove("join_session_uri");
+                root["join_session_url"] = "hm:synthetic".into();
+            }
+            if missing == 2 {
+                root["is_session_owner"] = false.into();
+            }
+            current.body = serde_json::to_vec(&root).unwrap();
+            fake.push(current);
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            if missing == 1 {
+                tokio::time::pause();
+                tokio::time::advance(FRESH_FOR).await;
+            }
+            caller_sync(&mut app, &ctx);
+            assert!(!app.jam.generation_ready);
+            caller_click(&mut app, &ctx, "Generate link (experimental test)");
+            assert!(app.actions.is_empty());
+            for intent in [
+                crate::model::jam::Intent::AskGeneration,
+                crate::model::jam::Intent::ConfirmGeneration,
+            ] {
+                app.apply(
+                    crate::model::Action::Jam(crate::model::jam::UiAction {
+                        expected: app.backend.jam_stamp(),
+                        intent,
+                    }),
+                    &ctx,
+                );
+            }
+            assert!(app.jam.generation.is_none());
+            assert_eq!(fake.0.generation_prepares.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.calls(), 1);
+        });
+    }
+}
+
 fn bind(worker: &mut Worker, fake: &Fake, account: &str) {
     let api = Arc::clone(&worker.api);
     let expected = account.to_owned();

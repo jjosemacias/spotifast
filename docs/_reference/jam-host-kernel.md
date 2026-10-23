@@ -438,8 +438,10 @@ Permissions, moderation, Leave, remote queue edits and audio are separate gates.
 
 ## E08B-1 generation experiment
 
-The `jam-host` backend has an explicit experimental `JamGenerate` command.
-There is no UI, startup or timer caller. It requires separate authorization
+The queue's existing diagnostic section offers **Generate link (experimental
+test)** with an inline confirmation before the experimental `JamGenerate`
+command. Opening it only shows local information. There is no startup or timer
+caller. The confirmation requires separate authorization
 for a remote experiment, a fresh confirmed host snapshot with an explicit
 `join_session_uri`, and the existing verified Session/Connect/Dealer binding.
 It never substitutes the URL or token fields, refreshes Current, or publishes
@@ -460,6 +462,9 @@ possible emission causes a replay or redirect; this is at most one potentially
 emitted POST, not exactly-once server execution. Slot, auth, response body and
 delivery share the original deadline and snapshot expiry. Retirement and
 cancellation discard operation buffers; failure does not change membership.
+Closing, hiding or minimizing the diagnostic surface also cancels queued and
+pending work. A stale confirmation cannot dispatch; the button is disabled
+without the backend's explicit URI capability, a fresh host or an unused allowance.
 The bounded response is classified and dropped. Reports contain fixed enums
 and valid-context HTTP status only, with no returned URL, Copy, QR or Join.
 

@@ -419,6 +419,7 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui, allow_comparison: bool) {
         Intent::DiagnoseCurrent,
     );
     if allow_comparison {
+        generation_diagnostic(app, ui);
         if app.jam.official_open {
             text(
                 app,
@@ -498,6 +499,71 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui, allow_comparison: bool) {
             ui,
             "This check only. format_boundary labels the first format rejection; not_applicable means accepted, not reached, or cleared. url_field=not_observed means not reached or cleared on context retirement. http=none means no status captured. Retirement seals this record; it cannot confirm membership or invitation availability now.",
         );
+    }
+}
+
+/// Existing diagnostic surface only. Draws controls and emits Actions, no I/O.
+pub(crate) fn generation_diagnostic(app: &mut App, ui: &mut egui::Ui) {
+    let view = app
+        .jam
+        .generation
+        .as_ref()
+        .map(|view| (view.sent, view.report));
+    match view {
+        None => {
+            button(
+                app,
+                ui,
+                "Generate link (experimental test)",
+                app.jam.generation_ready,
+                Intent::AskGeneration,
+            );
+            if !app.jam.generation_ready {
+                text(
+                    app,
+                    ui,
+                    "Generation test unavailable: a fresh owned Jam with an explicit URI and an unused allowance is required.",
+                );
+            }
+        }
+        Some((false, _)) => {
+            text(
+                app,
+                ui,
+                "This test can send at most one POST for the current Jam. Preparing session authorization may also use the network. The owned Jam, account, Session and connection must stay fresh and unchanged. No retry follows a possible send. Cancelling cannot undo an emitted request. The result is diagnostic only and cannot be shared yet. Keep logging configuration fixed. Run only with separate permission for this experiment.",
+            );
+            button(
+                app,
+                ui,
+                "Run one experimental request",
+                app.jam.generation_ready,
+                Intent::ConfirmGeneration,
+            );
+            button(
+                app,
+                ui,
+                "Cancel generation test",
+                true,
+                Intent::CancelGeneration,
+            );
+        }
+        Some((true, report)) => {
+            if let Some(report) = report {
+                ui.add(egui::Label::new(format!("generation={report:?}")).wrap());
+            }
+            text(
+                app,
+                ui,
+                "Experimental result only. No invitation is enabled or published.",
+            );
+            button(
+                app,
+                ui,
+                "Cancel generation test",
+                true,
+                Intent::CancelGeneration,
+            );
+        }
     }
 }
 

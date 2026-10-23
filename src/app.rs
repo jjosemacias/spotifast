@@ -1188,6 +1188,8 @@ impl App {
     /// The window is gone but the process stays: audio, the tray, and the
     /// media controls keep running until Show or Quit.
     pub fn window_gone(&mut self) {
+        #[cfg(feature = "jam-host")]
+        self.cancel_generation_view();
         self.winamp.forget_textures();
         self.window_hidden = true;
         self.hide_intent = false;
@@ -9455,6 +9457,8 @@ impl App {
         while !actions.is_empty() {
             for action in actions.drain(..) {
                 self.apply(action, ctx);
+                #[cfg(feature = "jam-host")]
+                self.sync_generation_view(ctx);
             }
             actions = std::mem::take(&mut self.actions);
         }

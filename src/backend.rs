@@ -1495,6 +1495,10 @@ impl Backend {
     pub fn jam_generation_report(&self) -> Option<jam::generation::Terminal> {
         self.jam_gate.generation_report()
     }
+    #[cfg(feature = "jam-host")]
+    pub(crate) fn jam_generation_available(&self, expected: jam::lifecycle::Stamp) -> bool {
+        self.jam_gate.generation_available(expected)
+    }
     /// Cancellation/surface close must call this when exposing the experiment.
     #[cfg(feature = "jam-host")]
     pub fn cancel_jam_generation(&self) {

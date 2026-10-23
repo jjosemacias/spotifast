@@ -445,6 +445,24 @@ impl Shared {
 pub(crate) struct Gate(Arc<Mutex<Shared>>);
 
 impl Gate {
+    /// Local capability bit only; never exposes the private URI to presentation.
+    pub(crate) fn generation_available(&self, expected: Stamp) -> bool {
+        let state = self.lock();
+        state.stamp == expected
+            && state.context_valid()
+            && state.listening
+            && state
+                .connection
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            && state.pending.is_none()
+            && state.generation_queued.is_none()
+            && !state.generation_allowance.exhausted()
+            && state
+                .kernel
+                .as_ref()
+                .is_some_and(|kernel| kernel.generation_until().is_ok())
+    }
     /// Install cancellation before the backend queue, without capturing secrets.
     pub(crate) fn arm_generation(&self, intent: &generation::Intent) -> bool {
         let mut state = self.lock();

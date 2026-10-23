@@ -6,6 +6,9 @@ use crate::backend::jam::{
 
 #[derive(Clone)]
 pub enum Intent {
+    AskGeneration,
+    ConfirmGeneration,
+    CancelGeneration,
     Current,
     DiagnoseCurrent,
     AskCompare,
@@ -50,6 +53,9 @@ impl OfficialEdit {
 impl std::fmt::Debug for Intent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::AskGeneration => "AskGeneration",
+            Self::ConfirmGeneration => "ConfirmGeneration",
+            Self::CancelGeneration => "CancelGeneration",
             Self::Current => "Current",
             Self::DiagnoseCurrent => "DiagnoseCurrent",
             Self::AskCompare => "AskCompare",
@@ -146,6 +152,8 @@ pub struct JoinDraft {
 }
 
 pub struct State {
+    pub generation: Option<GenerationView>,
+    pub generation_ready: bool,
     // Surface state only: never preserves input or authority after retirement.
     pub official_open: bool,
     pub official: Option<OfficialDraft>,
@@ -166,9 +174,19 @@ pub struct State {
     pub join: Option<JoinDraft>,
 }
 
+/// Local confirmation/report only. No private URI, URL or auth is held here.
+pub struct GenerationView {
+    pub expected: Stamp,
+    pub until: tokio::time::Instant,
+    pub sent: bool,
+    pub report: Option<crate::backend::jam::generation::Terminal>,
+}
+
 impl Default for State {
     fn default() -> Self {
         Self {
+            generation: None,
+            generation_ready: false,
             official_open: false,
             official: None,
             diagnostic: None,
@@ -193,6 +211,13 @@ impl Default for State {
 impl State {
     pub fn sync(&mut self, live: Stamp) {
         if self.stamp != live {
+            let generation = self.generation.take().filter(|view| {
+                view.sent
+                    && view.expected.account == live.account
+                    && view.expected.engine == live.engine
+                    && view.expected.revision == live.revision
+                    && live.operation == view.expected.operation.wrapping_add(1)
+            });
             if self.pending.is_some()
                 && self.stamp.account == live.account
                 && self.stamp.engine == live.engine
@@ -209,6 +234,7 @@ impl State {
                 self.confirmation = None;
                 self.join = None;
                 self.clear_metadata();
+                self.generation = generation;
                 return;
             }
             let notice = self
@@ -219,6 +245,7 @@ impl State {
                 && self.stamp.account == live.account
                 && self.stamp.engine == live.engine;
             *self = Self {
+                generation,
                 official_open,
                 stamp: live,
                 notice,

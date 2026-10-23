@@ -10,6 +10,12 @@ pub enum Shape {
     HttpKnownLong,
     RelativeKnownLong,
     SpaceWrappedKnownLong,
+    RelativeJoin,
+    NetworkRelativeKnown,
+    CaseVariantKnownPrefix,
+    LiteralSlashEscapedKnown,
+    PercentEncodedKnownPrefix,
+    SpaceWrappedBare,
     Other,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,7 +72,61 @@ fn candidate(value: &str) -> (Shape, Option<&str>) {
             (Shape::SpaceWrappedKnownLong, Some(token))
         });
     }
+    extended_candidate(value)
+}
+
+// One finite diagnostic extension only. Every rule consumes a complete fixed
+// envelope and borrows a strict token. Never decodes or searches for a secret.
+fn extended_candidate(value: &str) -> (Shape, Option<&str>) {
+    if let Some(token) = value.strip_prefix("/sessions/join/") {
+        return token_candidate(Shape::RelativeJoin, token);
+    }
+    for (prefix, shape) in [
+        (
+            "//open.spotify.com/socialsession/",
+            Shape::NetworkRelativeKnown,
+        ),
+        (
+            r"https:\/\/open.spotify.com\/socialsession\/",
+            Shape::LiteralSlashEscapedKnown,
+        ),
+    ] {
+        if let Some(tail) = value.strip_prefix(prefix) {
+            return Link::parse_tail(tail)
+                .map_or((Shape::Other, None), |token| (shape, Some(token)));
+        }
+    }
+    const HTTPS: &str = "https://open.spotify.com/socialsession/";
+    if let Some(prefix) = value.get(..HTTPS.len())
+        && prefix != HTTPS
+        && prefix.eq_ignore_ascii_case(HTTPS)
+    {
+        return Link::parse_tail(&value[HTTPS.len()..]).map_or((Shape::Other, None), |token| {
+            (Shape::CaseVariantKnownPrefix, Some(token))
+        });
+    }
+    const ENCODED: &str = "https%3A%2F%2Fopen.spotify.com%2Fsocialsession%2F";
+    if let Some(prefix) = value.get(..ENCODED.len())
+        && prefix.bytes().zip(ENCODED.bytes()).all(|(actual, fixed)| {
+            // Only the hexadecimal letters in the fixed escapes vary in case.
+            actual == fixed || matches!(fixed, b'A' | b'F') && actual == fixed + 32
+        })
+    {
+        return token_candidate(Shape::PercentEncodedKnownPrefix, &value[ENCODED.len()..]);
+    }
+    let core = value.trim_matches(' ');
+    if core != value {
+        return token_candidate(Shape::SpaceWrappedBare, core);
+    }
     (Shape::Other, None)
+}
+
+fn token_candidate(shape: Shape, token: &str) -> (Shape, Option<&str>) {
+    if Link::validate_token(token).is_ok() {
+        (shape, Some(token))
+    } else {
+        (Shape::Other, None)
+    }
 }
 
 pub(super) fn compare(value: &str, official: &Link) -> Comparison {
@@ -92,6 +152,12 @@ impl Shape {
             Self::HttpKnownLong => "http_known_long",
             Self::RelativeKnownLong => "relative_known_long",
             Self::SpaceWrappedKnownLong => "space_wrapped_known_long",
+            Self::RelativeJoin => "relative_join",
+            Self::NetworkRelativeKnown => "network_relative_known",
+            Self::CaseVariantKnownPrefix => "case_variant_known_prefix",
+            Self::LiteralSlashEscapedKnown => "literal_slash_escaped_known",
+            Self::PercentEncodedKnownPrefix => "percent_encoded_known_prefix",
+            Self::SpaceWrappedBare => "space_wrapped_bare",
             Self::Other => "other",
         }
     }
@@ -104,6 +170,30 @@ impl OfficialRelation {
             Self::Different => "different",
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn template_fixtures(token: &str) -> [(String, Shape); 6] {
+    [
+        (format!("/sessions/join/{token}"), Shape::RelativeJoin),
+        (
+            format!("//open.spotify.com/socialsession/{token}?si=Ab_9&utm_source=copy-link"),
+            Shape::NetworkRelativeKnown,
+        ),
+        (
+            format!("HTTPS://OPEN.SPOTIFY.COM/SOCIALSESSION/{token}?si=Ab_9"),
+            Shape::CaseVariantKnownPrefix,
+        ),
+        (
+            format!(r"https:\/\/open.spotify.com\/socialsession\/{token}?utm_source=copy-link"),
+            Shape::LiteralSlashEscapedKnown,
+        ),
+        (
+            format!("https%3a%2f%2Fopen.spotify.com%2fsocialsession%2F{token}"),
+            Shape::PercentEncodedKnownPrefix,
+        ),
+        (format!("  {token} "), Shape::SpaceWrappedBare),
+    ]
 }
 
 #[cfg(test)]
@@ -167,8 +257,6 @@ mod tests {
         let official = Link::parse("https://open.spotify.com/socialsession/Case9").unwrap();
         for value in [
             "",
-            "Case9 ",
-            " Case9",
             "Case9?si=x",
             "%43ase9",
             "Cаse9",
@@ -196,6 +284,95 @@ mod tests {
                 compare(&value, &official).official_relation,
                 OfficialRelation::NotComparable
             );
+        }
+    }
+
+    #[test]
+    fn official_six_templates_are_complete_and_never_change_acceptance() {
+        let official = Link::parse("https://open.spotify.com/socialsession/Case9").unwrap();
+        assert_eq!(
+            template_fixtures("Case9").map(|(_, shape)| shape.label()),
+            [
+                "relative_join",
+                "network_relative_known",
+                "case_variant_known_prefix",
+                "literal_slash_escaped_known",
+                "percent_encoded_known_prefix",
+                "space_wrapped_bare",
+            ]
+        );
+        for token in ["Case9", "case9", "Different9"] {
+            for (value, shape) in template_fixtures(token) {
+                assert_eq!(
+                    compare(&value, &official),
+                    Comparison {
+                        shape,
+                        official_relation: if token == "Case9" {
+                            OfficialRelation::Same
+                        } else {
+                            OfficialRelation::Different
+                        }
+                    }
+                );
+                assert!(Link::parse(&value).is_err());
+                assert!(Invitation::parse(&value).is_none());
+            }
+        }
+        for invalid in [
+            "",
+            "Case9/extra",
+            "Case9#frag",
+            "%43ase9",
+            "Case9\n",
+            "Cаse9",
+        ] {
+            for (value, _) in template_fixtures(invalid) {
+                assert_eq!(
+                    compare(&value, &official),
+                    Comparison {
+                        shape: Shape::Other,
+                        official_relation: OfficialRelation::NotComparable
+                    }
+                );
+            }
+        }
+        for (value, _) in template_fixtures(&"x".repeat(1025)) {
+            assert_eq!(candidate(&value), (Shape::Other, None));
+        }
+    }
+
+    #[test]
+    fn official_templates_reject_unknown_origins_wrappers_and_queries() {
+        for value in [
+            "//open.spotify.com.evil/socialsession/Case9",
+            "//u@open.spotify.com/socialsession/Case9",
+            "//open.spotify.com:443/socialsession/Case9",
+            "HTTPS://EVIL.TEST/SOCIALSESSION/Case9",
+            "HTTPS://OPEN.SPOTIFY.COM.evil/SOCIALSESSION/Case9",
+            "HTTPS://OPEN.SPOTIFY.COM/SOCIALSESSION/Case9?SI=x",
+            "HTTPS://OPEN.SPOTIFY.COM/SOCIALSESSION/Case9?si=x&si=y",
+            "HTTPS://OPEN.SPOTIFY.COM/SOCIALSESSION/Case9?si=%41",
+            "//open.spotify.com/socialsession/Case9?pi=x",
+            "//open.spotify.com/socialsession/Case9?si=x&",
+            "/sessions/join/Case9?si=x",
+            "https%3A%2F%2Fopen.spotify.com%2Fsocialsession%2FCase9?si=x",
+            "https%3A%2F%2Fevil.test%2Fsocialsession%2FCase9",
+            "https%3A%2F%2FOPEN.spotify.com%2Fsocialsession%2FCase9",
+            "https%253A%252F%252Fopen.spotify.com%252Fsocialsession%252FCase9",
+            r"https:\/\/evil.test\/socialsession\/Case9",
+            r"https:\/\/open.spotify.com\/socialsession\/Case9?pi=x",
+            " /sessions/join/Case9 ",
+            " //open.spotify.com/socialsession/Case9 ",
+            " HTTPS://OPEN.SPOTIFY.COM/SOCIALSESSION/Case9 ",
+            " Case9?si=x ",
+            "\tCase9\t",
+            "\u{a0}Case9\u{a0}",
+            "'Case9'",
+            "prefixCase9suffix/unknown",
+        ] {
+            assert_eq!(candidate(value), (Shape::Other, None), "{value}");
+            assert!(Link::parse(value).is_err());
+            assert!(Invitation::parse(value).is_none());
         }
     }
 }

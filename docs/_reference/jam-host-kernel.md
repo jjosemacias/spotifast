@@ -136,6 +136,13 @@ read, verifier, mutation, polling or token/URI-field fallback is added.
 
 The closed shapes are `accepted`, `bare_ascii_alnum`, `http_known_long`,
 `relative_known_long`, `space_wrapped_known_long`, `other` and `not_observed`.
+One bounded diagnostic extension also recognizes `relative_join`,
+`network_relative_known`, `case_variant_known_prefix`,
+`literal_slash_escaped_known`, `percent_encoded_known_prefix` and
+`space_wrapped_bare`. These match complete fixed envelopes and borrow only a
+strict token. They are six hypotheses, not accepted invitation formats. There
+is no arbitrary decoding, secret substring search or composition of wrappers.
+An `other` result ends this observation method, without automatic expansion.
 They reuse the existing exact token/query validation, without constructing a
 candidate URL. `official_relation` is `not_comparable`, `same` or `different`.
 The ordinary diagnostic keeps its six fields; comparison adds just these two

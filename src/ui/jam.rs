@@ -1072,6 +1072,76 @@ mod tests {
 mod official_tests {
     use super::*;
     #[test]
+    fn official_six_template_labels_render_only_fixed_diagnostic_fields() {
+        use crate::backend::jam::diagnostic::{
+            Class, Comparison, Diagnostic, FormatBoundary, OfficialRelation, Schema, Shape,
+            UrlField,
+        };
+        let ctx = egui::Context::default();
+        let root = std::env::temp_dir().join(format!("spotifast-six-ui-{}", std::process::id()));
+        let mut app = App::new(
+            &crate::backend::Waker::default(),
+            crate::paths::AppDirs {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+            },
+            crate::settings::Settings::default(),
+            crate::app::AppOptions {
+                media_controls: false,
+                restore_sign_in: false,
+                tray: false,
+            },
+        );
+        fn contains(shape: &egui::Shape, expected: &str) -> bool {
+            match shape {
+                egui::Shape::Text(t) => t.galley.text() == expected,
+                egui::Shape::Vec(v) => v.iter().any(|s| contains(s, expected)),
+                _ => false,
+            }
+        }
+        for (shape, label) in [
+            (Shape::RelativeJoin, "relative_join"),
+            (Shape::NetworkRelativeKnown, "network_relative_known"),
+            (Shape::CaseVariantKnownPrefix, "case_variant_known_prefix"),
+            (
+                Shape::LiteralSlashEscapedKnown,
+                "literal_slash_escaped_known",
+            ),
+            (
+                Shape::PercentEncodedKnownPrefix,
+                "percent_encoded_known_prefix",
+            ),
+            (Shape::SpaceWrappedBare, "space_wrapped_bare"),
+        ] {
+            let record = Diagnostic {
+                class: Class::Present,
+                http: Some(200),
+                schema: Schema::None,
+                url_field: UrlField::FormatRejected,
+                format_boundary: FormatBoundary::PrefixOther,
+                comparison: Some(Comparison {
+                    shape,
+                    official_relation: OfficialRelation::Same,
+                }),
+            };
+            app.jam.diagnostic = Some(record);
+            let expected = format!(
+                "class=current_present; http=200; schema=none; source=deliberate_current; url_field=format_rejected; format_boundary=prefix_other; shape={label}; official_relation=same"
+            );
+            assert_eq!(record.to_string(), expected);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                diagnostic(&mut app, ui, false)
+            });
+            assert!(output.shapes.iter().any(|s| contains(&s.shape, &expected)));
+            assert!(output.platform_output.commands.is_empty());
+            assert!(app.actions.is_empty() && app.backend.jam_requests.lock().unwrap().is_empty());
+            output.textures_delta.clear();
+        }
+        app.backend.shutdown();
+    }
+
+    #[test]
     fn official_hidden_capture_consumes_explicit_events_without_render_or_clipboard_output() {
         let ctx = egui::Context::default();
         let mut id = None;

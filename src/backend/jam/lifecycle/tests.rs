@@ -1847,6 +1847,62 @@ fn official_comparison_is_one_read_no_write_and_publishes_only_on_live_finish() 
 }
 
 #[test]
+fn official_six_templates_use_one_current_and_seal_retired_or_late_delivery() {
+    use super::diagnostic::{Comparison, OfficialRelation};
+    for (value, shape) in super::super::comparison::template_fixtures("SyntheticSecret9") {
+        for case in 0..4 {
+            let (runtime, mut worker, fake, mut commands, events) = setup("jam-official-six");
+            runtime.block_on(async {
+                tokio::time::pause();
+                fake.push(owner());
+                request(&mut worker, Action::Current);
+                finish(&mut worker, &mut commands).await;
+                fake.push(official_reply(&value));
+                let p = compare_official(&mut worker);
+                let completed = queued(&mut commands).await;
+                assert_eq!(p.snapshot().comparison, Some(Comparison::default()));
+                match case {
+                    1 => {
+                        let gate = worker.jam.gate();
+                        gate.signal(gate.stamp().engine, Notice::Jam);
+                    }
+                    2 => worker.jam.gate.cancel_comparison(),
+                    3 => tokio::time::advance(Duration::from_secs(21)).await,
+                    _ => (),
+                }
+                worker.finish_jam(completed);
+                assert_eq!(
+                    p.snapshot().comparison,
+                    Some(if case == 0 {
+                        Comparison {
+                            shape,
+                            official_relation: OfficialRelation::Same,
+                        }
+                    } else {
+                        Comparison::default()
+                    })
+                );
+                assert_eq!((fake.calls(), fake.writes()), (2, 0));
+                assert!(latest(&events).snapshot.metadata.invitation.is_none());
+                let output = p.snapshot().to_string();
+                assert!(!output.contains("SyntheticSecret9") && !output.contains(&value));
+                assert_eq!(output.split(';').count(), 8);
+                assert!(output.len() < 384);
+                assert!(
+                    output.bytes().all(|b| b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b"_=; ".contains(&b))
+                );
+                if case == 0 {
+                    assert!(output.contains(&format!("shape={}", shape.label())));
+                }
+                assert!(!worker.jam.gate.write_uncertain());
+            });
+        }
+    }
+}
+
+#[test]
 fn official_comparison_requires_existing_fresh_owner_and_no_uncertain_write() {
     use super::diagnostic::Comparison;
     for case in 0..5 {

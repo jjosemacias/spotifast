@@ -1194,8 +1194,15 @@ impl Backend {
                     | Command::InstallUpdate { .. }
             )
         {
+            #[cfg(feature = "jam-host")]
+            self.jam_gate.refuse_comparison(jam::Error::NotReady);
             return;
         }
+        #[cfg(feature = "jam-host")]
+        if self.commands.send(command).is_err() {
+            self.jam_gate.refuse_comparison(jam::Error::NotReady);
+        }
+        #[cfg(not(feature = "jam-host"))]
         let _ = self.commands.send(command);
     }
 
@@ -1462,6 +1469,11 @@ impl Backend {
     #[cfg(feature = "jam-host")]
     pub fn jam_stamp(&self) -> jam::lifecycle::Stamp {
         self.jam_gate.stamp()
+    }
+
+    #[cfg(feature = "jam-host")]
+    pub(crate) fn cancel_jam_comparison(&self) {
+        self.jam_gate.cancel_comparison();
     }
 
     #[cfg(feature = "jam-host")]

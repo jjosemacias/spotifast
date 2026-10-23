@@ -142,6 +142,17 @@ Ordinary Check does not enable diagnostics. The record describes
 the last accepted observation, not the first failure or a network trace. Retirement
 seals it; account/engine replacement clears it. No diagnostic data is logged or
 saved, and it never enables a Jam action.
+The optional local comparison in Jam management takes an explicitly entered
+strict official long link in a hidden, RAM-only capture. It shows no characters,
+length or undo history and never reads the clipboard automatically. It requires
+an existing fresh host and performs the same single deliberate Current, adding
+only `shape` and `official_relation` enums after a valid live completion. The
+input is discarded on submission, cancellation, errors or retirement. A match
+never supplies an invitation, enables an action or changes accepted formats;
+it describes one pair whose same-Jam provenance the human must confirm. This
+experimental comparison requires independent review and separate authorization
+before any account test.
+
 Invitation metadata also recognizes the exact Spotify HTTPS `/sessions/join/`
 address with a bounded alphanumeric token and no query or fragment, converting it
 locally to the long `/socialsession/` link. This does not extend accepted Join

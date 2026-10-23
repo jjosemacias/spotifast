@@ -192,6 +192,7 @@ pub(super) fn snapshot_observed(
             let invitation = Invitation::parse_classified(value);
             if let Some(probe) = diagnostic {
                 probe.invitation_format(invitation.as_ref().map(|_| ()).map_err(|error| *error));
+                probe.compare_url(value);
             }
             invitation.ok()
         }),

@@ -1799,3 +1799,275 @@ fn app_connect_actions_keep_backend_uncertainty_across_relogin_and_current_404()
         });
     }
 }
+
+fn official_reply(value: &str) -> Reply {
+    let mut reply = owner();
+    let mut root: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    root["join_session_url"] = serde_json::json!(value);
+    reply.body = serde_json::to_vec(&root).unwrap();
+    reply
+}
+fn compare_official(worker: &mut Worker) -> Probe {
+    let probe = Probe::with_official(
+        Link::parse("https://open.spotify.com/socialsession/SyntheticSecret9").unwrap(),
+    );
+    let action = Action::DiagnoseCurrent(probe.clone());
+    worker.jam.gate.arm_diagnostic(&action);
+    request(worker, action);
+    probe
+}
+
+#[test]
+fn official_comparison_is_one_read_no_write_and_publishes_only_on_live_finish() {
+    use super::diagnostic::{Comparison, OfficialRelation, Shape};
+    let (runtime, mut worker, fake, mut commands, events) = setup("jam-official-one-read");
+    runtime.block_on(async {
+        fake.push(owner());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        fake.push(official_reply("SyntheticSecret9"));
+        let p = compare_official(&mut worker);
+        let completed = queued(&mut commands).await;
+        assert_eq!(p.snapshot().comparison, Some(Comparison::default()));
+        worker.finish_jam(completed);
+        assert_eq!(
+            p.snapshot().comparison,
+            Some(Comparison {
+                shape: Shape::BareAsciiAlnum,
+                official_relation: OfficialRelation::Same
+            })
+        );
+        assert_eq!((fake.calls(), fake.writes()), (2, 0));
+        assert!(
+            latest(&events).snapshot.metadata.invitation.is_none(),
+            "comparison never supplies an invitation"
+        );
+        assert!(!worker.jam.gate.write_uncertain());
+    });
+}
+
+#[test]
+fn official_comparison_requires_existing_fresh_owner_and_no_uncertain_write() {
+    use super::diagnostic::Comparison;
+    for case in 0..5 {
+        let (runtime, mut worker, fake, mut commands, _events) = setup("jam-official-preflight");
+        runtime.block_on(async {
+            tokio::time::pause();
+            if case != 0 {
+                let mut reply = owner();
+                if case == 1 {
+                    let mut root: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+                    root["is_session_owner"] = serde_json::json!(false);
+                    reply.body = serde_json::to_vec(&root).unwrap();
+                }
+                fake.push(reply);
+                request(&mut worker, Action::Current);
+                finish(&mut worker, &mut commands).await;
+            }
+            if case == 2 {
+                tokio::time::advance(super::super::FRESH_FOR).await;
+            }
+            if case == 3 {
+                worker
+                    .jam
+                    .gate
+                    .lock()
+                    .write_uncertain
+                    .store(true, Ordering::SeqCst);
+            }
+            if case == 4 {
+                fake.0.context.lock().unwrap().connection = "changed-before-intention".into();
+            }
+            let before = fake.calls();
+            let p = compare_official(&mut worker);
+            assert_eq!(fake.calls(), before);
+            assert_eq!(fake.writes(), 0);
+            assert_eq!(p.snapshot().comparison, Some(Comparison::default()));
+            assert!(commands.try_recv().is_err());
+        });
+    }
+}
+
+#[test]
+fn official_comparison_cancel_budget_expiry_retirement_and_late_results_cannot_publish() {
+    use super::diagnostic::Comparison;
+    for case in 0..6 {
+        let (runtime, mut worker, fake, mut commands, _events) = setup("jam-official-retire");
+        runtime.block_on(async {
+            tokio::time::pause();
+            fake.push(owner());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            let held = if case < 2 {
+                Some(
+                    Arc::clone(&worker.background_session)
+                        .acquire_many_owned(4)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let mut release = if matches!(case, 2 | 3) {
+                Some(fake.wait())
+            } else {
+                fake.push(official_reply("SyntheticSecret9"));
+                None
+            };
+            let p = compare_official(&mut worker);
+            if case < 2 {
+                tokio::task::yield_now().await;
+                assert_eq!(fake.calls(), 1);
+                if case == 0 {
+                    worker.jam.gate.cancel_comparison();
+                } else {
+                    tokio::time::advance(super::super::FRESH_FOR).await;
+                }
+                drop(held);
+                finish(&mut worker, &mut commands).await;
+                assert_eq!(fake.calls(), 1);
+            } else if matches!(case, 2 | 3) {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while fake.calls() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                if case == 2 {
+                    let gate = worker.jam.gate();
+                    gate.signal(gate.stamp().engine, Notice::Jam);
+                    release.as_mut().unwrap().closed().await;
+                    assert!(commands.try_recv().is_err());
+                } else {
+                    tokio::time::advance(Duration::from_secs(21)).await;
+                    finish(&mut worker, &mut commands).await;
+                }
+                assert!(
+                    release
+                        .take()
+                        .unwrap()
+                        .send(official_reply("SyntheticSecret9"))
+                        .is_err()
+                );
+            } else {
+                let completed = queued(&mut commands).await;
+                if case == 4 {
+                    let gate = worker.jam.gate();
+                    gate.signal(gate.stamp().engine, Notice::Jam);
+                } else {
+                    tokio::time::advance(Duration::from_secs(16)).await;
+                }
+                worker.finish_jam(completed);
+            }
+            assert_eq!(
+                p.snapshot().comparison,
+                Some(Comparison::default()),
+                "case {case}"
+            );
+            assert_eq!(fake.writes(), 0);
+            assert!(fake.calls() <= 2);
+        });
+    }
+}
+
+#[test]
+fn official_gui_invalid_input_and_queued_cancel_cannot_issue_a_read_or_replay_input() {
+    use crate::app::{App, AppOptions};
+    use crate::model::{
+        Action as UiAction, QueueTab,
+        jam::{Intent, OfficialEdit, UiAction as JamAction},
+    };
+    let (runtime, mut worker, fake, mut commands, events) = setup("jam-official-gui-input");
+    runtime.block_on(async {
+        fake.push(owner());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        let mut app = App::new(
+            &Waker::default(),
+            worker.dirs.clone(),
+            crate::settings::Settings::default(),
+            AppOptions {
+                media_controls: false,
+                restore_sign_in: false,
+                tray: false,
+            },
+        );
+        app.backend.shutdown();
+        app.backend = consumer(&worker, events);
+        let (spy, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        app.backend.commands = spy;
+        app.show_queue_panel = true;
+        app.queue_tab = QueueTab::Queue;
+        let ctx = egui::Context::default();
+        let apply = |app: &mut App, intent| {
+            let expected = worker.jam.gate.stamp();
+            app.apply(UiAction::Jam(JamAction { intent, expected }), &ctx);
+        };
+        apply(&mut app, Intent::AskCompare);
+        for value in [
+            "SyntheticSecret9",
+            "https://spotify.link/unsupported",
+            "spotify://sessions/join/SyntheticSecret9",
+            "https://open.spotify.com/socialsession/SyntheticSecret9?bad=x",
+        ] {
+            apply(
+                &mut app,
+                Intent::EditOfficial(OfficialEdit::new(value.into())),
+            );
+            apply(&mut app, Intent::CompareOfficial);
+            assert!(sent.try_recv().is_err());
+            let draft = app.jam.official.as_ref().unwrap();
+            assert!(!draft.has_input() && draft.invalid);
+        }
+        let edit =
+            OfficialEdit::new("https://open.spotify.com/socialsession/SyntheticSecret9".into());
+        let cloned = edit.clone();
+        apply(&mut app, Intent::EditOfficial(edit));
+        assert!(cloned.take().is_none());
+        apply(&mut app, Intent::CompareOfficial);
+        assert!(app.jam.official.is_none());
+        let Command::Jam(request) = sent.try_recv().unwrap() else {
+            panic!("one diagnostic expected");
+        };
+        let Action::DiagnoseCurrent(p) = &request.action else {
+            panic!("never a mutation");
+        };
+        assert!(p.is_comparison());
+        apply(&mut app, Intent::CancelCompare);
+        assert!(app.jam.official.is_none() && app.backend.jam_diagnostic().is_none());
+        worker.request_jam(request);
+        assert_eq!((fake.calls(), fake.writes()), (1, 0));
+        assert!(sent.try_recv().is_err());
+    });
+}
+
+#[test]
+fn official_offline_or_closed_consumer_discards_input_without_http() {
+    for offline in [true, false] {
+        let (runtime, mut worker, fake, mut commands, events) = setup("jam-official-local-refusal");
+        runtime.block_on(async {
+            fake.push(owner());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            let mut backend = consumer(&worker, events);
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            backend.commands = sender;
+            drop(receiver);
+            backend.offline = offline;
+            let probe = Probe::with_official(
+                super::super::Link::parse(
+                    "https://open.spotify.com/socialsession/SyntheticSecret9",
+                )
+                .unwrap(),
+            );
+            backend.send(Command::Jam(Request {
+                expected: worker.jam.gate.stamp(),
+                action: Action::DiagnoseCurrent(probe.clone()),
+            }));
+            assert!(probe.comparison_deadline().is_none());
+            assert_eq!(probe.snapshot().comparison, Some(Default::default()));
+            assert_eq!((fake.calls(), fake.writes()), (1, 0));
+        });
+    }
+}

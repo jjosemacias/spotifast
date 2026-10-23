@@ -333,7 +333,74 @@ fn progress(app: &App, ui: &mut egui::Ui) {
     }
 }
 
-fn diagnostic(app: &mut App, ui: &mut egui::Ui) {
+/// Dedicated hidden capture, not TextEdit: no glyph count, cursor, undo, autofill or copy.
+fn hidden_official_input(app: &mut App, ui: &mut egui::Ui, present: bool) {
+    let label = if present {
+        "Official link captured (hidden)"
+    } else {
+        "Hidden official link input: click, then paste or type"
+    };
+    let (_, edits) = official_capture(ui, &gettext(app.locale, label));
+    for edit in edits {
+        enqueue(app, edit);
+    }
+}
+
+fn official_capture(ui: &mut egui::Ui, label: &str) -> (egui::Response, Vec<Intent>) {
+    let response = ui.add(
+        egui::Button::new(label)
+            .wrap()
+            .min_size(egui::vec2(36.0, 36.0)),
+    );
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(egui::Id::new("jam-official-focus-id"), response.id));
+    if response.clicked() {
+        response.request_focus();
+    }
+    if !response.has_focus() {
+        return (response, Vec::new());
+    }
+    let edits = ui.ctx().input_mut(|input| {
+        // egui keeps a raw event copy as well as processed events. Drop both.
+        input.raw.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut
+            )
+        });
+        let mut edits = Vec::new();
+        for event in std::mem::take(&mut input.events) {
+            match event {
+                egui::Event::Text(value) | egui::Event::Paste(value) => {
+                    edits.push(Intent::EditOfficial(crate::model::jam::OfficialEdit::new(
+                        value,
+                    )));
+                }
+                egui::Event::Copy | egui::Event::Cut => (),
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    pressed: true,
+                    ..
+                } => edits.push(Intent::BackspaceOfficial),
+                egui::Event::Key {
+                    key: egui::Key::Delete,
+                    pressed: true,
+                    ..
+                } => edits.push(Intent::ClearOfficial),
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                } => edits.push(Intent::CancelCompare),
+                other => input.events.push(other),
+            }
+        }
+        edits
+    });
+    (response, edits)
+}
+
+fn diagnostic(app: &mut App, ui: &mut egui::Ui, allow_comparison: bool) {
     text(
         app,
         ui,
@@ -346,6 +413,59 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui) {
         app.jam.pending.is_none(),
         Intent::DiagnoseCurrent,
     );
+    if allow_comparison {
+        if let Some(draft) = &app.jam.official {
+            let present = draft.has_input();
+            let invalid = draft.invalid;
+            text(
+                app,
+                ui,
+                "Local comparison only. Use a fresh official long link for this same Jam. Never send it to chat. No invitation is enabled by the result.",
+            );
+            hidden_official_input(app, ui, present);
+            if invalid {
+                text(
+                    app,
+                    ui,
+                    "official_relation=not_comparable; unsupported input was discarded.",
+                );
+            }
+            button(app, ui, "Clear hidden input", true, Intent::ClearOfficial);
+            button(
+                app,
+                ui,
+                "Compare with one Current",
+                app.jam.owner_id().is_some() && present,
+                Intent::CompareOfficial,
+            );
+            button(
+                app,
+                ui,
+                "Cancel local comparison",
+                true,
+                Intent::CancelCompare,
+            );
+        } else {
+            button(
+                app,
+                ui,
+                "Compare an official link locally…",
+                app.jam.owner_id().is_some(),
+                Intent::AskCompare,
+            );
+            if app.jam.pending.is_some()
+                && app.jam.diagnostic.is_some_and(|d| d.comparison.is_some())
+            {
+                button(
+                    app,
+                    ui,
+                    "Cancel local comparison",
+                    true,
+                    Intent::CancelCompare,
+                );
+            }
+        }
+    }
     if let Some(diagnostic) = app.jam.diagnostic {
         ui.add(egui::Label::new(diagnostic.to_string()).wrap());
         text(
@@ -419,7 +539,7 @@ pub(super) fn summary(app: &mut App, ui: &mut egui::Ui) {
         );
     }
     progress(app, ui);
-    diagnostic(app, ui);
+    diagnostic(app, ui, false);
     ui.add_space(8.0);
 }
 
@@ -451,7 +571,7 @@ pub(super) fn section(app: &mut App, ui: &mut egui::Ui) {
     }
     ui.add_space(8.0);
     progress(app, ui);
-    diagnostic(app, ui);
+    diagnostic(app, ui, true);
     if app.jam.fresh() {
         match app.jam.membership.clone() {
             Membership::Absent => {
@@ -920,5 +1040,67 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod official_tests {
+    use super::*;
+    #[test]
+    fn official_hidden_capture_consumes_explicit_events_without_render_or_clipboard_output() {
+        let ctx = egui::Context::default();
+        let mut id = None;
+        let mut first = ctx.run_ui(egui::RawInput::default(), |ui| {
+            id = Some(official_capture(ui, "Hidden input").0.id);
+        });
+        first.textures_delta.clear();
+        ctx.memory_mut(|memory| memory.request_focus(id.unwrap()));
+        let mut edits = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Paste("SyntheticSecret9".into()),
+                    egui::Event::Copy,
+                    egui::Event::Cut,
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                edits = official_capture(ui, "Hidden input present").1;
+            },
+        );
+        assert_eq!(edits.len(), 1);
+        let Intent::EditOfficial(value) = edits.pop().unwrap() else {
+            panic!("edit expected");
+        };
+        assert_eq!(value.take().as_deref(), Some("SyntheticSecret9"));
+        assert!(value.take().is_none());
+        assert!(
+            !output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+        );
+        fn safe(shape: &egui::Shape) {
+            match shape {
+                egui::Shape::Text(t) => assert!(!t.galley.text().contains("SyntheticSecret9")),
+                egui::Shape::Vec(v) => v.iter().for_each(safe),
+                _ => (),
+            }
+        }
+        for shape in &output.shapes {
+            safe(&shape.shape);
+        }
+        output.textures_delta.clear();
+        ctx.input(|input| {
+            assert!(
+                !input
+                    .events
+                    .iter()
+                    .chain(input.raw.events.iter())
+                    .any(|event| matches!(event, egui::Event::Paste(_) | egui::Event::Text(_)))
+            );
+        });
     }
 }

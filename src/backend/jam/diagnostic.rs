@@ -1,6 +1,7 @@
 //! One opt-in Current observation. No identity, raw response or persistent output.
+pub use super::comparison::{Comparison, OfficialRelation, Shape};
 use super::lifecycle::Cause;
-use super::{Arc, Error, Membership, Mutex};
+use super::{Arc, DEADLINE, Error, Instant, Link, Membership, Mutex, Snapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -71,9 +72,21 @@ pub struct Diagnostic {
     pub schema: Schema,
     pub url_field: UrlField,
     pub format_boundary: FormatBoundary,
+    pub comparison: Option<Comparison>,
+}
+
+// No Debug/Clone/Serialize: input and initial Jam ID are operation-local only.
+struct OfficialComparison {
+    official: Option<Link>,
+    host: Option<String>,
+    host_until: Option<Instant>,
+    deadline: Instant,
+    pending: Option<Comparison>,
+    verified_host: bool,
 }
 
 struct Slot {
+    comparison: Option<OfficialComparison>,
     value: Diagnostic,
     closed: bool,
     waker: crate::backend::Waker,
@@ -87,12 +100,14 @@ pub struct Probe(Arc<Mutex<Slot>>);
 impl Default for Probe {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(Slot {
+            comparison: None,
             value: Diagnostic {
                 class: Class::Waiting(Stage::Queued),
                 http: None,
                 schema: Schema::None,
                 url_field: UrlField::NotObserved,
                 format_boundary: FormatBoundary::NotApplicable,
+                comparison: None,
             },
             closed: false,
             waker: Default::default(),
@@ -101,6 +116,134 @@ impl Default for Probe {
 }
 
 impl Probe {
+    /// Takes only a strict long-link token; never stores the raw GUI input.
+    pub(crate) fn with_official(official: Link) -> Self {
+        let probe = Self::default();
+        {
+            let mut slot = probe
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.value.comparison = Some(Comparison::default());
+            slot.comparison = Some(OfficialComparison {
+                official: Some(official),
+                host: None,
+                host_until: None,
+                deadline: Instant::now() + DEADLINE,
+                pending: None,
+                verified_host: false,
+            });
+        }
+        probe
+    }
+    pub(super) fn is_comparison(&self) -> bool {
+        self.snapshot().comparison.is_some()
+    }
+    pub(super) fn bind_host(&self, snapshot: &Snapshot) -> Result<(), Error> {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.closed {
+            return Err(Error::Stale);
+        }
+        let comparison = slot.comparison.as_mut().ok_or(Error::Stale)?;
+        if comparison.host.is_some() || comparison.official.is_none() {
+            return Err(Error::Stale);
+        }
+        if Instant::now() >= comparison.deadline {
+            return Err(Error::Timeout);
+        }
+        if snapshot.reconcile_required || snapshot.error.is_some() {
+            return Err(Error::ReconcileRequired);
+        }
+        let until = snapshot
+            .fresh_until
+            .filter(|until| Instant::now() < *until)
+            .ok_or(Error::SnapshotExpired)?;
+        let Membership::Present(host) = &snapshot.membership else {
+            return Err(Error::NotOwner);
+        };
+        if !host.is_session_owner {
+            return Err(Error::NotOwner);
+        }
+        comparison.host = Some(host.session_id.clone());
+        comparison.host_until = Some(until);
+        Ok(())
+    }
+    pub(super) fn comparison_deadline(&self) -> Option<Instant> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .comparison
+            .as_ref()
+            .map(|c| c.deadline)
+    }
+    pub(super) fn comparison_fresh_until(&self) -> Option<Instant> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .comparison
+            .as_ref()
+            .and_then(|c| c.host_until.map(|until| until.min(c.deadline)))
+    }
+    pub(super) fn check_comparison(&self) -> Result<(), Error> {
+        let slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.value.comparison.is_none() {
+            return Ok(());
+        }
+        if slot.closed {
+            return Err(Error::Stale);
+        }
+        let c = slot.comparison.as_ref().ok_or(Error::Stale)?;
+        if c.host.is_none() {
+            return Err(Error::NotReady);
+        }
+        if Instant::now() >= c.deadline {
+            return Err(Error::Timeout);
+        }
+        Ok(())
+    }
+    pub(super) fn compare_url(&self, value: &str) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.closed {
+            return;
+        }
+        if let Some(c) = &mut slot.comparison
+            && let Some(official) = c.official.take()
+        {
+            c.pending = Some(super::comparison::compare(value, &official));
+        }
+    }
+    /// Only Bridge's live completion gate can expose the provisional enums.
+    pub(super) fn commit_comparison(&self, snapshot: &Snapshot) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(c) = slot.comparison.take() else {
+            return;
+        };
+        if !slot.closed
+            && c.verified_host
+            && Instant::now() < c.deadline
+            && snapshot.error.is_none()
+            && !snapshot.reconcile_required
+            && snapshot
+                .fresh_until
+                .is_some_and(|until| Instant::now() < until)
+            && matches!(&snapshot.membership, Membership::Present(host) if host.is_session_owner)
+        {
+            slot.value.comparison = Some(c.pending.unwrap_or_default());
+            slot.waker.wake();
+        }
+    }
     fn update(&self, apply: impl FnOnce(&mut Diagnostic)) {
         let mut slot = self
             .0
@@ -118,10 +261,25 @@ impl Probe {
             .waker = waker;
     }
     pub fn snapshot(&self) -> Diagnostic {
-        self.0
+        let mut slot = self
+            .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .value
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .comparison
+            .as_ref()
+            .is_some_and(|c| Instant::now() >= c.deadline)
+        {
+            slot.comparison = None;
+            slot.value.comparison = Some(Comparison::default());
+            let stage = match slot.value.class {
+                Class::Waiting(stage) | Class::Failed(stage, _) => stage,
+                _ => Stage::Response,
+            };
+            slot.value.class = Class::Failed(stage, Error::Timeout);
+            slot.closed = true;
+        }
+        slot.value
     }
     pub(super) fn stage(&self, stage: Stage) {
         self.update(|d| d.class = Class::Waiting(stage));
@@ -149,22 +307,35 @@ impl Probe {
         });
     }
     pub(super) fn finish(&self, result: Result<&Membership, Error>) {
-        self.update(|d| {
-            d.class = match result {
-                Ok(Membership::Absent) => Class::Absent,
-                Ok(Membership::Present(_)) => Class::Present,
-                Ok(Membership::Unknown) => {
-                    Class::Failed(Stage::Response, Error::VerificationFailed)
-                }
-                Err(error) => {
-                    let stage = match d.class {
-                        Class::Waiting(stage) | Class::Failed(stage, _) => stage,
-                        _ => Stage::Preflight,
-                    };
-                    Class::Failed(stage, error)
-                }
-            };
-        });
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.closed {
+            slot.comparison = None;
+            return;
+        }
+        slot.value.class = match result {
+            Ok(Membership::Absent) => Class::Absent,
+            Ok(Membership::Present(_)) => Class::Present,
+            Ok(Membership::Unknown) => Class::Failed(Stage::Response, Error::VerificationFailed),
+            Err(error) => {
+                let stage = match slot.value.class {
+                    Class::Waiting(stage) | Class::Failed(stage, _) => stage,
+                    _ => Stage::Preflight,
+                };
+                Class::Failed(stage, error)
+            }
+        };
+        if let Some(mut c) = slot.comparison.take() {
+            c.official = None;
+            let host = c.host.take();
+            c.verified_host = matches!(result, Ok(Membership::Present(p)) if p.is_session_owner && host.as_deref() == Some(p.session_id.as_str()));
+            if c.verified_host && Instant::now() < c.deadline {
+                slot.comparison = Some(c);
+            }
+        }
+        slot.waker.wake();
     }
     pub(super) fn retire(&self, cause: Cause) {
         let mut slot = self
@@ -172,6 +343,10 @@ impl Probe {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = slot.value;
+        slot.comparison = None;
+        if slot.value.comparison.is_some() {
+            slot.value.comparison = Some(Comparison::default());
+        }
         // Context loss sanitizes even an already retired record. Never carry
         // status/schema across an unverified account or replacement engine.
         if matches!(cause, Cause::Account | Cause::Engine | Cause::Context) {
@@ -238,7 +413,16 @@ impl std::fmt::Display for Diagnostic {
             },
             self.url_field.label(),
             self.format_boundary.label()
-        )
+        )?;
+        if let Some(comparison) = self.comparison {
+            write!(
+                f,
+                "; shape={}; official_relation={}",
+                comparison.shape.label(),
+                comparison.official_relation.label()
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -355,6 +539,7 @@ mod tests {
                             schema: Schema::None,
                             url_field,
                             format_boundary,
+                            comparison: None,
                         };
                         let text = d.to_string();
                         assert!(text.len() < 256);
@@ -446,5 +631,214 @@ mod tests {
             probe.snapshot().format_boundary,
             FormatBoundary::NotApplicable
         );
+    }
+}
+
+#[cfg(test)]
+mod official_tests {
+    use super::*;
+    use crate::backend::jam::{FRESH_FOR, Projection};
+    fn host(id: &str) -> Snapshot {
+        Snapshot {
+            metadata: Default::default(),
+            membership: Membership::Present(Projection {
+                session_id: id.into(),
+                is_session_owner: true,
+                is_listening: false,
+                is_controlling: false,
+            }),
+            fresh_until: Some(Instant::now() + FRESH_FOR),
+            reconcile_required: false,
+            error: None,
+        }
+    }
+    fn probe(snapshot: &Snapshot) -> Probe {
+        let p = Probe::with_official(
+            Link::parse("https://open.spotify.com/socialsession/SyntheticSecret9").unwrap(),
+        );
+        p.bind_host(snapshot).unwrap();
+        p
+    }
+    #[tokio::test(start_paused = true)]
+    async fn official_secret_is_consumed_once_and_result_waits_for_live_delivery() {
+        let h = host("synthetic-jam");
+        let p = probe(&h);
+        p.compare_url("SyntheticSecret9");
+        p.compare_url("Different9");
+        assert!(
+            p.0.lock()
+                .unwrap()
+                .comparison
+                .as_ref()
+                .unwrap()
+                .official
+                .is_none()
+        );
+        assert_eq!(p.snapshot().comparison, Some(Comparison::default()));
+        p.finish(Ok(&h.membership));
+        assert!(
+            p.0.lock()
+                .unwrap()
+                .comparison
+                .as_ref()
+                .unwrap()
+                .host
+                .is_none()
+        );
+        assert_eq!(p.snapshot().comparison, Some(Comparison::default()));
+        p.commit_comparison(&h);
+        assert!(p.0.lock().unwrap().comparison.is_none());
+        assert_eq!(
+            p.snapshot().comparison.unwrap().official_relation,
+            OfficialRelation::Same
+        );
+        let output = p.snapshot().to_string();
+        assert!(!output.contains("SyntheticSecret9") && !output.contains("synthetic-jam"));
+        assert_eq!(output.split(';').count(), 8);
+        assert!(output.len() < 384);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn official_retirement_purges_secret_and_seals_every_late_path() {
+        for cause in [
+            Cause::Account,
+            Cause::Engine,
+            Cause::Context,
+            Cause::Connection,
+            Cause::Jam,
+            Cause::ListenerClosed,
+        ] {
+            for compared in [false, true] {
+                let h = host("synthetic-jam");
+                let p = probe(&h);
+                if compared {
+                    p.compare_url("SyntheticSecret9");
+                    p.finish(Ok(&h.membership));
+                }
+                p.retire(cause);
+                assert!(p.0.lock().unwrap().comparison.is_none());
+                p.compare_url("SyntheticSecret9");
+                p.finish(Ok(&h.membership));
+                p.commit_comparison(&h);
+                assert_eq!(p.snapshot().comparison, Some(Comparison::default()));
+                assert!(p.check_comparison().is_err());
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn official_schema_role_identity_and_deadline_errors_never_publish_a_match() {
+        for case in 0..7 {
+            let h = host("synthetic-jam");
+            let p = probe(&h);
+            p.compare_url("SyntheticSecret9");
+            let mut result = h.clone();
+            match case {
+                0 => p.finish(Err(Error::InvalidResponse)),
+                1 => p.finish(Err(Error::Transport)),
+                2 => {
+                    result.membership = Membership::Absent;
+                    p.finish(Ok(&result.membership));
+                }
+                3 => {
+                    if let Membership::Present(m) = &mut result.membership {
+                        m.is_session_owner = false;
+                    }
+                    p.finish(Ok(&result.membership));
+                }
+                4 => {
+                    result.membership = host("other-jam").membership;
+                    p.finish(Ok(&result.membership));
+                }
+                _ => {
+                    p.finish(Ok(&h.membership));
+                    tokio::time::advance(std::time::Duration::from_secs(if case == 5 {
+                        21
+                    } else {
+                        16
+                    }))
+                    .await;
+                }
+            }
+            p.commit_comparison(&result);
+            assert_eq!(
+                p.snapshot().comparison,
+                Some(Comparison::default()),
+                "case {case}"
+            );
+            assert!(p.0.lock().unwrap().comparison.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn official_metadata_does_not_fallback_to_token_or_uri_and_full_schema_still_wins() {
+        let h = host("synthetic-jam");
+        for (url, extra) in [("Different9", false), ("SyntheticSecret9", true)] {
+            let p = probe(&h);
+            let mut root = serde_json::json!({"session_id":"synthetic-jam","is_session_owner":true,"is_listening":false,"is_controlling":false,
+                "join_session_url":url,"join_session_token":"SyntheticSecret9","join_session_uri":"spotify://sessions/join/SyntheticSecret9"});
+            if extra {
+                root.as_object_mut().unwrap().remove("is_listening");
+            }
+            let reply = crate::backend::jam::Reply {
+                status: 200,
+                content_type: None,
+                body: serde_json::to_vec(&root).unwrap(),
+            };
+            let read = crate::backend::jam::read_reply_observed(
+                reply,
+                &crate::backend::jam::Profile::ObservedFourFields,
+                Some(&p),
+            );
+            p.finish(read.as_ref().map(|r| &r.membership).map_err(|e| *e));
+            p.commit_comparison(&h);
+            assert_eq!(
+                p.snapshot().comparison.unwrap().official_relation,
+                if extra {
+                    OfficialRelation::NotComparable
+                } else {
+                    OfficialRelation::Different
+                }
+            );
+            assert!(p.0.lock().unwrap().comparison.is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod official_error_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn official_queued_expiry_and_alias_type_failures_discard_unconsumed_input() {
+        let p = Probe::with_official(
+            Link::parse("https://open.spotify.com/socialsession/SyntheticSecret9").unwrap(),
+        );
+        tokio::time::advance(std::time::Duration::from_secs(21)).await;
+        assert_eq!(p.snapshot().comparison, Some(Comparison::default()));
+        assert!(p.0.lock().unwrap().comparison.is_none());
+        for fields in [
+            serde_json::json!({"join_session_url":true}),
+            serde_json::json!({"join_session_url":"SyntheticSecret9","joinSessionUrl":"SyntheticSecret9"}),
+            serde_json::json!({"join_session_url":"secret\n"}),
+        ] {
+            let p = Probe::with_official(
+                Link::parse("https://open.spotify.com/socialsession/SyntheticSecret9").unwrap(),
+            );
+            let mut root = serde_json::json!({"session_id":"synthetic","is_session_owner":true,"is_listening":false,"is_controlling":false});
+            root.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let reply = crate::backend::jam::Reply {
+                status: 200,
+                content_type: None,
+                body: serde_json::to_vec(&root).unwrap(),
+            };
+            let result = crate::backend::jam::read_reply_observed(
+                reply,
+                &crate::backend::jam::Profile::ObservedFourFields,
+                Some(&p),
+            );
+            assert!(result.is_err());
+            p.finish(Err(Error::InvalidResponse));
+            assert!(p.0.lock().unwrap().comparison.is_none());
+            assert_eq!(p.snapshot().comparison, Some(Comparison::default()));
+        }
     }
 }

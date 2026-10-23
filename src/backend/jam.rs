@@ -4,6 +4,7 @@
 //! Candidate routes: Tu2525/librespot docs/jam.md at 09785618, Requests.
 //! The implementation is independent of PR935. Remote semantics remain unverified.
 
+mod comparison;
 pub mod diagnostic;
 pub mod lifecycle;
 mod link;
@@ -754,14 +755,20 @@ impl<T: Transport> Kernel<T> {
         diagnostic: Option<&Probe>,
     ) -> Result<Read, Error> {
         self.check(context, revision)?;
-        let permit = || self.check(context, revision);
+        let permit = || {
+            self.check(context, revision)?;
+            if let Some(probe) = diagnostic {
+                probe.check_comparison()?;
+            }
+            Ok(())
+        };
         let reply = self
             .transport
             .send(
                 Dispatch {
                     create: None,
                     operation: Operation::Current,
-                    fresh_until: None,
+                    fresh_until: diagnostic.and_then(Probe::comparison_fresh_until),
                     uncertainty: None,
                     diagnostic: diagnostic.cloned(),
                 },
@@ -833,7 +840,10 @@ impl<T: Transport> Kernel<T> {
             state.invalidate();
             (state.revision, fresh_until)
         };
-        let result = tokio::time::timeout(DEADLINE, async {
+        let deadline = diagnostic
+            .and_then(Probe::comparison_deadline)
+            .unwrap_or_else(|| Instant::now() + DEADLINE);
+        let result = tokio::time::timeout_at(deadline, async {
             self.check(&context, revision)?;
             if operation == Operation::Current {
                 return self.read_current(&context, revision, diagnostic).await;

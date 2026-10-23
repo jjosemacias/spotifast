@@ -397,6 +397,23 @@ impl Gate {
         Some(probe.snapshot())
     }
 
+    pub(crate) fn refuse_comparison(&self, error: Error) {
+        let mut state = self.lock();
+        if let Some(probe) = &state.diagnostic
+            && probe.is_comparison()
+        {
+            probe.finish(Err(error));
+            state.reject(error);
+        }
+    }
+    pub(crate) fn cancel_comparison(&self) {
+        let mut state = self.lock();
+        if state.diagnostic.as_ref().is_some_and(Probe::is_comparison)
+            && let Some(probe) = state.diagnostic.take()
+        {
+            probe.retire(Cause::Context);
+        }
+    }
     pub(crate) fn arm_diagnostic(&self, action: &Action) {
         let mut state = self.lock();
         if let Some(probe) = state.diagnostic.take() {
@@ -737,6 +754,19 @@ impl Bridge {
             }
         }
         let kernel = Arc::clone(state.kernel.as_ref().expect("bound kernel"));
+        if let Some(probe) = &diagnostic
+            && probe.is_comparison()
+        {
+            let result = if state.write_uncertain.load(Ordering::SeqCst) {
+                Err(Error::WriteUncertain)
+            } else {
+                probe.bind_host(&kernel.snapshot())
+            };
+            if let Err(error) = result {
+                reject(&mut state, error);
+                return;
+            }
+        }
         state.stamp.operation = state.stamp.operation.wrapping_add(1);
         let stamp = state.stamp;
         let kind = request.action.kind();
@@ -880,6 +910,11 @@ impl Bridge {
                 .as_ref()
                 .expect("verified kernel")
                 .commit_create();
+        }
+        if completed.kind == Kind::Current
+            && let Some(probe) = &state.diagnostic
+        {
+            probe.commit_comparison(&completed.snapshot);
         }
         state.publish(Phase::Complete(completed.kind), completed.snapshot);
     }

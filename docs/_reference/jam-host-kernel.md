@@ -110,6 +110,48 @@ The diagnostic UI is temporary local development tooling. It has offline unit
 coverage only; independent review and a separately authorized human observation
 are required before using it with an account.
 
+## Local official-link comparison
+
+This opt-in diagnostic reuses the single Probe and Current request. Before that
+read, an existing fresh owner can explicitly enter a strict supported official
+long link for the same Jam. The dedicated hidden capture shows only fixed
+empty/present/invalid states: no characters, proportional bullets, cursor position,
+editor undo, autofill or automatic clipboard read. Explicit native text/paste events
+are consumed while focused and both egui event copies are discarded. Input edits
+are one-use even when UI actions are cloned; private buffers have no Debug or
+serialization. Invalid input is discarded locally with no request. Memory is
+released, not guaranteed physically zeroized.
+
+Only the validated token moves into the operation's Probe. Backend preflight
+requires a fresh owner snapshot, no write uncertainty/reconciliation and a live
+context. The initial Jam ID is retained privately only to require the same owner
+and ID in the response. The host freshness fence still applies before dispatch;
+the original read deadline also bounds comparison and delivery. No additional
+read, verifier, mutation, polling or token/URI-field fallback is added.
+
+The closed shapes are `accepted`, `bare_ascii_alnum`, `http_known_long`,
+`relative_known_long`, `space_wrapped_known_long`, `other` and `not_observed`.
+They reuse the existing exact token/query validation, without constructing a
+candidate URL. `official_relation` is `not_comparable`, `same` or `different`.
+The ordinary diagnostic keeps its six fields; comparison adds just these two
+enums. Shape and relation remain provisional until the full response passes
+schema and same-owner/Jam checks, and Bridge accepts the live completion under
+its gate, deadline and freshness. Nothing is published from an error, retired or
+late comparison. Authority and invitation parsing are unchanged even on `same`.
+
+The raw GUI input is dropped on submit, clear/cancel, closure or loss of
+role/freshness/context. The Probe consumes the token during field processing and
+purges any remaining input on errors, replacement, retirement or cancellation;
+queued expiry is also checked before observation. Closing/cancelling comparison
+seals its Probe, so an already emitted Current can never restore its comparison
+result. The original Current context/deadline checks still govern any in-flight
+work. There is no second diagnostic slot or retained response for later matching.
+
+A match means exact lexical correspondence for the supplied pair, subject to
+human confirmation that the official link is current and belongs to that Jam.
+It is not evidence of future validity, a universal contract, Join, audio or full
+feature acceptance. No account test is started by preparing this code or tests.
+
 ## Candidate protocol
 
 The proposed [protocol description at 09785618](https://github.com/Tu2525/librespot/blob/09785618ef782b746821315b7548617f96671148/docs/jam.md#requests)

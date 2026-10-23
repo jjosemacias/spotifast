@@ -34,6 +34,11 @@ impl Link {
                     FormatBoundary::PrefixOther
                 }
             })?;
+        Self::parse_tail(tail).map(|token| Self(token.to_owned()))
+    }
+
+    /// Shared exact suffix grammar, returning a borrow without constructing a URL.
+    pub(super) fn parse_tail(tail: &str) -> Result<&str, FormatBoundary> {
         let (token, query) = tail
             .split_once('?')
             .map_or((tail, None), |(t, q)| (t, Some(q)));
@@ -57,7 +62,7 @@ impl Link {
                 }
             }
         }
-        Ok(Self(token.to_owned()))
+        Ok(token)
     }
 
     pub(super) fn validate_token(token: &str) -> Result<(), FormatBoundary> {

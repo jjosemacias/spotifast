@@ -762,6 +762,7 @@ async fn diagnostic_headers_survive_body_failure_limit_and_context_refusal() {
             schema: Schema::None,
             url_field: diagnostic::UrlField::NotObserved,
             format_boundary: diagnostic::FormatBoundary::NotApplicable,
+            comparison: None,
         }
     );
     let body = vec![b'x'; MAX_BODY + 1];

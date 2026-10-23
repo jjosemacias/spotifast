@@ -40,6 +40,18 @@ impl App {
             }
         }
         self.jam.sync(live);
+        let comparison_visible = (self.show_queue_panel && self.queue_tab == QueueTab::Queue)
+            || matches!(self.page(), Page::Queue);
+        if !comparison_visible {
+            self.jam.official = None;
+            self.backend.cancel_jam_comparison();
+        }
+        if self.jam.owner_id().is_none() {
+            self.jam.official = None;
+        }
+        if self.jam.official.is_none() {
+            clear_official_focus(ctx);
+        }
         self.jam.diagnostic = self.backend.jam_diagnostic();
         if !self.jam.fresh() || !self.backend.jam_context_valid(live) {
             self.jam.clear_metadata();
@@ -81,16 +93,68 @@ impl App {
     }
 
     pub(super) fn apply_jam(&mut self, action: crate::model::jam::UiAction, ctx: &egui::Context) {
+        // Drain edits even when a stale intention is refused; clones hold no replayable text.
+        let edit = match &action.intent {
+            Intent::EditOfficial(value) => value.take(),
+            _ => None,
+        };
         self.consume_jam(ctx);
         let intent = action.intent;
         if !matches!(
             intent,
-            Intent::Close | Intent::CancelEnd | Intent::CancelJoin
+            Intent::AskCompare
+                | Intent::EditOfficial(_)
+                | Intent::BackspaceOfficial
+                | Intent::ClearOfficial
+                | Intent::CompareOfficial
+                | Intent::CancelCompare
+        ) {
+            self.jam.official = None;
+            self.backend.cancel_jam_comparison();
+        }
+        if !matches!(
+            intent,
+            Intent::Close | Intent::CancelEnd | Intent::CancelJoin | Intent::CancelCompare
         ) && action.expected != self.jam.stamp
         {
             return;
         }
         match intent {
+            Intent::AskCompare => {
+                if self.jam.owner_id().is_some() {
+                    self.backend.cancel_jam_comparison();
+                    self.jam.official = Some(Default::default());
+                }
+                return;
+            }
+            Intent::EditOfficial(_) => {
+                if self.jam.owner_id().is_some()
+                    && let Some(draft) = &mut self.jam.official
+                    && let Some(value) = edit
+                {
+                    draft.append(value);
+                }
+                return;
+            }
+            Intent::BackspaceOfficial => {
+                if let Some(draft) = &mut self.jam.official {
+                    draft.backspace();
+                }
+                return;
+            }
+            Intent::ClearOfficial => {
+                if let Some(draft) = &mut self.jam.official {
+                    draft.clear();
+                }
+                return;
+            }
+            Intent::CancelCompare => {
+                self.jam.official = None;
+                clear_official_focus(ctx);
+                self.backend.cancel_jam_comparison();
+                self.jam.diagnostic = self.backend.jam_diagnostic();
+                return;
+            }
             Intent::OpenInvitation => {
                 if let Some(url) = self.jam.invitation() {
                     let qr = qrcodegen::QrCode::encode_text(url, qrcodegen::QrCodeEcc::Medium).ok();
@@ -206,6 +270,20 @@ impl App {
                 lifecycle::Action::DiagnoseCurrent(Default::default()),
                 Kind::Current,
             ),
+            Intent::CompareOfficial if self.jam.owner_id().is_some() => {
+                let Some(draft) = &mut self.jam.official else {
+                    return;
+                };
+                let Ok(link) = draft.take_link() else {
+                    return;
+                };
+                (
+                    lifecycle::Action::DiagnoseCurrent(
+                        crate::backend::jam::diagnostic::Probe::with_official(link),
+                    ),
+                    Kind::Current,
+                )
+            }
             Intent::Create
                 if self.jam.can_create() && self.local.connected && self.local.is_active() =>
             {
@@ -255,10 +333,73 @@ impl App {
         };
         let expected = self.jam.stamp;
         self.jam.start(kind);
+        clear_official_focus(ctx);
         ctx.data_mut(|data| {
             data.remove::<egui::text_edit::TextEditState>(egui::Id::new("jam-join-link"))
         });
         self.backend
             .send(Command::Jam(lifecycle::Request { expected, action }));
+    }
+}
+
+// Discard private native events if the capture disappeared before this frame drew.
+fn clear_official_focus(ctx: &egui::Context) {
+    let id = ctx.data_mut(|data| {
+        let key = egui::Id::new("jam-official-focus-id");
+        let id = data.get_temp::<egui::Id>(key);
+        data.remove::<egui::Id>(key);
+        id
+    });
+    if let Some(id) = id
+        && ctx.memory(|memory| memory.has_focus(id))
+    {
+        ctx.input_mut(|input| {
+            let public = |event: &egui::Event| {
+                !matches!(
+                    event,
+                    egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                )
+            };
+            input.events.retain(public);
+            input.raw.events.retain(public);
+        });
+        ctx.memory_mut(|memory| memory.surrender_focus(id));
+    }
+}
+
+#[cfg(test)]
+mod official_tests {
+    use super::*;
+    #[test]
+    fn official_capture_close_purges_both_native_event_copies_and_focus() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response = ui.button("hidden capture");
+            response.request_focus();
+            ctx.data_mut(|data| {
+                data.insert_temp(egui::Id::new("jam-official-focus-id"), response.id)
+            });
+        });
+        output.textures_delta.clear();
+        let mut output =
+            ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Paste("SyntheticSecret9".into())],
+                    ..Default::default()
+                },
+                |ui| {
+                    clear_official_focus(ui.ctx());
+                    ui.ctx().input(|input| {
+                        assert!(!input.events.iter().chain(input.raw.events.iter()).any(
+                            |event| matches!(event, egui::Event::Paste(_) | egui::Event::Text(_))
+                        ))
+                    });
+                    assert!(ui.ctx().memory(|memory| memory.focused().is_none()));
+                },
+            );
+        output.textures_delta.clear();
     }
 }

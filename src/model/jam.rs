@@ -4,10 +4,16 @@ use crate::backend::jam::{
     lifecycle::{Event, Kind, Phase, Stamp},
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Intent {
     Current,
     DiagnoseCurrent,
+    AskCompare,
+    EditOfficial(OfficialEdit),
+    BackspaceOfficial,
+    ClearOfficial,
+    CompareOfficial,
+    CancelCompare,
     Create,
     AskEnd,
     CancelEnd,
@@ -24,6 +30,90 @@ pub enum Intent {
     ExpandQr,
     CloseQr,
     CopyInvitation,
+}
+
+// No Debug/Serialize. Clones share a one-use edit, never copy its private string.
+#[derive(Clone)]
+pub struct OfficialEdit(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+impl OfficialEdit {
+    pub(crate) fn new(value: String) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(value))))
+    }
+    pub(crate) fn take(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+impl std::fmt::Debug for Intent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Current => "Current",
+            Self::DiagnoseCurrent => "DiagnoseCurrent",
+            Self::AskCompare => "AskCompare",
+            Self::EditOfficial(_) => "EditOfficial([hidden])",
+            Self::BackspaceOfficial => "BackspaceOfficial",
+            Self::ClearOfficial => "ClearOfficial",
+            Self::CompareOfficial => "CompareOfficial",
+            Self::CancelCompare => "CancelCompare",
+            Self::Create => "Create",
+            Self::AskEnd => "AskEnd",
+            Self::CancelEnd => "CancelEnd",
+            Self::ConfirmEnd => "ConfirmEnd",
+            Self::Close => "Close",
+            Self::Manage => "Manage",
+            Self::AskJoin => "AskJoin",
+            Self::CancelJoin => "CancelJoin",
+            Self::RequestListenHere => "RequestListenHere",
+            Self::ConfirmJoin => "ConfirmJoin",
+            Self::EditJoin(_) => "EditJoin([private invitation])",
+            Self::OpenInvitation => "OpenInvitation",
+            Self::CloseInvitation => "CloseInvitation",
+            Self::ExpandQr => "ExpandQr",
+            Self::CloseQr => "CloseQr",
+            Self::CopyInvitation => "CopyInvitation",
+        })
+    }
+}
+
+// RAM-only input, with no editor state, history, serialization or Debug.
+#[derive(Default)]
+pub struct OfficialDraft {
+    input: String,
+    pub invalid: bool,
+}
+impl OfficialDraft {
+    pub fn has_input(&self) -> bool {
+        !self.input.is_empty()
+    }
+    pub(crate) fn append(&mut self, value: String) {
+        if self.input.len().saturating_add(value.len()) > 2048 {
+            self.input = String::new();
+            self.invalid = true;
+        } else {
+            if self.input.is_empty() {
+                self.input = value;
+            } else {
+                self.input.push_str(&value);
+            }
+            self.invalid = false;
+        }
+    }
+    pub(crate) fn backspace(&mut self) {
+        self.input.pop();
+        self.invalid = false;
+    }
+    pub(crate) fn clear(&mut self) {
+        self.input = String::new();
+        self.invalid = false;
+    }
+    pub(crate) fn take_link(&mut self) -> Result<crate::backend::jam::Link, Error> {
+        let raw = std::mem::take(&mut self.input);
+        let link = crate::backend::jam::Link::parse(&raw);
+        self.invalid = link.is_err();
+        link
+    }
 }
 
 #[derive(Clone)]
@@ -54,6 +144,7 @@ pub struct JoinDraft {
 }
 
 pub struct State {
+    pub official: Option<OfficialDraft>,
     pub diagnostic: Option<crate::backend::jam::diagnostic::Diagnostic>,
     pub metadata: crate::backend::jam::metadata::Metadata,
     pub invitation_open: bool,
@@ -74,6 +165,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            official: None,
             diagnostic: None,
             metadata: Default::default(),
             invitation_open: false,
@@ -171,6 +263,7 @@ impl State {
     }
 
     pub fn clear_metadata(&mut self) {
+        self.official = None;
         self.metadata = Default::default();
         self.close_invitation();
     }
@@ -484,5 +577,59 @@ mod tests {
             assert!(state.membership == Membership::Unknown);
             assert!(state.owner_id().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod official_tests {
+    use super::*;
+    #[test]
+    fn official_input_is_strict_hidden_and_one_use_even_when_actions_are_cloned() {
+        for value in [
+            "Case9",
+            "https://spotify.link/private",
+            "spotify://sessions/join/Case9",
+            " https://open.spotify.com/socialsession/Case9",
+            "http://open.spotify.com/socialsession/Case9",
+            "https://open.spotify.com/socialsession/Case9?bad=x",
+        ] {
+            let mut draft = OfficialDraft::default();
+            draft.append(value.into());
+            assert!(draft.take_link().is_err());
+            assert!(!draft.has_input() && draft.invalid);
+        }
+        let edit =
+            OfficialEdit::new("https://open.spotify.com/socialsession/SyntheticSecret9".into());
+        let cloned = edit.clone();
+        let mut draft = OfficialDraft::default();
+        draft.append(edit.take().unwrap());
+        assert!(cloned.take().is_none());
+        let action = Intent::EditOfficial(cloned);
+        assert!(!format!("{action:?}").contains("SyntheticSecret9"));
+        assert!(draft.take_link().is_ok() && !draft.has_input());
+        draft.append("x".repeat(2049));
+        assert!(!draft.has_input() && draft.invalid);
+        draft.append("secret".into());
+        draft.clear();
+        assert!(!draft.has_input());
+    }
+    #[test]
+    fn official_draft_never_survives_context_retirement_or_pending() {
+        let mut state = State {
+            official: Some(OfficialDraft::default()),
+            ..Default::default()
+        };
+        state.official.as_mut().unwrap().append("synthetic".into());
+        state.sync(Stamp {
+            account: 1,
+            ..Default::default()
+        });
+        assert!(state.official.is_none());
+        state.official = Some(OfficialDraft::default());
+        state.start(Kind::Current);
+        assert!(state.official.is_none());
+        state.official = Some(OfficialDraft::default());
+        state.clear_metadata();
+        assert!(state.official.is_none());
     }
 }

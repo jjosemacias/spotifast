@@ -10,6 +10,12 @@ enum Step {
     Wait(tokio::sync::oneshot::Receiver<Reply>),
 }
 struct FakeState {
+    generation_prepares: AtomicUsize,
+    generation_posts: AtomicUsize,
+    generation_auth_fail: AtomicBool,
+    generation_status: AtomicUsize,
+    generation_auth: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    generation_reply: Mutex<Option<tokio::sync::oneshot::Receiver<Reply>>>,
     context: Mutex<Context>,
     calls: Mutex<Vec<Operation>>,
     steps: Mutex<VecDeque<Step>>,
@@ -21,6 +27,12 @@ struct Fake(Arc<FakeState>);
 impl Fake {
     fn new(account: &str) -> Self {
         Self(Arc::new(FakeState {
+            generation_prepares: AtomicUsize::new(0),
+            generation_posts: AtomicUsize::new(0),
+            generation_auth_fail: AtomicBool::new(false),
+            generation_status: AtomicUsize::new(200),
+            generation_auth: Mutex::new(None),
+            generation_reply: Mutex::new(None),
             context: Mutex::new(Context {
                 account: account.into(),
                 device: "synthetic-device".into(),
@@ -55,6 +67,37 @@ impl Fake {
 }
 
 impl Transport for Fake {
+    fn generate<'a>(
+        &'a self,
+        _uri: &'a generation::JoinUri,
+        _context: &'a Context,
+        lease: &'a generation::Lease,
+        check: generation::Permit<'a>,
+    ) -> generation::Response<'a> {
+        Box::pin(async move {
+            check()?;
+            self.0.generation_prepares.fetch_add(1, Ordering::SeqCst);
+            let wait = self.0.generation_auth.lock().unwrap().take();
+            if let Some(wait) = wait {
+                wait.await
+                    .map_err(|_| generation::Terminal::AuthUnavailable)?;
+            }
+            check()?;
+            if self.0.generation_auth_fail.load(Ordering::SeqCst) {
+                return Err(generation::Terminal::AuthUnavailable);
+            }
+            lease.dispatch()?;
+            self.0.generation_posts.fetch_add(1, Ordering::SeqCst);
+            let wait = self.0.generation_reply.lock().unwrap().take();
+            let reply = if let Some(wait) = wait {
+                wait.await.map_err(|_| generation::Terminal::Transport)?
+            } else {
+                generation_reply(self.0.generation_status.load(Ordering::SeqCst) as u16)
+            };
+            check()?;
+            Ok(reply)
+        })
+    }
     fn context(&self) -> Result<Context, Error> {
         Ok(self.0.context.lock().unwrap().clone())
     }
@@ -107,6 +150,296 @@ fn empty(status: u16) -> Reply {
 fn owner() -> Reply {
     Reply { status: 200, content_type: None,
         body: br#"{"session_id":"synthetic-jam","is_session_owner":true,"is_listening":false,"is_controlling":true}"#.to_vec() }
+}
+
+fn generation_owner() -> Reply {
+    Reply { status:200, content_type:None, body:br#"{"session_id":"synthetic-jam","is_session_owner":true,"is_listening":false,"is_controlling":true,"session_owner_id":"alice","join_session_uri":"spotify://sessions/join/SyntheticJam08B"}"#.to_vec() }
+}
+fn generation_reply(status: u16) -> Reply {
+    Reply {
+        status,
+        content_type: Some(b"application/json".to_vec()),
+        body: br#"{"shareable_url":"https://spotify.link/SyntheticInvite08B"}"#.to_vec(),
+    }
+}
+async fn generation_complete(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+) -> GenerationCompleted {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match receiver.recv().await.unwrap() {
+                Command::JamGenerationFinished(result) => return *result,
+                Command::SignInEnded { .. } => {}
+                _ => panic!("unexpected completion"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+async fn generation_started(fake: &Fake, dispatched: bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while if dispatched {
+            fake.0.generation_posts.load(Ordering::SeqCst)
+        } else {
+            fake.0.generation_prepares.load(Ordering::SeqCst)
+        } == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn generation_real_bridge_keeps_membership_and_total_cap_across_retirement() {
+    for status in [200, 201, 301, 401, 429, 503] {
+        let (runtime, mut worker, fake, mut commands, events) = setup("generation-total-cap");
+        runtime.block_on(async {
+            fake.push(generation_owner());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            fake.0.generation_status.store(status, Ordering::SeqCst);
+            worker.generate_jam(generation::Intent::explicitly_authorized(
+                worker.jam.gate.stamp(),
+            ));
+            let complete = generation_complete(&mut commands).await;
+            worker.finish_jam_generation(complete);
+            let expected = if status == 200 || status == 201 {
+                generation::Terminal::Accepted(generation::Family::Short)
+            } else {
+                generation::Terminal::Http(status as u16)
+            };
+            assert_eq!(worker.jam.gate.generation_report(), Some(expected));
+            assert!(matches!(
+                latest(&events).snapshot.membership,
+                Membership::Present(_)
+            ));
+            assert!(!latest(&events).snapshot.reconcile_required);
+            assert!(latest(&events).snapshot.metadata.invitation.is_none());
+            let stamp = worker.jam.gate.stamp();
+            worker.jam.gate.signal(stamp.engine, Notice::Jam);
+            // Read again explicitly; no experiment refresh is emitted.
+            fake.push(generation_owner());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            worker.generate_jam(generation::Intent::explicitly_authorized(
+                worker.jam.gate.stamp(),
+            ));
+            assert_eq!(
+                worker.jam.gate.generation_report(),
+                Some(generation::Terminal::Exhausted)
+            );
+            assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.calls(), 2);
+            bind(&mut worker, &fake, "alice"); // Engine retirement/bind also retains allowance.
+            fake.push(generation_owner());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            worker.generate_jam(generation::Intent::explicitly_authorized(
+                worker.jam.gate.stamp(),
+            ));
+            assert_eq!(
+                worker.jam.gate.generation_report(),
+                Some(generation::Terminal::Exhausted)
+            );
+            assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.calls(), 3);
+        });
+    }
+}
+
+#[test]
+fn generation_bridge_refuses_actual_registration_stamp_owner_uri_uncertainty_and_auth_guards() {
+    for guard in 0..11 {
+        let (runtime, mut worker, fake, mut commands, _events) = setup("generation-guards");
+        runtime.block_on(async {
+            let mut current = generation_owner();
+            if guard == 3 || guard == 10 {
+                let mut root: serde_json::Value = serde_json::from_slice(&current.body).unwrap();
+                root.as_object_mut().unwrap().remove(if guard == 3 {
+                    "join_session_uri"
+                } else {
+                    "session_owner_id"
+                });
+                if guard == 3 {
+                    root["join_session_url"] = "hm:synthetic".into();
+                    root["join_session_token"] = "Synthetic".into();
+                }
+                current.body = serde_json::to_vec(&root).unwrap();
+            }
+            if guard == 4 {
+                let mut root: serde_json::Value = serde_json::from_slice(&current.body).unwrap();
+                root["is_session_owner"] = false.into();
+                current.body = serde_json::to_vec(&root).unwrap();
+            }
+            fake.push(current);
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            let mut intent = generation::Intent::explicitly_authorized(worker.jam.gate.stamp());
+            match guard {
+                0 => intent.expected.operation += 1,
+                1 => worker.jam.gate.lock().listening = false,
+                2 => worker
+                    .jam
+                    .gate
+                    .lock()
+                    .write_uncertain
+                    .store(true, Ordering::SeqCst),
+                3 | 4 | 10 => {}
+                5 => worker.jam.gate.lock().verify = Arc::new(|| false),
+                6 => fake.0.context.lock().unwrap().connection = "replacement".into(),
+                7 => intent.deadline = Instant::now(),
+                8 => fake.0.generation_auth_fail.store(true, Ordering::SeqCst),
+                _ => worker.jam.gate.lock().connection = None,
+            }
+            worker.generate_jam(intent);
+            if guard == 8 {
+                worker.finish_jam_generation(generation_complete(&mut commands).await);
+                assert_eq!(
+                    worker.jam.gate.generation_report(),
+                    Some(generation::Terminal::AuthUnavailable)
+                );
+            }
+            assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.calls(), 1);
+        });
+    }
+}
+
+#[test]
+fn generation_bridge_retires_during_auth_response_and_queued_delivery_without_late_http() {
+    for stage in 0..3 {
+        for cause in 0..4 {
+            let (runtime, mut worker, fake, mut commands, _events) = setup("generation-retire");
+            runtime.block_on(async {
+                fake.push(generation_owner());
+                request(&mut worker, Action::Current);
+                finish(&mut worker, &mut commands).await;
+                let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if stage == 0 {
+                    *fake.0.generation_auth.lock().unwrap() = Some(auth_rx);
+                }
+                if stage == 1 {
+                    *fake.0.generation_reply.lock().unwrap() = Some(reply_rx);
+                }
+                worker.generate_jam(generation::Intent::explicitly_authorized(
+                    worker.jam.gate.stamp(),
+                ));
+                let queued = if stage == 2 {
+                    Some(generation_complete(&mut commands).await)
+                } else {
+                    generation_started(&fake, stage == 1).await;
+                    None
+                };
+                let gate = worker.jam.gate();
+                let stamp = gate.stamp();
+                match cause {
+                    0 => gate.signal(stamp.engine, Notice::Jam),
+                    1 => gate.signal(stamp.engine, Notice::Connection(Some("replacement".into()))),
+                    2 => gate.signal(stamp.engine, Notice::Closed),
+                    _ => gate.cancel_generation(),
+                }
+                let _ = auth_tx.send(());
+                let _ = reply_tx.send(generation_reply(200));
+                if let Some(queued) = queued {
+                    worker.finish_jam_generation(queued);
+                }
+                tokio::task::yield_now().await;
+                assert!(matches!(
+                    gate.generation_report(),
+                    Some(generation::Terminal::Invalidated | generation::Terminal::Cancelled)
+                ));
+                assert_eq!(
+                    fake.0.generation_posts.load(Ordering::SeqCst),
+                    usize::from(stage != 0)
+                );
+                assert_eq!(fake.calls(), 1);
+            });
+        }
+    }
+}
+
+#[test]
+fn generation_budget_wait_expires_original_freshness_and_busy_cannot_dispatch_twice() {
+    let (runtime, mut worker, fake, mut commands, _events) = setup("generation-budget");
+    runtime.block_on(async {
+        tokio::time::pause();
+        fake.push(generation_owner());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        let slots = worker.background_session.available_permits();
+        let budget = Arc::clone(&worker.background_session);
+        let occupied = budget.acquire_many(slots as u32).await.unwrap();
+        worker.generate_jam(generation::Intent::explicitly_authorized(
+            worker.jam.gate.stamp(),
+        ));
+        worker.generate_jam(generation::Intent::explicitly_authorized(
+            worker.jam.gate.stamp(),
+        ));
+        assert_eq!(
+            worker.jam.gate.generation_report(),
+            Some(generation::Terminal::Busy)
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(FRESH_FOR).await;
+        drop(occupied);
+        worker.finish_jam_generation(generation_complete(&mut commands).await);
+        assert_eq!(
+            worker.jam.gate.generation_report(),
+            Some(generation::Terminal::Invalidated)
+        );
+        assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.calls(), 1);
+    });
+}
+
+#[test]
+fn generation_cancelled_in_backend_queue_cannot_dispatch_or_replace_newer_intent() {
+    let (runtime, mut worker, fake, mut commands, _events) = setup("generation-queued-cancel");
+    runtime.block_on(async {
+        fake.push(generation_owner());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        let gate = worker.jam.gate();
+        let old = generation::Intent::explicitly_authorized(gate.stamp());
+        assert!(gate.arm_generation(&old));
+        assert!(!gate.arm_generation(&generation::Intent::explicitly_authorized(gate.stamp())));
+        gate.cancel_generation();
+        let new = generation::Intent::explicitly_authorized(gate.stamp());
+        assert!(gate.arm_generation(&new));
+        worker.generate_jam(old);
+        assert!(
+            gate.lock()
+                .generation_queued
+                .as_ref()
+                .is_some_and(|(slot, _)| Arc::ptr_eq(slot, &new.cancelled))
+        );
+        gate.cancel_generation();
+        worker.generate_jam(new);
+        assert_eq!(
+            gate.generation_report(),
+            Some(generation::Terminal::Cancelled)
+        );
+        assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.0.generation_prepares.load(Ordering::SeqCst), 0);
+        tokio::time::pause();
+        let expired = generation::Intent::explicitly_authorized(gate.stamp());
+        assert!(gate.arm_generation(&expired));
+        tokio::time::advance(DEADLINE).await;
+        assert_eq!(
+            gate.generation_report(),
+            Some(generation::Terminal::Deadline)
+        );
+        worker.generate_jam(expired);
+        assert_eq!(
+            gate.generation_report(),
+            Some(generation::Terminal::Deadline)
+        );
+        assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
+    });
 }
 
 fn bind(worker: &mut Worker, fake: &Fake, account: &str) {

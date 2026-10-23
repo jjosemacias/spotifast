@@ -603,6 +603,11 @@ struct PlaylistCacheWrite {
 }
 
 pub enum Command {
+    /// Experimental explicit diagnostic only. No UI/startup caller is installed.
+    #[cfg(feature = "jam-host")]
+    JamGenerate(jam::generation::Intent),
+    #[cfg(feature = "jam-host")]
+    JamGenerationFinished(Box<jam::lifecycle::GenerationCompleted>),
     #[cfg(feature = "jam-host")]
     Jam(jam::lifecycle::Request),
     #[cfg(feature = "jam-host")]
@@ -1159,6 +1164,18 @@ impl Backend {
 
     pub fn send(&self, command: Command) {
         #[cfg(feature = "jam-host")]
+        let generation_requested = matches!(&command, Command::JamGenerate(_));
+        #[cfg(feature = "jam-host")]
+        if let Command::JamGenerate(intent) = &command {
+            if self.offline {
+                self.jam_gate.cancel_generation();
+                return;
+            }
+            if !self.jam_gate.arm_generation(intent) {
+                return;
+            }
+        }
+        #[cfg(feature = "jam-host")]
         if let Command::Jam(request) = &command {
             self.jam_gate.arm_diagnostic(&request.action);
         }
@@ -1200,6 +1217,9 @@ impl Backend {
         }
         #[cfg(feature = "jam-host")]
         if self.commands.send(command).is_err() {
+            if generation_requested {
+                self.jam_gate.cancel_generation();
+            }
             self.jam_gate.refuse_comparison(jam::Error::NotReady);
         }
         #[cfg(not(feature = "jam-host"))]
@@ -1469,6 +1489,16 @@ impl Backend {
     #[cfg(feature = "jam-host")]
     pub fn jam_stamp(&self) -> jam::lifecycle::Stamp {
         self.jam_gate.stamp()
+    }
+
+    #[cfg(feature = "jam-host")]
+    pub fn jam_generation_report(&self) -> Option<jam::generation::Terminal> {
+        self.jam_gate.generation_report()
+    }
+    /// Cancellation/surface close must call this when exposing the experiment.
+    #[cfg(feature = "jam-host")]
+    pub fn cancel_jam_generation(&self) {
+        self.jam_gate.cancel_generation();
     }
 
     #[cfg(feature = "jam-host")]
@@ -1847,6 +1877,32 @@ impl Worker {
     }
 
     #[cfg(feature = "jam-host")]
+    fn generate_jam(&mut self, intent: jam::generation::Intent) {
+        let epoch = *self.session.borrow();
+        if !self.signed_in {
+            self.jam.retire(epoch, jam::lifecycle::Cause::Account);
+        }
+        let account = self.api.account();
+        self.jam.generate(
+            intent,
+            account.as_ref().map(|a| a.as_str()),
+            epoch,
+            self.commands.clone(),
+        );
+    }
+    #[cfg(feature = "jam-host")]
+    fn finish_jam_generation(&mut self, result: jam::lifecycle::GenerationCompleted) {
+        let epoch = *self.session.borrow();
+        if !self.signed_in {
+            self.jam.retire(epoch, jam::lifecycle::Cause::Account);
+            return;
+        }
+        let account = self.api.account();
+        self.jam
+            .finish_generation(result, account.as_ref().map(|a| a.as_str()), epoch);
+    }
+
+    #[cfg(feature = "jam-host")]
     fn finish_jam(&mut self, result: jam::lifecycle::Completed) {
         let epoch = *self.session.borrow();
         if !self.signed_in {
@@ -2008,6 +2064,11 @@ impl Worker {
                 self.finish_jam(*result);
                 continue;
             }
+            #[cfg(feature = "jam-host")]
+            if let Command::JamGenerationFinished(result) = command {
+                self.finish_jam_generation(*result);
+                continue;
+            }
             if self.restoring_proxy
                 && !matches!(
                     &command,
@@ -2023,6 +2084,10 @@ impl Worker {
                 continue;
             }
             match command {
+                #[cfg(feature = "jam-host")]
+                Command::JamGenerate(intent) => self.generate_jam(intent),
+                #[cfg(feature = "jam-host")]
+                Command::JamGenerationFinished(result) => self.finish_jam_generation(*result),
                 #[cfg(feature = "jam-host")]
                 Command::Jam(request) => self.request_jam(request),
                 #[cfg(feature = "jam-host")]

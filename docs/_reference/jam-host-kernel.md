@@ -435,3 +435,34 @@ Native demo scenes `jam-members`, `jam-members-empty`, `jam-invitation`, and
 presentation and local actions, not a usable Spotify invitation. Acceptance of
 R02 and the invitation-to-Join-to-same-Jam flow with real members remains J02-12.
 Permissions, moderation, Leave, remote queue edits and audio are separate gates.
+
+## E08B-1 generation experiment
+
+The `jam-host` backend has an explicit experimental `JamGenerate` command.
+There is no UI, startup or timer caller. It requires separate authorization
+for a remote experiment, a fresh confirmed host snapshot with an explicit
+`join_session_uri`, and the existing verified Session/Connect/Dealer binding.
+It never substitutes the URL or token fields, refreshes Current, or publishes
+an invitation. Its reduced historical request is a hypothesis, not a verified
+Spotify service contract.
+
+One allowance lasts for the Bridge instance, across gestures and retired
+bindings. The deadline starts before queuing. Login5 and client-token are
+mandatory; acquisition refuses effective Trace logging for their dependency
+targets and checks again at each future poll. Keep logger configuration fixed
+during a future experiment; this check is not an atomic filter-reconfiguration
+barrier and does not secure logging elsewhere in the application.
+
+The existing Session HTTP client invokes `request_fut` once at the fixed
+`https://spclient.wg.spotify.com/url-dispenser/v1/generate-url` destination.
+Hyper may recover a message before serialization/writing. No status, error or
+possible emission causes a replay or redirect; this is at most one potentially
+emitted POST, not exactly-once server execution. Slot, auth, response body and
+delivery share the original deadline and snapshot expiry. Retirement and
+cancellation discard operation buffers; failure does not change membership.
+The bounded response is classified and dropped. Reports contain fixed enums
+and valid-context HTTP status only, with no returned URL, Copy, QR or Join.
+
+Offline tests cannot establish Login5 access, current service compatibility or
+that a generated link joins the same Jam. Review the exact adapter commit
+before preparing a human artifact; remote execution needs separate permission.

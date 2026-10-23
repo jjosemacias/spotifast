@@ -153,6 +153,12 @@ impl CreateLease {
     }
 }
 trait Host: Send + Sync {
+    fn purge_generation(&self);
+    fn generation_until(&self) -> Result<Instant, generation::Terminal>;
+    fn generate(
+        &self,
+        lease: Arc<generation::Lease>,
+    ) -> Pin<Box<dyn Future<Output = generation::Terminal> + Send + '_>>;
     fn context(&self) -> Result<Context, Error>;
     fn invalidate(&self);
     fn snapshot(&self) -> Snapshot;
@@ -163,6 +169,18 @@ trait Host: Send + Sync {
 }
 
 impl<T: Transport> Host for Kernel<T> {
+    fn purge_generation(&self) {
+        self.state().generation_uri = None;
+    }
+    fn generation_until(&self) -> Result<Instant, generation::Terminal> {
+        self.generation_until()
+    }
+    fn generate(
+        &self,
+        lease: Arc<generation::Lease>,
+    ) -> Pin<Box<dyn Future<Output = generation::Terminal> + Send + '_>> {
+        Box::pin(self.generate(lease))
+    }
     fn capture_create(&self, lease: Arc<CreateLease>) -> AckWork<'_> {
         Box::pin(self.capture_create(lease))
     }
@@ -206,6 +224,33 @@ struct EpochTransport<T> {
 }
 
 impl<T: Transport> Transport for EpochTransport<T> {
+    fn generate<'a>(
+        &'a self,
+        uri: &'a generation::JoinUri,
+        context: &'a Context,
+        lease: &'a generation::Lease,
+        permit: generation::Permit<'a>,
+    ) -> generation::Response<'a> {
+        Box::pin(async move {
+            let check = || {
+                lease.check()?;
+                if self.context().ok().as_ref() != Some(context) {
+                    return Err(generation::Terminal::Invalidated);
+                }
+                permit()
+            };
+            check()?;
+            let _slot = self
+                .budget
+                .acquire()
+                .await
+                .map_err(|_| generation::Terminal::PreconditionRejected)?;
+            check()?;
+            let result = self.inner.generate(uri, context, lease, &check).await;
+            check()?;
+            result
+        })
+    }
     fn observation_context(&self) -> Result<Context, Error> {
         if !(self.verify)() {
             return Err(Error::Stale);
@@ -299,6 +344,11 @@ fn unknown(error: Option<Error>) -> Snapshot {
 }
 
 struct Shared {
+    generation_queued: Option<(Arc<AtomicBool>, Instant)>,
+    generation_active: bool,
+    generation_allowance: Arc<generation::Allowance>,
+    generation_lease: Option<Arc<generation::Lease>>,
+    generation_report: Option<generation::Terminal>,
     hard_epoch: watch::Sender<u64>,
     pending_create: Option<Arc<CreateLease>>,
     diagnostic: Option<Probe>,
@@ -331,6 +381,15 @@ impl Shared {
     }
 
     fn invalidate(&mut self, cause: Cause) {
+        if let Some((cancelled, _)) = self.generation_queued.take() {
+            cancelled.store(true, Ordering::SeqCst);
+            self.generation_report = Some(generation::Terminal::Invalidated);
+        }
+        self.generation_active = false;
+        if let Some(lease) = self.generation_lease.take() {
+            lease.cancel();
+            self.generation_report = Some(generation::Terminal::Invalidated);
+        }
         let preserve_observation = cause == Cause::Jam
             && self.pending_create.as_ref().is_some_and(|lease| {
                 lease.emitted.load(Ordering::SeqCst)
@@ -386,6 +445,74 @@ impl Shared {
 pub(crate) struct Gate(Arc<Mutex<Shared>>);
 
 impl Gate {
+    /// Install cancellation before the backend queue, without capturing secrets.
+    pub(crate) fn arm_generation(&self, intent: &generation::Intent) -> bool {
+        let mut state = self.lock();
+        if state.pending.is_some() || state.generation_queued.is_some() {
+            state.generation_report = Some(generation::Terminal::Busy);
+            state.waker.wake();
+            return false;
+        }
+        if let Some(lease) = state.generation_lease.take() {
+            lease.cancel();
+        }
+        state.generation_report = Some(generation::Terminal::Waiting);
+        state.generation_queued = Some((Arc::clone(&intent.cancelled), intent.deadline));
+        true
+    }
+    pub(crate) fn generation_report(&self) -> Option<generation::Terminal> {
+        let mut state = self.lock();
+        if state
+            .generation_queued
+            .as_ref()
+            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+        {
+            if let Some((cancelled, _)) = state.generation_queued.take() {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+            if let Some(kernel) = &state.kernel {
+                kernel.purge_generation();
+            }
+            state.generation_report = Some(generation::Terminal::Deadline);
+        }
+        if !state.context_valid() {
+            state.generation_report = state
+                .generation_report
+                .map(|_| generation::Terminal::Invalidated);
+        } else if let Some(reason) = state
+            .generation_lease
+            .as_ref()
+            .and_then(|lease| lease.check().err())
+        {
+            state.generation_report = state.generation_report.map(|_| reason);
+        }
+        state.generation_report
+    }
+    pub(crate) fn cancel_generation(&self) {
+        let mut state = self.lock();
+        if let Some((cancelled, _)) = state.generation_queued.take() {
+            cancelled.store(true, Ordering::SeqCst);
+            if let Some(kernel) = &state.kernel {
+                kernel.purge_generation();
+            }
+            state.generation_report = Some(generation::Terminal::Cancelled);
+            state.waker.wake();
+        }
+        if let Some(lease) = state.generation_lease.take() {
+            lease.cancel();
+            if state.generation_active
+                && let Some(task) = state.pending.take()
+            {
+                task.abort();
+            }
+            state.generation_active = false;
+            if let Some(kernel) = &state.kernel {
+                kernel.purge_generation();
+            }
+            state.generation_report = Some(generation::Terminal::Cancelled);
+            state.waker.wake();
+        }
+    }
     /// Independent of membership delivery: a coalesced invalidation must still
     /// expose the fixed retirement reason, never stale authority or identity.
     pub(crate) fn diagnostic(&self) -> Option<diagnostic::Diagnostic> {
@@ -494,6 +621,13 @@ pub struct Completed {
     snapshot: Snapshot,
 }
 
+/// Private completion. Contains fixed report enums, no generated URL.
+pub struct GenerationCompleted {
+    stamp: Stamp,
+    lease: Arc<generation::Lease>,
+    report: generation::Terminal,
+}
+
 pub(crate) struct Bridge {
     gate: Gate,
     factory: Option<Factory>,
@@ -510,6 +644,11 @@ impl Bridge {
     pub(crate) fn channel(waker: Waker) -> (Self, watch::Receiver<Option<Arc<Event>>>) {
         let (output, receiver) = watch::channel(None);
         let state = Shared {
+            generation_queued: None,
+            generation_active: false,
+            generation_allowance: Arc::new(generation::Allowance::default()),
+            generation_lease: None,
+            generation_report: None,
             hard_epoch: watch::channel(0).0,
             pending_create: None,
             diagnostic: None,
@@ -691,6 +830,10 @@ impl Bridge {
         if state.pending.is_some() {
             reject(&mut state, Error::Busy);
             return;
+        }
+        if let Some(lease) = state.generation_lease.take() {
+            lease.cancel();
+            state.generation_report = Some(generation::Terminal::Invalidated);
         }
         if request.expected != state.stamp {
             reject(&mut state, Error::Stale);
@@ -917,6 +1060,138 @@ impl Bridge {
             probe.commit_comparison(&completed.snapshot);
         }
         state.publish(Phase::Complete(completed.kind), completed.snapshot);
+    }
+
+    pub(crate) fn generate(
+        &mut self,
+        intent: generation::Intent,
+        account: Option<&str>,
+        epoch: u64,
+        commands: tokio::sync::mpsc::UnboundedSender<Command>,
+    ) {
+        use generation::Terminal as T;
+        let mut state = self.gate.lock();
+        if state
+            .generation_queued
+            .as_ref()
+            .is_some_and(|(queued, _)| !Arc::ptr_eq(queued, &intent.cancelled))
+        {
+            return; // A withdrawn old command cannot steal a newer intention.
+        }
+        state.generation_queued = None;
+        if intent.cancelled.load(Ordering::SeqCst) {
+            if state.generation_report != Some(T::Deadline) {
+                state.generation_report = Some(T::Cancelled);
+            }
+            state.waker.wake();
+            return;
+        }
+        // Busy does not replace the active lease, abort handle or allowance.
+        if state.pending.is_some() {
+            state.generation_report = Some(T::Busy);
+            state.waker.wake();
+            return;
+        }
+        let refusal = if state.generation_allowance.exhausted() {
+            Some(T::Exhausted)
+        } else if Instant::now() >= intent.deadline {
+            Some(T::Deadline)
+        } else if state.stamp != intent.expected
+            || state.account.as_deref() != account
+            || state.stamp.account != epoch
+            || !state.context_valid()
+            || !state.listening
+            || state.connection.as_deref().is_none_or(str::is_empty)
+        {
+            Some(T::PreconditionRejected)
+        } else {
+            None
+        };
+        if let Some(report) = refusal {
+            if let Some(kernel) = &state.kernel {
+                kernel.purge_generation();
+            }
+            state.generation_report = Some(report);
+            state.waker.wake();
+            return;
+        }
+        let Some(kernel) = state.kernel.clone() else {
+            state.generation_report = Some(T::PreconditionRejected);
+            state.waker.wake();
+            return;
+        };
+        let until = match kernel.generation_until() {
+            Ok(until) => until,
+            Err(report) => {
+                state.generation_report = Some(report);
+                state.waker.wake();
+                return;
+            }
+        };
+        let lease = Arc::new(generation::Lease::new(
+            state.epoch.subscribe(),
+            Arc::clone(&state.generation_allowance),
+            until,
+            intent.deadline,
+        ));
+        state.generation_lease = Some(Arc::clone(&lease));
+        state.generation_report = Some(T::Waiting);
+        state.generation_active = true;
+        state.stamp.operation = state.stamp.operation.wrapping_add(1);
+        let stamp = state.stamp;
+        let phase = state
+            .latest
+            .as_ref()
+            .map_or(Phase::Idle, |event| event.phase);
+        state.publish(phase, kernel.snapshot());
+        let gate = self.gate.clone();
+        let task = tokio::spawn(async move {
+            let report = if gate.accepts(stamp) {
+                kernel.generate(Arc::clone(&lease)).await
+            } else {
+                T::Invalidated
+            };
+            let _ = commands.send(Command::JamGenerationFinished(Box::new(
+                GenerationCompleted {
+                    stamp,
+                    lease,
+                    report,
+                },
+            )));
+        });
+        state.pending = Some(task.abort_handle());
+    }
+
+    pub(crate) fn finish_generation(
+        &mut self,
+        completed: GenerationCompleted,
+        account: Option<&str>,
+        epoch: u64,
+    ) {
+        use generation::Terminal as T;
+        let mut state = self.gate.lock();
+        if state.stamp != completed.stamp
+            || !state.generation_active
+            || !state
+                .generation_lease
+                .as_ref()
+                .is_some_and(|lease| Arc::ptr_eq(lease, &completed.lease))
+        {
+            return;
+        }
+        state.pending = None;
+        state.generation_active = false;
+        state.generation_report = Some(
+            if state.account.as_deref() != account
+                || state.stamp.account != epoch
+                || !state.context_valid()
+            {
+                T::Invalidated
+            } else {
+                completed.lease.check().err().unwrap_or(completed.report)
+            },
+        );
+        state.waker.wake();
     }
 }
 

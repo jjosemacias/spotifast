@@ -6,6 +6,7 @@
 
 mod comparison;
 pub mod diagnostic;
+pub mod generation;
 pub mod lifecycle;
 mod link;
 pub mod metadata;
@@ -169,6 +170,17 @@ pub type Response<'a> = Pin<Box<dyn Future<Output = Result<Reply, Error>> + Send
 pub type Check<'a> = &'a (dyn Fn() -> Result<(), Error> + Send + Sync);
 
 pub trait Transport: Send + Sync {
+    /// Separate experimental POST. Implementations must use the same binding,
+    /// check every await and consume Lease::dispatch before request_fut once.
+    fn generate<'a>(
+        &'a self,
+        _uri: &'a generation::JoinUri,
+        _context: &'a Context,
+        _lease: &'a generation::Lease,
+        _permit: generation::Permit<'a>,
+    ) -> generation::Response<'a> {
+        Box::pin(async { Err(generation::Terminal::PreconditionRejected) })
+    }
     /// Must reflect logout, engine replacement and Dealer connection changes.
     fn context(&self) -> Result<Context, Error>;
     /// Physical binding for observing an already emitted Create; grants no authority
@@ -223,6 +235,15 @@ impl SessionTransport {
 }
 
 impl Transport for SessionTransport {
+    fn generate<'a>(
+        &'a self,
+        uri: &'a generation::JoinUri,
+        context: &'a Context,
+        lease: &'a generation::Lease,
+        permit: generation::Permit<'a>,
+    ) -> generation::Response<'a> {
+        self.generate(uri, context, lease, permit)
+    }
     fn context(&self) -> Result<Context, Error> {
         if !matches!(self.epoch.has_changed(), Ok(false))
             || self.session.is_invalid()
@@ -431,6 +452,7 @@ fn success(reply: &Reply) -> Result<(), Error> {
 }
 
 struct Read {
+    generation_uri: Option<generation::JoinUri>,
     membership: Membership,
     metadata: metadata::Metadata,
 }
@@ -460,6 +482,7 @@ fn read_reply_observed(
     }
     if reply.status == StatusCode::NOT_FOUND.as_u16() {
         return Ok(Read {
+            generation_uri: None,
             membership: Membership::Absent,
             metadata: Default::default(),
         });
@@ -494,8 +517,10 @@ fn read_reply_observed(
     }))?;
     let metadata =
         metadata::snapshot_observed(&root, diagnostic).map_err(classify(Schema::Metadata))?;
+    let generation_uri = generation::JoinUri::capture(&root);
     let projection = projection::from_value(root).map_err(classify(Schema::Projection))?;
     Ok(Read {
+        generation_uri,
         membership: Membership::Present(projection),
         metadata,
     })
@@ -513,6 +538,7 @@ pub struct Snapshot {
 }
 
 struct State {
+    generation_uri: Option<generation::JoinUri>,
     metadata: metadata::Metadata,
     context: Option<Context>,
     revision: u64,
@@ -524,6 +550,7 @@ struct State {
 
 impl State {
     fn invalidate(&mut self) {
+        self.generation_uri = None;
         self.revision = self.revision.wrapping_add(1);
         self.membership = Membership::Unknown;
         self.metadata = Default::default();
@@ -654,6 +681,7 @@ impl<T: Transport> Kernel<T> {
         }
         let at = Instant::now();
         state.membership = read.membership.clone();
+        state.generation_uri = read.generation_uri.clone();
         state.metadata = read.metadata.clone();
         state.current_at = Some(at);
         state.reconcile = true;
@@ -680,6 +708,7 @@ impl<T: Transport> Kernel<T> {
             profile,
             gate: AsyncMutex::new(()),
             state: Mutex::new(State {
+                generation_uri: None,
                 metadata: Default::default(),
                 context: None,
                 revision: 0,
@@ -723,6 +752,7 @@ impl<T: Transport> Kernel<T> {
         let _ = self.sync_context();
         let mut state = self.state();
         if !state.current_at.is_some_and(|at| at.elapsed() < FRESH_FOR) {
+            state.generation_uri = None;
             state.metadata = Default::default();
         }
         Snapshot {
@@ -873,7 +903,7 @@ impl<T: Transport> Kernel<T> {
                 match read_reply(reply, &self.profile)? {
                     Read {
                         membership: Membership::Present(session),
-                        metadata: _,
+                        ..
                     } if !session.is_session_owner => Some(session.session_id),
                     _ => return Err(Error::VerificationFailed),
                 }
@@ -904,6 +934,7 @@ impl<T: Transport> Kernel<T> {
                     self.write_uncertain.store(false, Ordering::SeqCst);
                 }
                 state.membership = read.membership.clone();
+                state.generation_uri = read.generation_uri.clone();
                 state.metadata = read.metadata.clone();
                 state.current_at = Some(Instant::now());
                 state.reconcile = self.write_uncertain.load(Ordering::SeqCst);

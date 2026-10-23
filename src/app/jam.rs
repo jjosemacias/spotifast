@@ -40,22 +40,25 @@ impl App {
             }
         }
         self.jam.sync(live);
-        let comparison_visible = (self.show_queue_panel && self.queue_tab == QueueTab::Queue)
-            || matches!(self.page(), Page::Queue);
-        if !comparison_visible {
+        let context_valid = self.backend.jam_context_valid(live);
+        if !self.jam.fresh() || !context_valid {
+            self.jam.clear_metadata();
+        }
+        let comparison_visible = self.lyrics_fullscreen.is_none()
+            && ((self.show_queue_panel && self.queue_tab == QueueTab::Queue)
+                || matches!(self.page(), Page::Queue));
+        if !comparison_visible || !context_valid {
             self.jam.official = None;
             self.backend.cancel_jam_comparison();
         }
         if self.jam.owner_id().is_none() {
             self.jam.official = None;
         }
+        // All invalidations must finish before native event copies lose their owner.
         if self.jam.official.is_none() {
             clear_official_focus(ctx);
         }
         self.jam.diagnostic = self.backend.jam_diagnostic();
-        if !self.jam.fresh() || !self.backend.jam_context_valid(live) {
-            self.jam.clear_metadata();
-        }
         if had_invitation && !self.jam.invitation_open {
             ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
         }

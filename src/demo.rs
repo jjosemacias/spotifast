@@ -2057,6 +2057,92 @@ mod tests {
     }
 
     #[cfg(feature = "jam-host")]
+    #[test]
+    fn jam_official_full_ui_keys_do_not_control_playback_or_close_queue() {
+        use crate::model::jam::{Intent, UiAction};
+        let (ctx, mut app) = accessible_app("jam-official-keyboard");
+        jam_fixture(&mut app, "jam-owner");
+        let size = egui::vec2(1200.0, 900.0);
+        app.apply(
+            Action::Jam(UiAction {
+                intent: Intent::AskCompare,
+                expected: app.jam.stamp,
+            }),
+            &ctx,
+        );
+        jam_frame(&ctx, &mut app, size, vec![]);
+        app.actions.clear();
+        let id = ctx
+            .data(|data| data.get_temp::<egui::Id>(egui::Id::new("jam-official-focus-id")))
+            .unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        for (key, modifiers) in [
+            (egui::Key::Space, egui::Modifiers::NONE),
+            (egui::Key::ArrowLeft, egui::Modifiers::ALT),
+            (egui::Key::ArrowRight, egui::Modifiers::ALT),
+            (egui::Key::ArrowLeft, egui::Modifiers::COMMAND),
+            (egui::Key::ArrowRight, egui::Modifiers::COMMAND),
+            (egui::Key::ArrowUp, egui::Modifiers::COMMAND),
+            (egui::Key::ArrowDown, egui::Modifiers::COMMAND),
+        ] {
+            let output = jam_frame(
+                &ctx,
+                &mut app,
+                size,
+                vec![keyboard(key, modifiers), egui::Event::Text(" ".into())],
+            );
+            assert!(output.platform_output.commands.is_empty());
+            let actions = std::mem::take(&mut app.actions);
+            assert!(actions.iter().all(|action| matches!(
+                action,
+                Action::Jam(UiAction {
+                    intent: Intent::EditOfficial(_),
+                    ..
+                })
+            )));
+            for action in actions {
+                app.apply(action, &ctx);
+            }
+            assert!(app.show_queue_panel && app.jam.official.as_ref().unwrap().has_input());
+            assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        }
+        jam_frame(
+            &ctx,
+            &mut app,
+            size,
+            vec![keyboard(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        let actions = std::mem::take(&mut app.actions);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::Jam(UiAction {
+                intent: Intent::CancelCompare,
+                ..
+            })
+        ));
+        for action in actions {
+            app.apply(action, &ctx);
+        }
+        assert!(app.show_queue_panel && app.jam.official.is_none());
+        assert!(!ctx.memory(|memory| memory.has_focus(id)));
+        assert!(app.backend.jam_requests.lock().unwrap().is_empty());
+        // Outside comparison, the ordinary shortcut is still available.
+        jam_frame(
+            &ctx,
+            &mut app,
+            size,
+            vec![keyboard(egui::Key::Space, egui::Modifiers::NONE)],
+        );
+        assert!(
+            app.actions
+                .iter()
+                .any(|action| matches!(action, Action::TogglePlay))
+        );
+        app.backend.shutdown();
+    }
+
+    #[cfg(feature = "jam-host")]
     fn jam_frame(
         ctx: &egui::Context,
         app: &mut App,

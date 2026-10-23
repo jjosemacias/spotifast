@@ -2071,3 +2071,129 @@ fn official_offline_or_closed_consumer_discards_input_without_http() {
         });
     }
 }
+
+#[test]
+fn official_visibility_and_getter_loss_purge_native_input_before_actions_and_seal_late_results() {
+    use crate::app::{App, AppOptions};
+    use crate::model::{Action as UiAction, Page, QueueTab, jam::OfficialDraft};
+    for case in 0..5 {
+        let (runtime, mut worker, fake, mut commands, events) =
+            setup("jam-official-surface-retire");
+        runtime.block_on(async {
+            fake.push(owner());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            let mut app = App::new(
+                &Waker::default(),
+                worker.dirs.clone(),
+                crate::settings::Settings::default(),
+                AppOptions {
+                    media_controls: false,
+                    restore_sign_in: false,
+                    tray: false,
+                },
+            );
+            app.backend.shutdown();
+            app.backend = consumer(&worker, events);
+            let (spy, mut sent) = tokio::sync::mpsc::unbounded_channel();
+            app.backend.commands = spy;
+            app.history = vec![Page::Queue];
+            app.history_index = 0;
+            app.queue_tab = QueueTab::Queue;
+            let ctx = egui::Context::default();
+            app.apply(UiAction::SetQueueTab(QueueTab::Queue), &ctx);
+            assert!(app.jam.owner_id().is_some());
+            let probe;
+            let completed;
+            if case < 2 {
+                probe = Probe::with_official(
+                    Link::parse("https://open.spotify.com/socialsession/SyntheticSecret9").unwrap(),
+                );
+                worker
+                    .jam
+                    .gate
+                    .arm_diagnostic(&Action::DiagnoseCurrent(probe.clone()));
+                completed = None;
+                let mut draft = OfficialDraft::default();
+                draft.append("SyntheticSecret9".into());
+                app.jam.official = Some(draft);
+            } else {
+                fake.push(official_reply("SyntheticSecret9"));
+                probe = compare_official(&mut worker);
+                completed = Some(queued(&mut commands).await);
+            }
+            let mut focus = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let response = ui.button("hidden capture");
+                response.request_focus();
+                focus = Some(response.id);
+                ctx.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("jam-official-focus-id"), response.id)
+                });
+            });
+            output.textures_delta.clear();
+            let before = fake.calls();
+            let stamp = worker.jam.gate.stamp();
+            if matches!(case, 0 | 3) {
+                app.lyrics_fullscreen = Some(false);
+                app.show_queue_panel = false;
+            } else if matches!(case, 1 | 4) {
+                fake.0.context.lock().unwrap().connection = "getter-invalid-without-stamp".into();
+                assert_eq!(worker.jam.gate.stamp(), stamp);
+                if case == 1 {
+                    assert!(app.jam.owner_id().is_some());
+                }
+            } else {
+                app.history = vec![Page::Home];
+                app.show_queue_panel = false;
+            }
+            let mut output =
+                ctx.run_ui(
+                    egui::RawInput {
+                        events: vec![
+                            egui::Event::Text("SyntheticText9".into()),
+                            egui::Event::Paste("SyntheticPaste9".into()),
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.ctx().input(|input| {
+                            for events in [&input.events, &input.raw.events] {
+                                assert!(events.iter().any(|e| matches!(e, egui::Event::Text(_))));
+                                assert!(events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+                            }
+                        });
+                        // This ordinary action invokes consume_jam exactly once before its
+                        // own no-network tab update; a second consume cannot mask ordering.
+                        app.apply(UiAction::SetQueueTab(QueueTab::Queue), ui.ctx());
+                        assert!(app.jam.official.is_none());
+                        assert!(!ui.ctx().memory(|memory| memory.has_focus(focus.unwrap())));
+                        ui.ctx().input(|input| {
+                            assert!(
+                                !input.events.iter().chain(input.raw.events.iter()).any(
+                                    |e| matches!(e, egui::Event::Text(_) | egui::Event::Paste(_))
+                                )
+                            )
+                        });
+                        assert!(app.actions.is_empty());
+                    },
+                );
+            output.textures_delta.clear();
+            assert!(probe.comparison_deadline().is_none());
+            assert!(app.backend.jam_diagnostic().is_none());
+            if let Some(completed) = completed {
+                worker.finish_jam(completed);
+            }
+            assert_eq!(probe.snapshot().comparison, Some(Default::default()));
+            assert!(app.backend.jam_diagnostic().is_none());
+            assert_eq!(fake.calls(), before);
+            assert_eq!(fake.writes(), 0);
+            assert!(sent.try_recv().is_err());
+            app.lyrics_fullscreen = None;
+            app.history = vec![Page::Queue];
+            app.apply(UiAction::SetQueueTab(QueueTab::Queue), &ctx);
+            assert!(app.jam.official.is_none());
+            assert!(sent.try_recv().is_err());
+        });
+    }
+}

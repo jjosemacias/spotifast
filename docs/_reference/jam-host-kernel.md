@@ -468,6 +468,15 @@ without the backend's explicit URI capability, a fresh host or an unused allowan
 The bounded response is classified and dropped. Reports contain fixed enums
 and valid-context HTTP status only, with no returned URL, Copy, QR or Join.
 
+The generation terminal distinguishes `Transport(PrepareHttp)`,
+`Transport(AwaitHeaders)` and `Transport(ReadBody(status))`. Only a failed body
+frame carries the HTTP status already received. These are failure boundaries,
+not exact causes or permission to retry. A synchronous preparation refusal can
+consume the allowance before emission. Context retirement, cancellation and
+expiry withdraw the boundary and status together. No raw error or remote body
+is included. This distinction cannot reconstruct an earlier bare `Transport`
+report, and does not authorize another experiment.
+
 Offline tests cannot establish Login5 access, current service compatibility or
 that a generated link joins the same Jam. Review the exact adapter commit
 before preparing a human artifact; remote execution needs separate permission.

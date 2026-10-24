@@ -7,6 +7,13 @@ pub enum Family {
     Long,
     Short,
 }
+/// Boundary only, not a diagnosis. Only a received response can carry HTTP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportStage {
+    PrepareHttp,
+    AwaitHeaders,
+    ReadBody(u16),
+}
 /// Fixed diagnostic only. Never contains a URI, identity, auth or returned URL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Terminal {
@@ -20,7 +27,7 @@ pub enum Terminal {
     Cancelled,
     Invalidated,
     Deadline,
-    Transport,
+    Transport(TransportStage),
     Http(u16),
     SchemaRejected,
     OutputNotCovered,
@@ -119,7 +126,6 @@ fn map_error(error: Error) -> Terminal {
     match error {
         Error::Timeout => Terminal::Deadline,
         Error::InvalidResponse => Terminal::SchemaRejected,
-        Error::Transport => Terminal::Transport,
         _ => Terminal::Invalidated,
     }
 }
@@ -204,20 +210,40 @@ impl SessionTransport {
             lease.dispatch()?;
             // Exactly one invocation. Hyper may recover only an unserialized
             // message; status/error/possible emission never causes replay here.
-            let future = self
-                .session
-                .http_client()
-                .request_fut(request.map(Into::into))
-                .map_err(|_| Terminal::Transport)?;
-            let response = fenced(future, &check).await?;
-            check()?;
-            let response = response.map_err(|_| Terminal::Transport)?;
-            let body_check = || check().map_err(|_| Error::Stale);
-            let reply = receive_reply(response, &body_check, None).await;
-            check()?;
-            reply.map_err(map_error)
+            http_reply(
+                || {
+                    self.session
+                        .http_client()
+                        .request_fut(request.map(Into::into))
+                },
+                &check,
+            )
+            .await
         })
     }
+}
+
+// Shared by the native call and offline fixtures, without storing raw errors.
+async fn http_reply<F, B, P, E>(
+    prepare: impl FnOnce() -> Result<F, P>,
+    check: Permit<'_>,
+) -> Result<Reply, Terminal>
+where
+    F: Future<Output = Result<http::Response<B>, E>>,
+    B: BodyExt + Unpin,
+    B::Data: AsRef<[u8]>,
+{
+    let future = prepare().map_err(|_| Terminal::Transport(TransportStage::PrepareHttp))?;
+    let response = fenced(future, check).await?;
+    check()?;
+    let response = response.map_err(|_| Terminal::Transport(TransportStage::AwaitHeaders))?;
+    let body_check = || check().map_err(|_| Error::Stale);
+    let reply = receive_reply_result(response, &body_check, None).await;
+    check()?;
+    reply.map_err(|(error, status)| match (error, status) {
+        (Error::Transport, Some(status)) => Terminal::Transport(TransportStage::ReadBody(status)),
+        (error, _) => map_error(error),
+    })
 }
 // Private RAM only. Deliberately no Debug/Serialize or public string accessor.
 #[derive(Clone, PartialEq, Eq)]

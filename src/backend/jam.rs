@@ -328,12 +328,27 @@ where
     B: BodyExt + Unpin,
     B::Data: AsRef<[u8]>,
 {
+    receive_reply_result(response, check, diagnostic)
+        .await
+        .map_err(|(error, _)| error)
+}
+
+// Operation-local result only. HTTP accompanies a failed frame, never a fence.
+async fn receive_reply_result<B>(
+    response: http::Response<B>,
+    check: Check<'_>,
+    diagnostic: Option<&Probe>,
+) -> Result<Reply, (Error, Option<u16>)>
+where
+    B: BodyExt + Unpin,
+    B::Data: AsRef<[u8]>,
+{
     let status = response.status().as_u16();
     if let Some(probe) = diagnostic {
         probe.status(status);
         probe.stage(Stage::Body);
     }
-    check()?;
+    check().map_err(|error| (error, None))?;
     let content_type = response
         .headers()
         .get(http::header::CONTENT_TYPE)
@@ -341,20 +356,20 @@ where
     let mut incoming = response.into_body();
     let mut body = Vec::new();
     while let Some(frame) = incoming.frame().await {
-        check()?;
-        let frame = frame.map_err(|_| Error::Transport)?;
+        check().map_err(|error| (error, None))?;
+        let frame = frame.map_err(|_| (Error::Transport, Some(status)))?;
         if let Ok(data) = frame.into_data() {
             let data = data.as_ref();
             if data.len() > MAX_BODY - body.len() {
                 if let Some(probe) = diagnostic {
                     probe.schema(Schema::BodyLimit);
                 }
-                return Err(Error::InvalidResponse);
+                return Err((Error::InvalidResponse, None));
             }
             body.extend_from_slice(data);
         }
     }
-    check()?;
+    check().map_err(|error| (error, None))?;
     Ok(Reply {
         status,
         content_type,

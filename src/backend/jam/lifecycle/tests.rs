@@ -90,7 +90,9 @@ impl Transport for Fake {
             self.0.generation_posts.fetch_add(1, Ordering::SeqCst);
             let wait = self.0.generation_reply.lock().unwrap().take();
             let reply = if let Some(wait) = wait {
-                wait.await.map_err(|_| generation::Terminal::Transport)?
+                wait.await.map_err(|_| {
+                    generation::Terminal::Transport(generation::TransportStage::AwaitHeaders)
+                })?
             } else {
                 generation_reply(self.0.generation_status.load(Ordering::SeqCst) as u16)
             };
@@ -567,6 +569,100 @@ fn caller_click(app: &mut crate::app::App, ctx: &egui::Context, label: &str) {
                 },
             ],
         );
+    }
+}
+
+#[test]
+fn transport_caller_allowlist_purge_and_context_late_delivery() {
+    use generation::{Terminal, TransportStage};
+    for (report, label) in [
+        (
+            Terminal::Transport(TransportStage::PrepareHttp),
+            "generation=Transport(PrepareHttp)",
+        ),
+        (
+            Terminal::Transport(TransportStage::AwaitHeaders),
+            "generation=Transport(AwaitHeaders)",
+        ),
+        (
+            Terminal::Transport(TransportStage::ReadBody(401)),
+            "generation=Transport(ReadBody(401))",
+        ),
+    ] {
+        let (runtime, mut worker, fake, mut commands, events) = setup("transport-caller");
+        let (ctx, mut app) = caller_app(&worker, events);
+        runtime.block_on(async {
+            fake.push(generation_owner());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            caller_sync(&mut app, &ctx);
+            caller_click(&mut app, &ctx, "Generate link (experimental test)");
+            caller_apply(&mut app, &ctx);
+            caller_click(&mut app, &ctx, "Run one experimental request");
+            caller_apply(&mut app, &ctx);
+            let Command::JamGenerate(intent) = commands.recv().await.unwrap() else {
+                panic!("expected command")
+            };
+            worker.generate_jam(intent);
+            let mut completed = generation_complete(&mut commands).await;
+            // The native boundary mappings are covered separately. Inject only
+            // their typed report at this completion-to-UI seam.
+            completed.report = report;
+            let late = GenerationCompleted {
+                stamp: completed.stamp,
+                lease: Arc::clone(&completed.lease),
+                report,
+            };
+            worker.finish_jam_generation(completed);
+            assert!(
+                worker
+                    .jam
+                    .gate
+                    .lock()
+                    .kernel
+                    .as_ref()
+                    .unwrap()
+                    .generation_until()
+                    .is_err()
+            );
+            app.apply(
+                crate::model::Action::Jam(crate::model::jam::UiAction {
+                    expected: app.backend.jam_stamp(),
+                    intent: crate::model::jam::Intent::ConfirmGeneration,
+                }),
+                &ctx,
+            );
+            let labels = caller_frame(&mut app, &ctx, Vec::new());
+            let generation_labels: Vec<_> = labels
+                .iter()
+                .filter(|(text, _)| text.starts_with("generation="))
+                .collect();
+            assert_eq!(generation_labels.len(), 1);
+            assert_eq!(generation_labels[0].0, label);
+            assert!(app.jam.metadata.invitation.is_none() && app.jam.qr.is_none());
+            let stamp = worker.jam.gate.stamp();
+            worker.jam.gate.signal(stamp.engine, Notice::Jam);
+            worker.finish_jam_generation(late);
+            assert_eq!(
+                worker.jam.gate.generation_report(),
+                Some(Terminal::Invalidated)
+            );
+            app.apply(
+                crate::model::Action::Jam(crate::model::jam::UiAction {
+                    expected: app.backend.jam_stamp(),
+                    intent: crate::model::jam::Intent::ConfirmGeneration,
+                }),
+                &ctx,
+            );
+            assert!(
+                !caller_frame(&mut app, &ctx, Vec::new())
+                    .iter()
+                    .any(|(text, _)| text.contains("Transport("))
+            );
+            assert!(app.jam.generation.is_none());
+            assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.calls(), 1);
+        });
     }
 }
 

@@ -91,7 +91,9 @@ impl Transport for Fake {
             let wait = self.0.generation_reply.lock().unwrap().take();
             let reply = if let Some(wait) = wait {
                 wait.await.map_err(|_| {
-                    generation::Terminal::Transport(generation::TransportStage::AwaitHeaders)
+                    generation::Terminal::Transport(generation::TransportStage::AwaitHeaders(
+                        generation::FutureFailure::OPAQUE,
+                    ))
                 })?
             } else {
                 generation_reply(self.0.generation_status.load(Ordering::SeqCst) as u16)
@@ -574,15 +576,32 @@ fn caller_click(app: &mut crate::app::App, ctx: &egui::Context, label: &str) {
 
 #[test]
 fn transport_caller_allowlist_purge_and_context_late_delivery() {
-    use generation::{Terminal, TransportStage};
+    use generation::{
+        FutureCause, FutureFailure, H2Origin, H2Reason, HyperContext, IoKind, Terminal,
+        TransportStage,
+    };
     for (report, label) in [
         (
             Terminal::Transport(TransportStage::PrepareHttp),
             "generation=Transport(PrepareHttp)",
         ),
         (
-            Terminal::Transport(TransportStage::AwaitHeaders),
-            "generation=Transport(AwaitHeaders)",
+            Terminal::Transport(TransportStage::AwaitHeaders(FutureFailure::OPAQUE)),
+            "generation=Transport(AwaitHeaders(FutureFailure { hyper: None, cause: Opaque }))",
+        ),
+        (
+            Terminal::Transport(TransportStage::AwaitHeaders(FutureFailure {
+                hyper: None,
+                cause: FutureCause::H2Reset(H2Reason::from_standard(1).unwrap(), H2Origin::Remote),
+            })),
+            "generation=Transport(AwaitHeaders(FutureFailure { hyper: None, cause: H2Reset(H2Reason(1), Remote) }))",
+        ),
+        (
+            Terminal::Transport(TransportStage::AwaitHeaders(FutureFailure {
+                hyper: Some(HyperContext::User),
+                cause: FutureCause::Io(IoKind::BrokenPipe),
+            })),
+            "generation=Transport(AwaitHeaders(FutureFailure { hyper: Some(User), cause: Io(BrokenPipe) }))",
         ),
         (
             Terminal::Transport(TransportStage::ReadBody(401)),

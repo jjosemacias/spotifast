@@ -1,5 +1,7 @@
 //! Explicit E08B-1 experiment. Historical reduced request, never product sharing.
 use super::*;
+mod failure;
+pub use failure::{FutureCause, FutureFailure, H2Origin, H2Reason, HyperContext, IoKind, TlsKind};
 const DESTINATION: &str = "https://spclient.wg.spotify.com/url-dispenser/v1/generate-url";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,7 +13,7 @@ pub enum Family {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportStage {
     PrepareHttp,
-    AwaitHeaders,
+    AwaitHeaders(FutureFailure),
     ReadBody(u16),
 }
 /// Fixed diagnostic only. Never contains a URI, identity, auth or returned URL.
@@ -217,6 +219,7 @@ impl SessionTransport {
                         .request_fut(request.map(Into::into))
                 },
                 &check,
+                |error| failure::project(&error),
             )
             .await
         })
@@ -227,6 +230,7 @@ impl SessionTransport {
 async fn http_reply<F, B, P, E>(
     prepare: impl FnOnce() -> Result<F, P>,
     check: Permit<'_>,
+    classify: impl FnOnce(E) -> FutureFailure,
 ) -> Result<Reply, Terminal>
 where
     F: Future<Output = Result<http::Response<B>, E>>,
@@ -236,7 +240,8 @@ where
     let future = prepare().map_err(|_| Terminal::Transport(TransportStage::PrepareHttp))?;
     let response = fenced(future, check).await?;
     check()?;
-    let response = response.map_err(|_| Terminal::Transport(TransportStage::AwaitHeaders))?;
+    let response = response
+        .map_err(|error| Terminal::Transport(TransportStage::AwaitHeaders(classify(error))))?;
     let body_check = || check().map_err(|_| Error::Stale);
     let reply = receive_reply_result(response, &body_check, None).await;
     check()?;

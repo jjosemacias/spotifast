@@ -34,6 +34,7 @@ async fn transport_prepare_refusal_consumes_allowance_without_polling_http() {
             Err::<HeaderFixture, _>("SyntheticPrivate preparation error")
         },
         &|| lease.check(),
+        |_| FutureFailure::OPAQUE,
     )
     .await;
     assert_eq!(
@@ -48,13 +49,23 @@ async fn transport_prepare_refusal_consumes_allowance_without_polling_http() {
 #[tokio::test]
 async fn transport_header_future_failure_has_no_http_or_raw_error() {
     let future: HeaderFixture = std::future::ready(Err("SyntheticPrivate future error"));
-    let result = http_reply(|| Ok::<_, &'static str>(future), &|| Ok(())).await;
+    let result = http_reply(
+        || Ok::<_, &'static str>(future),
+        &|| Ok(()),
+        |_| FutureFailure::OPAQUE,
+    )
+    .await;
     let terminal = result.err();
     assert_eq!(
         terminal,
-        Some(Terminal::Transport(TransportStage::AwaitHeaders))
+        Some(Terminal::Transport(TransportStage::AwaitHeaders(
+            FutureFailure::OPAQUE
+        )))
     );
-    assert_eq!(format!("{terminal:?}"), "Some(Transport(AwaitHeaders))");
+    assert_eq!(
+        format!("{terminal:?}"),
+        "Some(Transport(AwaitHeaders(FutureFailure { hyper: None, cause: Opaque })))"
+    );
 }
 
 #[tokio::test]
@@ -67,6 +78,7 @@ async fn transport_frame_failure_preserves_only_obtained_http_and_keeps_limits()
         let result = http_reply(
             || Ok::<_, &'static str>(std::future::ready(Ok::<_, &'static str>(response))),
             &|| Ok(()),
+            |_| FutureFailure::OPAQUE,
         )
         .await;
         assert_eq!(
@@ -81,6 +93,7 @@ async fn transport_frame_failure_preserves_only_obtained_http_and_keeps_limits()
     let reply = http_reply(
         || Ok::<_, &'static str>(std::future::ready(Ok::<_, &'static str>(response))),
         &|| Ok(()),
+        |_| FutureFailure::OPAQUE,
     )
     .await
     .unwrap();
@@ -93,7 +106,8 @@ async fn transport_frame_failure_preserves_only_obtained_http_and_keeps_limits()
     assert_eq!(
         http_reply(
             || Ok::<_, &'static str>(std::future::ready(Ok::<_, &'static str>(response))),
-            &|| Ok(())
+            &|| Ok(()),
+            |_| FutureFailure::OPAQUE,
         )
         .await
         .err(),
@@ -123,6 +137,7 @@ async fn transport_fences_withdraw_late_headers_and_body_http() {
         let result = http_reply(
             || Ok::<_, &'static str>(std::future::ready(Ok::<_, &'static str>(response))),
             &|| lease.check(),
+            |_| FutureFailure::OPAQUE,
         )
         .await;
         assert_eq!(
@@ -146,9 +161,13 @@ async fn transport_fences_withdraw_late_headers_and_body_http() {
         Err::<http::Response<Full<&[u8]>>, _>("SyntheticPrivate late future")
     };
     assert_eq!(
-        http_reply(|| Ok::<_, &'static str>(future), &|| lease.check())
-            .await
-            .err(),
+        http_reply(
+            || Ok::<_, &'static str>(future),
+            &|| lease.check(),
+            |_| FutureFailure::OPAQUE
+        )
+        .await
+        .err(),
         Some(Terminal::Deadline)
     );
 }

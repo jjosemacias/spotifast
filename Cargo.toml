@@ -146,6 +146,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # Same System-proxy matcher reqwest uses, so local playback follows the same
 # HTTP proxy (environment, and the OS proxy on macOS and Windows).
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+# Expose already-locked error types for the bounded Jam future diagnostic.
+# No client is constructed here and no additional protocol features are enabled.
+hyper = { version = "1", default-features = false, optional = true }
+h2 = { version = "0.4", default-features = false, optional = true }
 http = "1"
 # Bounded streaming reads for the opt-in Jam kernel; already used by librespot.
 http-body-util = { version = "0.1", optional = true }
@@ -237,7 +241,7 @@ default = ["milkdrop"]
 # Sample data and screenshot flags; never part of a release build.
 demo = []
 # Experimental host UI in Connect. Deliberate reads/writes only; off by default.
-jam-host = ["dep:http-body-util", "dep:qrcodegen"]
+jam-host = ["dep:http-body-util", "dep:qrcodegen", "dep:hyper", "dep:h2"]
 # MilkDrop, through libprojectM: a C++ library that CMake builds into the
 # binary at compile time, so building needs cmake, a C++ compiler, and
 # libclang. `--no-default-features` leaves it out.

@@ -469,13 +469,29 @@ The bounded response is classified and dropped. Reports contain fixed enums
 and valid-context HTTP status only, with no returned URL, Copy, QR or Join.
 
 The generation terminal distinguishes `Transport(PrepareHttp)`,
-`Transport(AwaitHeaders)` and `Transport(ReadBody(status))`. Only a failed body
+`Transport(AwaitHeaders(failure))` and `Transport(ReadBody(status))`. Only a failed body
 frame carries the HTTP status already received. These are failure boundaries,
 not exact causes or permission to retry. A synchronous preparation refusal can
 consume the allowance before emission. Context retirement, cancellation and
 expiry withdraw the boundary and status together. No raw error or remote body
 is included. This distinction cannot reconstruct an earlier bare `Transport`
 report, and does not authorize another experiment.
+
+The future failure is a small copied projection, with an optional Hyper context
+and a closed cause: a standard HTTP/2 reset/GOAWAY reason and origin, an IO kind,
+a limited TLS class, or Opaque. It inspects at most eight known typed nodes and
+does not format, retain or invoke source methods on unknown errors. An IO kind
+is preserved when a nested error cannot be identified. No new HTTP client,
+logging channel or state slot is added. Retirement withdraws this projection
+with the existing terminal. Hyper and h2 are direct optional dependencies only
+to expose the error types already present in the locked graph.
+
+These classes do not establish a universal cause. A GOAWAY can reach the
+response future as IO BrokenPipe without its original reason. Opaque ends the
+observation; it does not enable more diagnostics or another request. The
+native Full body is infallible, so a deliberately fallible fixture body is a
+mapping control, not an explanation of a production failure. No HTTP status is
+inferred from a future error or an HTTP/2 reason.
 
 Offline tests cannot establish Login5 access, current service compatibility or
 that a generated link joins the same Jam. Review the exact adapter commit

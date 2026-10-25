@@ -438,7 +438,7 @@ Permissions, moderation, Leave, remote queue edits and audio are separate gates.
 
 ## E08B-1 generation experiment
 
-The queue's existing diagnostic section offers **Generate link (experimental
+The queue's existing diagnostic section offers **Generate link (experimental H1
 test)** with an inline confirmation before the experimental `JamGenerate`
 command. Opening it only shows local information. There is no startup or timer
 caller. The confirmation requires separate authorization
@@ -455,11 +455,22 @@ targets and checks again at each future poll. Keep logger configuration fixed
 during a future experiment; this check is not an atomic filter-reconfiguration
 barrier and does not secure logging elsewhere in the application.
 
-The existing Session HTTP client invokes `request_fut` once at the fixed
+The explicit H1 variant uses an ephemeral Hyper client at the same fixed
 `https://spclient.wg.spotify.com/url-dispenser/v1/generate-url` destination.
-Hyper may recover a message before serialization/writing. No status, error or
-possible emission causes a replay or redirect; this is at most one potentially
-emitted POST, not exactly-once server execution. Slot, auth, response body and
+Auth still comes from the existing Session, and its public proxy configuration
+is passed directly to the same pinned proxy connector. Direct TLS and TLS after
+CONNECT advertise only `http/1.1`, with native roots, normal certificate/name
+validation and the existing provider (or local ring default). No global HTTP
+client, provider or trust setting is changed. The client is constructed late,
+rechecked after setup and discarded after the operation, without idle pooling.
+There is no H2 baseline, retry, redirect or fallback. One HTTP future is invoked
+after consuming the Bridge allowance; this is at most one potentially emitted
+POST, not exactly-once server execution. The narrowly approved exception omits
+only Session's private local domain rate limiter, whose state cannot be reserved
+through its public API. It does not omit server rate limits or change ordinary
+Session traffic. That difference, as well as a fresh connection and different
+time/auth/Jam, prevents claiming an exclusive protocol cause from a future
+comparison. Slot, auth, response body and
 delivery share the original deadline and snapshot expiry. Retirement and
 cancellation discard operation buffers; failure does not change membership.
 Closing, hiding or minimizing the diagnostic surface also cancels queued and
@@ -481,10 +492,12 @@ The future failure is a small copied projection, with an optional Hyper context
 and a closed cause: a standard HTTP/2 reset/GOAWAY reason and origin, an IO kind,
 a limited TLS class, or Opaque. It inspects at most eight known typed nodes and
 does not format, retain or invoke source methods on unknown errors. An IO kind
-is preserved when a nested error cannot be identified. No new HTTP client,
-logging channel or state slot is added. Retirement withdraws this projection
+is preserved when a nested error cannot be identified. No new logging channel
+or state slot is added. Retirement withdraws this projection
 with the existing terminal. Hyper and h2 are direct optional dependencies only
-to expose the error types already present in the locked graph.
+to expose the error types already present in the locked graph. The H1 connector
+adds only optional root edges for already locked bytes, hyper-rustls,
+hyper-proxy2 and tokio-rustls, without changing their effective features.
 
 These classes do not establish a universal cause. A GOAWAY can reach the
 response future as IO BrokenPipe without its original reason. Opaque ends the

@@ -150,6 +150,12 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-pr
 # No client is constructed here and no additional protocol features are enabled.
 hyper = { version = "1", default-features = false, optional = true }
 h2 = { version = "0.4", default-features = false, optional = true }
+# Isolated H1 generation diagnostic: reuse the locked Session connector/TLS and
+# Full<Bytes> body. Optional root edges only; no new packages or protocol features.
+bytes = { version = "1", default-features = false, optional = true }
+hyper-rustls = { version = "0.27", default-features = false, optional = true }
+hyper-proxy2 = { version = "0.1", default-features = false, optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
 http = "1"
 # Bounded streaming reads for the opt-in Jam kernel; already used by librespot.
 http-body-util = { version = "0.1", optional = true }
@@ -241,7 +247,7 @@ default = ["milkdrop"]
 # Sample data and screenshot flags; never part of a release build.
 demo = []
 # Experimental host UI in Connect. Deliberate reads/writes only; off by default.
-jam-host = ["dep:http-body-util", "dep:qrcodegen", "dep:hyper", "dep:h2"]
+jam-host = ["dep:http-body-util", "dep:qrcodegen", "dep:hyper", "dep:h2", "dep:bytes", "dep:hyper-rustls", "dep:hyper-proxy2", "dep:tokio-rustls"]
 # MilkDrop, through libprojectM: a C++ library that CMake builds into the
 # binary at compile time, so building needs cmake, a C++ compiler, and
 # libclang. `--no-default-features` leaves it out.

@@ -514,7 +514,7 @@ pub(crate) fn generation_diagnostic(app: &mut App, ui: &mut egui::Ui) {
             button(
                 app,
                 ui,
-                "Generate link (experimental test)",
+                "Generate link (experimental H1 test)",
                 app.jam.generation_ready,
                 Intent::AskGeneration,
             );
@@ -530,12 +530,12 @@ pub(crate) fn generation_diagnostic(app: &mut App, ui: &mut egui::Ui) {
             text(
                 app,
                 ui,
-                "This test can send at most one POST for the current Jam. Preparing session authorization may also use the network. The owned Jam, account, Session and connection must stay fresh and unchanged. No retry follows a possible send. Cancelling cannot undo an emitted request. The result is diagnostic only and cannot be shared yet. Keep logging configuration fixed. Run only with separate permission for this experiment.",
+                "This H1 test can send at most one POST for this authorization. Preparing session authorization may also use the network. The owned Jam, account, Session and connection must stay fresh and unchanged. No retry or fallback follows a send. Cancelling cannot undo an emitted request. The result is diagnostic only and cannot be shared yet. Keep logging configuration fixed. Run only with separate permission for this experiment.",
             );
             button(
                 app,
                 ui,
-                "Run one experimental request",
+                "Run one experimental H1 request",
                 app.jam.generation_ready,
                 Intent::ConfirmGeneration,
             );

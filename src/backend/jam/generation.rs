@@ -1,6 +1,7 @@
 //! Explicit E08B-1 experiment. Historical reduced request, never product sharing.
 use super::*;
 mod failure;
+mod http1;
 pub use failure::{FutureCause, FutureFailure, H2Origin, H2Reason, HyperContext, IoKind, TlsKind};
 const DESTINATION: &str = "https://spclient.wg.spotify.com/url-dispenser/v1/generate-url";
 
@@ -38,7 +39,7 @@ pub type Response<'a> = Pin<Box<dyn Future<Output = Result<Reply, Terminal>> + S
 pub type Permit<'a> = &'a (dyn Fn() -> Result<(), Terminal> + Send + Sync);
 
 /// Construct only for a separately authorized explicit experimental gesture.
-/// No UI or startup path creates this command. Deadline starts before queuing.
+/// Only the explicit diagnostic gesture creates it. Deadline starts before queuing.
 pub struct Intent {
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) expected: lifecycle::Stamp,
@@ -210,18 +211,9 @@ impl SessionTransport {
             )?;
             check()?;
             lease.dispatch()?;
-            // Exactly one invocation. Hyper may recover only an unserialized
-            // message; status/error/possible emission never causes replay here.
-            http_reply(
-                || {
-                    self.session
-                        .http_client()
-                        .request_fut(request.map(Into::into))
-                },
-                &check,
-                |error| failure::project(&error),
-            )
-            .await
+            // Explicit H1 mode only, one ephemeral client/invocation. No Session
+            // HTTP mutation, dummy reservation, fallback or allowance renewal.
+            http1::send(request, self.session.config().proxy.as_ref(), &check).await
         })
     }
 }

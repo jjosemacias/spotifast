@@ -615,9 +615,9 @@ fn transport_caller_allowlist_purge_and_context_late_delivery() {
             request(&mut worker, Action::Current);
             finish(&mut worker, &mut commands).await;
             caller_sync(&mut app, &ctx);
-            caller_click(&mut app, &ctx, "Generate link (experimental test)");
+            caller_click(&mut app, &ctx, "Generate link (experimental H1 test)");
             caller_apply(&mut app, &ctx);
-            caller_click(&mut app, &ctx, "Run one experimental request");
+            caller_click(&mut app, &ctx, "Run one experimental H1 request");
             caller_apply(&mut app, &ctx);
             let Command::JamGenerate(intent) = commands.recv().await.unwrap() else {
                 panic!("expected command")
@@ -700,7 +700,7 @@ fn generation_caller_ui_confirm_routes_one_backend_command_and_sanitized_result(
         }
         assert!(app.actions.is_empty() && app.jam.generation.is_none());
         assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
-        caller_click(&mut app, &ctx, "Generate link (experimental test)");
+        caller_click(&mut app, &ctx, "Generate link (experimental H1 test)");
         assert!(matches!(
             app.actions.as_slice(),
             [crate::model::Action::Jam(crate::model::jam::UiAction {
@@ -719,7 +719,7 @@ fn generation_caller_ui_confirm_routes_one_backend_command_and_sanitized_result(
                     && text.contains("cannot be shared"))
         );
         assert_eq!(fake.0.generation_prepares.load(Ordering::SeqCst), 0);
-        caller_click(&mut app, &ctx, "Run one experimental request");
+        caller_click(&mut app, &ctx, "Run one experimental H1 request");
         // Duplicate the action to exercise same-frame duplicate confirmation.
         app.actions.push(app.actions.last().unwrap().clone());
         caller_apply(&mut app, &ctx);
@@ -767,9 +767,9 @@ fn generation_caller_ui_cancel_hide_context_and_deadline_retire_queue_and_auth()
                 request(&mut worker, Action::Current);
                 finish(&mut worker, &mut commands).await;
                 caller_sync(&mut app, &ctx);
-                caller_click(&mut app, &ctx, "Generate link (experimental test)");
+                caller_click(&mut app, &ctx, "Generate link (experimental H1 test)");
                 caller_apply(&mut app, &ctx);
-                caller_click(&mut app, &ctx, "Run one experimental request");
+                caller_click(&mut app, &ctx, "Run one experimental H1 request");
                 caller_apply(&mut app, &ctx);
                 let intent = match commands.recv().await.unwrap() {
                     Command::JamGenerate(intent) => intent,
@@ -876,7 +876,7 @@ fn generation_caller_ui_disabled_without_explicit_uri_freshness_or_host() {
             }
             caller_sync(&mut app, &ctx);
             assert!(!app.jam.generation_ready);
-            caller_click(&mut app, &ctx, "Generate link (experimental test)");
+            caller_click(&mut app, &ctx, "Generate link (experimental H1 test)");
             assert!(app.actions.is_empty());
             for intent in [
                 crate::model::jam::Intent::AskGeneration,

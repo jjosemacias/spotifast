@@ -1,4 +1,4 @@
-//! Explicit E08B-1 experiment. Historical reduced request, never product sharing.
+//! Explicit E08B-1 H1 candidate. Private sharing, still awaiting real Join validation.
 use super::*;
 mod failure;
 mod http1;
@@ -59,6 +59,7 @@ impl Intent {
 #[derive(Default)]
 pub(super) struct Allowance(AtomicBool);
 pub struct Lease {
+    share: Mutex<Option<ShareLink>>,
     epoch: watch::Receiver<u64>,
     allowance: Arc<Allowance>,
     pub(super) until: Instant,
@@ -73,6 +74,7 @@ impl Lease {
         deadline: Instant,
     ) -> Self {
         Self {
+            share: Mutex::new(None),
             epoch,
             allowance,
             until,
@@ -97,6 +99,23 @@ impl Lease {
     }
     pub(super) fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.purge_share();
+    }
+    pub(super) fn purge_share(&self) {
+        *self
+            .share
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+    pub(super) fn invitation(&self) -> Option<metadata::Invitation> {
+        let mut share = self
+            .share
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.check().is_err() {
+            *share = None;
+        }
+        share.as_ref().map(|link| link.0.clone())
     }
     /// Consume before calling request_fut, even when its preparation refuses.
     pub fn dispatch(&self) -> Result<(), Terminal> {
@@ -108,6 +127,9 @@ impl Lease {
             .map_err(|_| Terminal::Exhausted)
     }
 }
+
+/// RAM only, bound to one lease. Never Debug/Serialize or part of a report.
+struct ShareLink(metadata::Invitation);
 impl Allowance {
     pub(super) fn exhausted(&self) -> bool {
         self.0.load(Ordering::SeqCst)
@@ -300,8 +322,12 @@ impl<T: Transport> Kernel<T> {
                 .generate(&input.uri, &input.context, &lease, &check)
                 .await;
             check()?;
-            let family = output(reply?)?;
+            let (family, invitation) = share_output(reply?)?;
             check()?;
+            *lease
+                .share
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = invitation.map(ShareLink);
             Ok(Terminal::Accepted(family))
         })
         .await
@@ -312,10 +338,14 @@ impl<T: Transport> Kernel<T> {
                 Terminal::Invalidated
             })
         });
-        match check() {
+        let terminal = match check() {
             Err(error) => error,
             Ok(()) => result.unwrap_or_else(|error| error),
+        };
+        if terminal != Terminal::Accepted(Family::Long) {
+            lease.purge_share();
         }
+        terminal
     }
     pub(super) fn generation_input(&self) -> Result<Input, Terminal> {
         let context = self
@@ -411,7 +441,12 @@ fn request(uri: &JoinUri, auth: Auth) -> Result<http::Request<Vec<u8>>, Terminal
     Ok(request)
 }
 
+#[cfg(test)]
 fn output(reply: Reply) -> Result<Family, Terminal> {
+    share_output(reply).map(|(family, _)| family)
+}
+
+fn share_output(reply: Reply) -> Result<(Family, Option<metadata::Invitation>), Terminal> {
     if !matches!(reply.status, 200 | 201) {
         return Err(Terminal::Http(reply.status));
     }
@@ -438,7 +473,7 @@ fn output(reply: Reply) -> Result<Family, Terminal> {
     // Literal prefixes exclude userinfo/ports. No resolution or decoding.
     // Long form uses the existing Link grammar; a short path stays opaque.
     if Link::parse(url).is_ok() {
-        return Ok(Family::Long);
+        return Ok((Family::Long, metadata::Invitation::parse(url)));
     }
     if let Some(segment) = url.strip_prefix("https://spotify.link/")
         && !segment.is_empty()
@@ -449,7 +484,7 @@ fn output(reply: Reply) -> Result<Family, Terminal> {
             .any(|c| c.is_whitespace() || "/\\?#".contains(c))
         && reqwest::Url::parse(url).is_ok_and(|parsed| parsed.as_str() == url)
     {
-        return Ok(Family::Short);
+        return Ok((Family::Short, None));
     }
     Err(Terminal::OutputNotCovered)
 }

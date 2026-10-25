@@ -166,6 +166,175 @@ fn generation_reply(status: u16) -> Reply {
         body: br#"{"shareable_url":"https://spotify.link/SyntheticInvite08B"}"#.to_vec(),
     }
 }
+fn generation_long_reply() -> Reply {
+    Reply {
+        status: 200,
+        content_type: Some(b"application/json".to_vec()),
+        body: br#"{"shareable_url":"https://open.spotify.com/socialsession/SyntheticInvite08C"}"#
+            .to_vec(),
+    }
+}
+
+#[test]
+fn sharing_long_is_private_until_finish_copy_qr_are_deliberate_and_close_keeps_cap() {
+    use crate::model::{
+        Action as UiAction,
+        jam::{Intent, UiAction as JamAction},
+    };
+    let (runtime, mut worker, fake, mut commands, events) = setup("sharing-long");
+    let (ctx, mut app) = caller_app(&worker, events);
+    runtime.block_on(async {
+        fake.push(generation_owner());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        caller_sync(&mut app, &ctx);
+        let until = app.jam.fresh_until;
+        caller_click(&mut app, &ctx, "Invite");
+        caller_apply(&mut app, &ctx);
+        caller_click(&mut app, &ctx, "Generate invitation once");
+        app.actions.push(app.actions.last().unwrap().clone());
+        caller_apply(&mut app, &ctx);
+        let Command::JamGenerate(intent) = commands.recv().await.unwrap() else { panic!("gesture") };
+        assert!(commands.try_recv().is_err());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        *fake.0.generation_reply.lock().unwrap() = Some(receive);
+        send.send(generation_long_reply()).ok().unwrap();
+        worker.generate_jam(intent);
+        let completed = generation_complete(&mut commands).await;
+        let gate = worker.jam.gate();
+        assert!(gate.generation_invitation(gate.stamp()).is_none());
+        assert!(latest(&app.backend.jam_events).snapshot.metadata.invitation.is_none());
+        worker.finish_jam_generation(completed);
+        let apply = |app: &mut crate::app::App, intent, ctx: &egui::Context| {
+            app.apply(UiAction::Jam(JamAction { expected: app.backend.jam_stamp(), intent }), ctx);
+        };
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            apply(&mut app, Intent::ConfirmGeneration, ui.ctx());
+        });
+        assert!(output.platform_output.commands.is_empty());
+        output.textures_delta.clear();
+        assert_eq!(app.jam.fresh_until, until);
+        assert_eq!(app.jam.invitation(), Some("https://open.spotify.com/socialsession/SyntheticInvite08C"));
+        assert!(app.jam.invitation_open && app.jam.qr.is_some());
+        apply(&mut app, Intent::ExpandQr, &ctx);
+        assert!(app.jam.qr_expanded);
+        apply(&mut app, Intent::CloseQr, &ctx);
+        assert!(!app.jam.qr_expanded && app.jam.invitation().is_some());
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            apply(&mut app, Intent::CopyInvitation, ui.ctx());
+        });
+        assert!(matches!(output.platform_output.commands.as_slice(),
+            [egui::OutputCommand::CopyText(value)] if value == "https://open.spotify.com/socialsession/SyntheticInvite08C"));
+        // Inspect egui output only. No platform clipboard adapter runs.
+        output.platform_output.commands.clear();
+        output.textures_delta.clear();
+        assert_eq!(app.jam.notice, Some("Copy requested. Clipboard delivery is unconfirmed."));
+        apply(&mut app, Intent::CloseInvitation, &ctx);
+        assert!(app.jam.invitation().is_none() && app.jam.qr.is_none());
+        assert!(gate.generation_invitation(gate.stamp()).is_none());
+        apply(&mut app, Intent::AskGeneration, &ctx);
+        apply(&mut app, Intent::ConfirmGeneration, &ctx);
+        assert!(app.jam.generation.is_none() && commands.try_recv().is_err());
+        assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.calls(), 1);
+    });
+}
+
+#[test]
+fn sharing_long_retirement_seals_pending_delivery_and_purges_presentation() {
+    use crate::model::{
+        Action as UiAction,
+        jam::{Intent, UiAction as JamAction},
+    };
+    for late in [false, true] {
+        for exit in 0..11 {
+            let (runtime, mut worker, fake, mut commands, events) = setup("sharing-retire");
+            let (ctx, mut app) = caller_app(&worker, events);
+            runtime.block_on(async {
+                tokio::time::pause();
+                fake.push(generation_owner());
+                request(&mut worker, Action::Current);
+                finish(&mut worker, &mut commands).await;
+                caller_sync(&mut app, &ctx);
+                let apply = |app: &mut crate::app::App, intent| {
+                    app.apply(
+                        UiAction::Jam(JamAction {
+                            expected: app.backend.jam_stamp(),
+                            intent,
+                        }),
+                        &ctx,
+                    );
+                };
+                apply(&mut app, Intent::AskGeneration);
+                apply(&mut app, Intent::ConfirmGeneration);
+                let Command::JamGenerate(intent) = commands.recv().await.unwrap() else {
+                    panic!("gesture")
+                };
+                let (send, receive) = tokio::sync::oneshot::channel();
+                *fake.0.generation_reply.lock().unwrap() = Some(receive);
+                send.send(generation_long_reply()).ok().unwrap();
+                worker.generate_jam(intent);
+                let mut completed = Some(generation_complete(&mut commands).await);
+                let lease = Arc::clone(&completed.as_ref().unwrap().lease);
+                if !late {
+                    worker.finish_jam_generation(completed.take().unwrap());
+                    apply(&mut app, Intent::ConfirmGeneration);
+                    assert!(app.jam.invitation().is_some() && app.jam.qr.is_some());
+                }
+                match exit {
+                    0 => apply(&mut app, Intent::CancelGeneration),
+                    1 => app.show_queue_panel = false,
+                    2 => app.window_gone(),
+                    3 => {
+                        let gate = worker.jam.gate();
+                        gate.signal(gate.stamp().engine, Notice::Jam);
+                    }
+                    4 => {
+                        let gate = worker.jam.gate();
+                        gate.signal(gate.stamp().engine, Notice::Connection(Some("new".into())));
+                    }
+                    5 => worker.jam.retire(
+                        worker.jam.gate.stamp().account.wrapping_add(1),
+                        Cause::Account,
+                    ),
+                    6 => tokio::time::advance(FRESH_FOR).await,
+                    7 => fake.0.context.lock().unwrap().connection = "getter-changed".into(),
+                    8 | 9 => {
+                        let gate = worker.jam.gate();
+                        gate.signal(gate.stamp().engine, Notice::Jam);
+                        let mut reply = generation_owner();
+                        let mut root: serde_json::Value =
+                            serde_json::from_slice(&reply.body).unwrap();
+                        if exit == 8 {
+                            root["is_session_owner"] = serde_json::json!(false);
+                        } else {
+                            root["session_id"] = serde_json::json!("another-jam");
+                        }
+                        reply.body = serde_json::to_vec(&root).unwrap();
+                        fake.push(reply);
+                        request(&mut worker, Action::Current);
+                        finish(&mut worker, &mut commands).await;
+                    }
+                    _ => app.queue_tab = crate::model::QueueTab::Recents,
+                }
+                apply(&mut app, Intent::CopyInvitation);
+                if let Some(completed) = completed {
+                    worker.finish_jam_generation(completed);
+                }
+                apply(&mut app, Intent::CopyInvitation);
+                assert!(
+                    app.jam.invitation().is_none() && app.jam.qr.is_none() && !app.jam.qr_expanded,
+                    "late={late}, exit={exit}"
+                );
+                assert!(lease.invitation().is_none(), "private lease purged");
+                app.show_queue_panel = true;
+                apply(&mut app, Intent::AskGeneration);
+                assert!(commands.try_recv().is_err());
+                assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 1);
+            });
+        }
+    }
+}
 async fn generation_complete(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
 ) -> GenerationCompleted {
@@ -615,9 +784,9 @@ fn transport_caller_allowlist_purge_and_context_late_delivery() {
             request(&mut worker, Action::Current);
             finish(&mut worker, &mut commands).await;
             caller_sync(&mut app, &ctx);
-            caller_click(&mut app, &ctx, "Generate link (experimental H1 test)");
+            caller_click(&mut app, &ctx, "Invite");
             caller_apply(&mut app, &ctx);
-            caller_click(&mut app, &ctx, "Run one experimental H1 request");
+            caller_click(&mut app, &ctx, "Generate invitation once");
             caller_apply(&mut app, &ctx);
             let Command::JamGenerate(intent) = commands.recv().await.unwrap() else {
                 panic!("expected command")
@@ -700,7 +869,7 @@ fn generation_caller_ui_confirm_routes_one_backend_command_and_sanitized_result(
         }
         assert!(app.actions.is_empty() && app.jam.generation.is_none());
         assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 0);
-        caller_click(&mut app, &ctx, "Generate link (experimental H1 test)");
+        caller_click(&mut app, &ctx, "Invite");
         assert!(matches!(
             app.actions.as_slice(),
             [crate::model::Action::Jam(crate::model::jam::UiAction {
@@ -716,10 +885,10 @@ fn generation_caller_ui_confirm_routes_one_backend_command_and_sanitized_result(
                 .iter()
                 .any(|(text, _)| text.contains("at most one POST")
                     && text.contains("authorization")
-                    && text.contains("cannot be shared"))
+                    && text.contains("can be shared"))
         );
         assert_eq!(fake.0.generation_prepares.load(Ordering::SeqCst), 0);
-        caller_click(&mut app, &ctx, "Run one experimental H1 request");
+        caller_click(&mut app, &ctx, "Generate invitation once");
         // Duplicate the action to exercise same-frame duplicate confirmation.
         app.actions.push(app.actions.last().unwrap().clone());
         caller_apply(&mut app, &ctx);
@@ -767,9 +936,9 @@ fn generation_caller_ui_cancel_hide_context_and_deadline_retire_queue_and_auth()
                 request(&mut worker, Action::Current);
                 finish(&mut worker, &mut commands).await;
                 caller_sync(&mut app, &ctx);
-                caller_click(&mut app, &ctx, "Generate link (experimental H1 test)");
+                caller_click(&mut app, &ctx, "Invite");
                 caller_apply(&mut app, &ctx);
-                caller_click(&mut app, &ctx, "Run one experimental H1 request");
+                caller_click(&mut app, &ctx, "Generate invitation once");
                 caller_apply(&mut app, &ctx);
                 let intent = match commands.recv().await.unwrap() {
                     Command::JamGenerate(intent) => intent,
@@ -876,7 +1045,7 @@ fn generation_caller_ui_disabled_without_explicit_uri_freshness_or_host() {
             }
             caller_sync(&mut app, &ctx);
             assert!(!app.jam.generation_ready);
-            caller_click(&mut app, &ctx, "Generate link (experimental H1 test)");
+            caller_click(&mut app, &ctx, "Invite");
             assert!(app.actions.is_empty());
             for intent in [
                 crate::model::jam::Intent::AskGeneration,

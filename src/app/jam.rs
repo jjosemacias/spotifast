@@ -91,6 +91,10 @@ impl App {
     }
 
     pub(super) fn cancel_generation_view(&mut self) {
+        if self.jam.generation.is_some() {
+            self.jam.metadata.invitation = None;
+            self.jam.close_invitation();
+        }
         self.jam.generation = None;
         self.jam.generation_ready = false;
         self.backend.cancel_jam_generation();
@@ -135,6 +139,21 @@ impl App {
             && view.sent
         {
             view.report = self.backend.jam_generation_report();
+            let invitation = self.backend.jam_generation_invitation(live);
+            if invitation.is_none() {
+                self.jam.metadata.invitation = None;
+                self.jam.close_invitation();
+            } else if self.jam.metadata.invitation.is_none() {
+                self.jam.metadata.invitation = invitation;
+                if let Some(url) = self.jam.invitation() {
+                    self.jam.qr =
+                        qrcodegen::QrCode::encode_text(url, qrcodegen::QrCodeEcc::Medium).ok();
+                    self.jam.invitation_open = true;
+                    ctx.data_mut(|data| {
+                        data.insert_temp(egui::Id::new("jam-invitation-focus"), true)
+                    });
+                }
+            }
         }
     }
 
@@ -161,7 +180,13 @@ impl App {
         let intent = action.intent;
         if !matches!(
             intent,
-            Intent::AskGeneration | Intent::ConfirmGeneration | Intent::CancelGeneration
+            Intent::AskGeneration
+                | Intent::ConfirmGeneration
+                | Intent::CancelGeneration
+                | Intent::OpenInvitation
+                | Intent::CopyInvitation
+                | Intent::ExpandQr
+                | Intent::CloseQr
         ) && self.jam.generation.is_some()
         {
             self.cancel_generation_view();
@@ -302,6 +327,18 @@ impl App {
             }
             Intent::CopyInvitation => {
                 let jam = &mut self.jam;
+                if jam.generation.is_some() {
+                    if jam.invitation_open && jam.invitation().is_some() {
+                        let _ =
+                            self.backend
+                                .with_jam_generation_invitation(action.expected, |link| {
+                                    ctx.copy_text(link.url().to_owned());
+                                    jam.notice =
+                                        Some("Copy requested. Clipboard delivery is unconfirmed.");
+                                });
+                    }
+                    return;
+                }
                 let _ = self.backend.with_jam_context(action.expected, || {
                     if let Some(url) = jam.invitation().filter(|_| jam.invitation_open) {
                         ctx.copy_text(url.to_owned());

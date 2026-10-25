@@ -159,14 +159,21 @@ locally to the long `/socialsession/` link. This does not extend accepted Join
 input formats or resolve short links.
 End requires fresh host authority and confirmation, and verifies only this
 account's absence, not an end for everyone.
-The feature is off by default with offline validation only. Leave,
+The feature is off by default and lacks complete functional runtime validation. Leave,
 permissions, shared queue and synchronized audio remain
 unavailable. Join accepts only strict Spotify HTTPS long invitations, after a fresh
 absence check and an explicit request. Membership confirmation does not confirm
 local audio or host controls. Short links and other modes remain pending.
 Fresh responses may also supply a partial participant list and a validated host
 invitation. Its queue card offers a deliberate native copy request and a local,
-temporary QR; unavailable data stays visibly unavailable. These experimental
+temporary QR; unavailable data stays visibly unavailable. Experimental host
+controls also offer **Invite** with an explicit one-request confirmation
+when Current supplies the same Jam's private URI. A validated long result stays
+only in memory for the original context and freshness, and can then be copied
+or shown as a QR by the user. Closing the invitation retires it without restoring
+the experimental request allowance. This requires separate authorization for
+the remote test; it does not enable general regeneration or short-link resolution.
+These experimental
 paths still need a real invitation-to-Join test. See the [candidate contract](docs/_reference/jam-host-kernel.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull

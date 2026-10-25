@@ -1496,6 +1496,21 @@ impl Backend {
         self.jam_gate.generation_report()
     }
     #[cfg(feature = "jam-host")]
+    pub(crate) fn jam_generation_invitation(
+        &self,
+        expected: jam::lifecycle::Stamp,
+    ) -> Option<jam::metadata::Invitation> {
+        self.jam_gate.generation_invitation(expected)
+    }
+    #[cfg(feature = "jam-host")]
+    pub(crate) fn with_jam_generation_invitation<T>(
+        &self,
+        expected: jam::lifecycle::Stamp,
+        apply: impl FnOnce(jam::metadata::Invitation) -> T,
+    ) -> Option<T> {
+        self.jam_gate.with_generation_invitation(expected, apply)
+    }
+    #[cfg(feature = "jam-host")]
     pub(crate) fn jam_generation_available(&self, expected: jam::lifecycle::Stamp) -> bool {
         self.jam_gate.generation_available(expected)
     }

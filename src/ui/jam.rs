@@ -209,6 +209,7 @@ fn return_focus(ctx: &egui::Context, key: &'static str, trigger: &'static str) {
 fn invitation(app: &mut App, ui: &mut egui::Ui) {
     if app.jam.invitation().is_none() {
         text(app, ui, "Invitation unavailable");
+        generation_diagnostic(app, ui);
         return;
     }
     button(app, ui, "Invite", true, Intent::OpenInvitation);
@@ -419,7 +420,6 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui, allow_comparison: bool) {
         Intent::DiagnoseCurrent,
     );
     if allow_comparison {
-        generation_diagnostic(app, ui);
         if app.jam.official_open {
             text(
                 app,
@@ -502,7 +502,7 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui, allow_comparison: bool) {
     }
 }
 
-/// Existing diagnostic surface only. Draws controls and emits Actions, no I/O.
+/// Inline explicit invitation generation. Draws controls and emits Actions, no I/O.
 pub(crate) fn generation_diagnostic(app: &mut App, ui: &mut egui::Ui) {
     let view = app
         .jam
@@ -514,7 +514,7 @@ pub(crate) fn generation_diagnostic(app: &mut App, ui: &mut egui::Ui) {
             button(
                 app,
                 ui,
-                "Generate link (experimental H1 test)",
+                "Invite",
                 app.jam.generation_ready,
                 Intent::AskGeneration,
             );
@@ -530,12 +530,12 @@ pub(crate) fn generation_diagnostic(app: &mut App, ui: &mut egui::Ui) {
             text(
                 app,
                 ui,
-                "This H1 test can send at most one POST for this authorization. Preparing session authorization may also use the network. The owned Jam, account, Session and connection must stay fresh and unchanged. No retry or fallback follows a send. Cancelling cannot undo an emitted request. The result is diagnostic only and cannot be shared yet. Keep logging configuration fixed. Run only with separate permission for this experiment.",
+                "Generate an invitation to this Jam? This can send at most one POST for this authorization. Preparing session authorization may also use the network. The owned Jam, account, Session and connection must stay fresh and unchanged. No retry or fallback follows a send. Cancelling cannot undo an emitted request. A validated long link can be shared while this view and its original freshness remain valid. Keep logging configuration fixed. Run only with separate permission for this experiment.",
             );
             button(
                 app,
                 ui,
-                "Run one experimental H1 request",
+                "Generate invitation once",
                 app.jam.generation_ready,
                 Intent::ConfirmGeneration,
             );
@@ -554,7 +554,7 @@ pub(crate) fn generation_diagnostic(app: &mut App, ui: &mut egui::Ui) {
             text(
                 app,
                 ui,
-                "Experimental result only. No invitation is enabled or published.",
+                "Generation does not confirm that anyone joined. Unsupported results cannot be shared.",
             );
             button(
                 app,
@@ -994,6 +994,74 @@ fn join_form(app: &mut App, ctx: &egui::Context) {
 #[cfg(all(test, feature = "demo"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invitation_generation_reuses_card_and_wraps_in_both_themes_without_io() {
+        fn text_shapes<'a>(shape: &'a egui::Shape, result: &mut Vec<&'a egui::epaint::TextShape>) {
+            match shape {
+                egui::Shape::Text(text) => result.push(text),
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| text_shapes(shape, result))
+                }
+                _ => (),
+            }
+        }
+        for palette in [theme::Palette::dark(), theme::Palette::light()] {
+            for width in [280.0, 560.0] {
+                for generated in [false, true] {
+                    let (ctx, mut app) = accessible_app("invitation-generation");
+                    app.locale = crate::i18n::Locale::English;
+                    app.palette = palette;
+                    crate::demo::jam_fixture(&mut app, "jam-invitation");
+                    if generated {
+                        app.jam.invitation_open = true;
+                        app.jam.qr = qrcodegen::QrCode::encode_text(
+                            app.jam.invitation().unwrap(),
+                            qrcodegen::QrCodeEcc::Medium,
+                        )
+                        .ok();
+                    } else {
+                        app.jam.metadata.invitation = None;
+                        app.jam.generation_ready = true;
+                        app.jam.generation = Some(crate::model::jam::GenerationView {
+                            expected: app.jam.stamp,
+                            until: app.jam.fresh_until.unwrap(),
+                            sent: false,
+                            report: None,
+                        });
+                    }
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 900.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| invitation(&mut app, ui),
+                    );
+                    assert!(app.actions.is_empty() && output.platform_output.commands.is_empty());
+                    let mut texts = Vec::new();
+                    output
+                        .shapes
+                        .iter()
+                        .for_each(|shape| text_shapes(&shape.shape, &mut texts));
+                    assert!(texts.iter().any(|text| text.galley.text()
+                        == if generated {
+                            "Copy link"
+                        } else {
+                            "Generate invitation once"
+                        }));
+                    for text in texts {
+                        assert!(!text.galley.text().contains("https://"));
+                        assert!(text.galley.size().x <= width, "wrapped card content");
+                    }
+                    output.textures_delta.clear();
+                    app.backend.shutdown();
+                }
+            }
+        }
+    }
 
     fn accessible_app(name: &str) -> (egui::Context, App) {
         let root =

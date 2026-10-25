@@ -436,17 +436,19 @@ presentation and local actions, not a usable Spotify invitation. Acceptance of
 R02 and the invitation-to-Join-to-same-Jam flow with real members remains J02-12.
 Permissions, moderation, Leave, remote queue edits and audio are separate gates.
 
-## E08B-1 generation experiment
+## E08B-1 H1 invitation candidate (J02-08C)
 
-The queue's existing diagnostic section offers **Generate link (experimental H1
-test)** with an inline confirmation before the experimental `JamGenerate`
+The queue's existing invitation area offers **Invite** with an inline
+**Generate invitation once** confirmation before the experimental `JamGenerate`
 command. Opening it only shows local information. There is no startup or timer
 caller. The confirmation requires separate authorization
 for a remote experiment, a fresh confirmed host snapshot with an explicit
 `join_session_uri`, and the existing verified Session/Connect/Dealer binding.
-It never substitutes the URL or token fields, refreshes Current, or publishes
-an invitation. Its reduced historical request is a hypothesis, not a verified
-Spotify service contract.
+It never substitutes the URL or token fields or refreshes Current. Its reduced
+historical request remains a candidate rather than a stable service contract.
+A human reported Accepted(Long) for the separately authorized H1 experiment;
+this establishes a validated response family in that context, not same-Jam Join
+or audio. That private result was discarded and is never recovered here.
 
 One allowance lasts for the Bridge instance, across gestures and retired
 bindings. The deadline starts before queuing. Login5 and client-token are
@@ -476,8 +478,18 @@ cancellation discard operation buffers; failure does not change membership.
 Closing, hiding or minimizing the diagnostic surface also cancels queued and
 pending work. A stale confirmation cannot dispatch; the button is disabled
 without the backend's explicit URI capability, a fresh host or an unused allowance.
-The bounded response is classified and dropped. Reports contain fixed enums
-and valid-context HTTP status only, with no returned URL, Copy, QR or Join.
+The bounded response is classified and its raw body dropped. A strict long-link
+result is retained as a private RAM-only ShareLink in the operation lease, without
+Debug/Serialize, logs or persistence. Only a matching, finished, live operation
+can supply it to the existing invitation card. The original snapshot TTL (15s)
+and absolute operation deadline (20s) bound presentation too; no server expiry
+is inferred and opening the card never extends either deadline. Copy and QR
+remain deliberate user actions. Copy requests do not claim clipboard delivery.
+Closing the invitation or its management surface, cancellation, expiry, logout,
+or any binding/Jam/role retirement purges the link and QR. No auto-regeneration
+or allowance reset follows. Short results remain classified but unshareable;
+Join's parser and lack of short-link resolution are unchanged. Reports still
+contain only fixed enums and valid-context HTTP status, never the link.
 
 The generation terminal distinguishes `Transport(PrepareHttp)`,
 `Transport(AwaitHeaders(failure))` and `Transport(ReadBody(status))`. Only a failed body

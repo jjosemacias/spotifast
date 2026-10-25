@@ -504,7 +504,40 @@ impl Gate {
         {
             state.generation_report = state.generation_report.map(|_| reason);
         }
+        if state.generation_report != Some(generation::Terminal::Accepted(generation::Family::Long))
+            && !(state.generation_active
+                && state.generation_report == Some(generation::Terminal::Waiting))
+            && let Some(lease) = &state.generation_lease
+        {
+            lease.purge_share();
+        }
         state.generation_report
+    }
+    /// Only a finished, still-live operation can supply private presentation data.
+    pub(crate) fn generation_invitation(&self, expected: Stamp) -> Option<metadata::Invitation> {
+        self.with_generation_invitation(expected, |invitation| invitation)
+    }
+    pub(crate) fn with_generation_invitation<T>(
+        &self,
+        expected: Stamp,
+        apply: impl FnOnce(metadata::Invitation) -> T,
+    ) -> Option<T> {
+        self.generation_report();
+        let state = self.lock();
+        if state.generation_active {
+            return None;
+        }
+        if state.stamp != expected
+            || !state.context_valid()
+            || state.generation_report
+                != Some(generation::Terminal::Accepted(generation::Family::Long))
+        {
+            if let Some(lease) = &state.generation_lease {
+                lease.purge_share();
+            }
+            return None;
+        }
+        Some(apply(state.generation_lease.as_ref()?.invitation()?))
     }
     pub(crate) fn cancel_generation(&self) {
         let mut state = self.lock();
@@ -1209,6 +1242,9 @@ impl Bridge {
                 completed.lease.check().err().unwrap_or(completed.report)
             },
         );
+        if state.generation_report != Some(T::Accepted(generation::Family::Long)) {
+            completed.lease.purge_share();
+        }
         state.waker.wake();
     }
 }

@@ -308,6 +308,11 @@ impl App {
             }
             Intent::CloseInvitation => {
                 self.jam.close_invitation();
+                if self.jam.invitation().is_none() {
+                    ctx.data_mut(|data| {
+                        data.insert_temp(egui::Id::new("jam-management-focus"), true)
+                    });
+                }
                 ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-invitation-return"), true));
                 return;
             }

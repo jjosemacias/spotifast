@@ -208,6 +208,15 @@ fn return_focus(ctx: &egui::Context, key: &'static str, trigger: &'static str) {
 
 fn invitation(app: &mut App, ui: &mut egui::Ui) {
     if app.jam.invitation().is_none() {
+        ui.ctx().data_mut(|data| {
+            for key in [
+                "jam-invitation-return",
+                "jam-qr-return",
+                "jam-invitation-focus",
+            ] {
+                data.remove::<bool>(egui::Id::new(key));
+            }
+        });
         text(app, ui, "Invitation unavailable");
         generation_diagnostic(app, ui);
         return;

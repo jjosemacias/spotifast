@@ -181,13 +181,26 @@ fn sharing_long_is_private_until_finish_copy_qr_are_deliberate_and_close_keeps_c
         Action as UiAction,
         jam::{Intent, UiAction as JamAction},
     };
-    let (runtime, mut worker, fake, mut commands, events) = setup("sharing-long");
-    let (ctx, mut app) = caller_app(&worker, events);
-    runtime.block_on(async {
+    for escape in [false, true] {
+        let (runtime, mut worker, fake, mut commands, events) = setup("sharing-long");
+        let (ctx, mut app) = caller_app(&worker, events);
+        crate::theme::install(&ctx);
+        runtime.block_on(async {
         fake.push(generation_owner());
         request(&mut worker, Action::Current);
         finish(&mut worker, &mut commands).await;
         caller_sync(&mut app, &ctx);
+        let frame = |app: &mut crate::app::App, events| {
+            ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 2400.0))),
+                events,
+                ..Default::default()
+            }, |ui| crate::ui::queue::page(app, ui))
+        };
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
+        let mut output = frame(&mut app, Vec::new());
+        output.textures_delta.clear();
+        let management_focus = ctx.memory(|memory| memory.focused()).expect("live management heading");
         let until = app.jam.fresh_until;
         caller_click(&mut app, &ctx, "Invite");
         caller_apply(&mut app, &ctx);
@@ -229,15 +242,52 @@ fn sharing_long_is_private_until_finish_copy_qr_are_deliberate_and_close_keeps_c
         output.platform_output.commands.clear();
         output.textures_delta.clear();
         assert_eq!(app.jam.notice, Some("Copy requested. Clipboard delivery is unconfirmed."));
-        apply(&mut app, Intent::CloseInvitation, &ctx);
+        let mut output = frame(&mut app, Vec::new());
+        output.textures_delta.clear(); // Settle the invitation's scroll-to-focus before input.
+        let mut output = frame(&mut app, Vec::new());
+        fn close_position(shape: &egui::Shape) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == "Close invitation" => Some(text.pos + text.galley.size() * 0.5),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(close_position),
+                _ => None,
+            }
+        }
+        let close = output.shapes.iter().find_map(|shape| close_position(&shape.shape)).expect("close button drawn");
+        output.textures_delta.clear();
+        let card_focus = ctx.data(|data| data.get_temp::<egui::Id>(egui::Id::new("jam-qr-trigger"))).unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(card_focus));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(card_focus));
+        if escape {
+            let mut output = frame(&mut app, vec![egui::Event::Key {
+                key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+            }]);
+            output.textures_delta.clear();
+        } else {
+            for pressed in [true, false] {
+                let mut output = frame(&mut app, vec![egui::Event::PointerMoved(close), egui::Event::PointerButton {
+                    pos: close, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                }]);
+                output.textures_delta.clear();
+            }
+        }
+        assert!(matches!(app.actions.as_slice(), [UiAction::Jam(JamAction { intent: Intent::CloseInvitation, .. })]));
+        caller_apply(&mut app, &ctx);
         assert!(app.jam.invitation().is_none() && app.jam.qr.is_none());
         assert!(gate.generation_invitation(gate.stamp()).is_none());
+        let mut output = frame(&mut app, Vec::new());
+        assert!(output.platform_output.commands.is_empty() && app.actions.is_empty());
+        output.textures_delta.clear();
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(management_focus), "escape={escape}");
+        for key in ["jam-invitation-return", "jam-qr-return", "jam-invitation-focus", "jam-management-focus"] {
+            assert!(ctx.data(|data| data.get_temp::<bool>(egui::Id::new(key))).is_none(), "consumed {key}");
+        }
         apply(&mut app, Intent::AskGeneration, &ctx);
         apply(&mut app, Intent::ConfirmGeneration, &ctx);
         assert!(app.jam.generation.is_none() && commands.try_recv().is_err());
         assert_eq!(fake.0.generation_posts.load(Ordering::SeqCst), 1);
         assert_eq!(fake.calls(), 1);
     });
+    }
 }
 
 #[test]

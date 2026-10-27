@@ -193,7 +193,9 @@ impl<T: Wire> Kernel<T> {
         observed_gate: &mut Gate,
     ) -> Result<Terminal, Terminal> {
         let check = || {
-            if *intent.cancelled.borrow() {
+            // Dropping the last sender can leave false behind. Detect closure
+            // here too, before a Ready poll can advance another request.
+            if *intent.cancelled.borrow() || intent.cancelled.has_changed().is_err() {
                 return Err(Terminal::Cancelled);
             }
             if Instant::now() >= intent.deadline {

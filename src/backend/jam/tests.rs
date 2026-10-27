@@ -119,6 +119,8 @@ pub(super) enum Step {
     Error(Error),
     Wait(tokio::sync::oneshot::Receiver<Reply>),
     Preparing(tokio::sync::oneshot::Receiver<()>, Reply),
+    PreparingPoll(Box<dyn FnOnce() + Send>, Reply),
+    ReplyPoll(Box<dyn FnOnce() + Send>, Reply),
     Pending,
 }
 
@@ -176,6 +178,13 @@ impl Transport for Fake {
                 .unwrap()
                 .pop_front()
                 .expect("unexpected dispatch");
+            let step = if let Step::PreparingPoll(action, reply) = step {
+                action();
+                permit()?;
+                Step::Reply(reply)
+            } else {
+                step
+            };
             if let Step::Preparing(receiver, reply) = step {
                 receiver.await.map_err(|_| Error::Transport)?;
                 permit()?;
@@ -189,10 +198,14 @@ impl Transport for Fake {
             self.calls.lock().unwrap().push(dispatch.operation);
             match step {
                 Step::Reply(reply) => Ok(reply),
+                Step::ReplyPoll(action, reply) => {
+                    action();
+                    Ok(reply)
+                }
                 Step::Error(error) => Err(error),
                 Step::Wait(receiver) => receiver.await.map_err(|_| Error::Transport),
                 Step::Pending => std::future::pending().await,
-                Step::Preparing(_, _) => unreachable!(),
+                Step::Preparing(_, _) | Step::PreparingPoll(_, _) => unreachable!(),
             }
         })
     }
@@ -219,6 +232,13 @@ impl resume::Wire for Fake {
                 .unwrap()
                 .pop_front()
                 .expect("unexpected exchange");
+            let step = if let Step::PreparingPoll(action, reply) = step {
+                action();
+                permit()?;
+                Step::Reply(reply)
+            } else {
+                step
+            };
             let step = if let Step::Preparing(receiver, reply) = step {
                 receiver.await.map_err(|_| resume::Terminal::Preparation)?;
                 permit()?;
@@ -236,10 +256,14 @@ impl resume::Wire for Fake {
             }
             match step {
                 Step::Reply(reply) => Ok(reply),
+                Step::ReplyPoll(action, reply) => {
+                    action();
+                    Ok(reply)
+                }
                 Step::Error(_) => Err(resume::Terminal::Transport),
                 Step::Wait(receiver) => receiver.await.map_err(|_| resume::Terminal::Transport),
                 Step::Pending => std::future::pending().await,
-                Step::Preparing(_, _) => unreachable!(),
+                Step::Preparing(_, _) | Step::PreparingPoll(_, _) => unreachable!(),
             }
         })
     }

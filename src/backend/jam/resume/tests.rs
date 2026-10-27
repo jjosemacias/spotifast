@@ -573,3 +573,115 @@ async fn preparation_failure_is_not_sent_and_does_not_renew_grant() {
     );
     assert_eq!(fake.count(), 0);
 }
+
+#[tokio::test]
+async fn drop_handle_during_preparation_poll_blocks_current_and_social_dispatch() {
+    for social in [false, true] {
+        let fake = Fake::new(if social {
+            vec![current(true.into())]
+        } else {
+            vec![]
+        });
+        let authorization = Authorization::explicitly_authorized();
+        let kernel = Kernel::new(Arc::clone(&fake), Profile::ObservedFourFields);
+        let slots = budget();
+        let (intent, cancel) = kernel
+            .experimental_resume_intent(&authorization, paused())
+            .unwrap();
+        let closed = intent.cancelled.clone();
+        // This callback runs inside the preparation's poll, after select's
+        // changed() branch was Pending, and returns Ready without yielding.
+        fake.push(Step::PreparingPoll(
+            Box::new(move || drop(cancel)),
+            if social {
+                status(200)
+            } else {
+                current(true.into())
+            },
+        ));
+        fake.push(Step::Reply(status(200))); // Lets the unfixed path finish too.
+        let result = kernel.experimental_resume(intent, Arc::clone(&slots)).await;
+        assert!(
+            !*closed.borrow(),
+            "Drop must not be replaced by an explicit bool write"
+        );
+        assert!(closed.has_changed().is_err());
+        assert_eq!(
+            result,
+            Outcome {
+                terminal: Terminal::Cancelled,
+                gate: Gate::Unknown,
+                current_possible: social,
+                post_possible: false
+            }
+        );
+        assert_eq!((fake.count(), fake.writes()), (usize::from(social), 0));
+        assert_eq!(slots.available_permits(), 1);
+        assert!(kernel.gate.try_lock().is_ok());
+        let (again, _cancel) = kernel
+            .experimental_resume_intent(&authorization, paused())
+            .unwrap();
+        assert_eq!(
+            kernel.experimental_resume(again, slots).await.terminal,
+            Terminal::Exhausted
+        );
+        assert_eq!(fake.count(), usize::from(social));
+    }
+}
+
+#[tokio::test]
+async fn drop_handle_during_reply_poll_discards_retired_current_and_post_results() {
+    for social in [false, true] {
+        let fake = Fake::new(if social {
+            vec![current(true.into())]
+        } else {
+            vec![]
+        });
+        let authorization = Authorization::explicitly_authorized();
+        let kernel = Kernel::new(Arc::clone(&fake), Profile::ObservedFourFields);
+        let slots = budget();
+        let (intent, cancel) = kernel
+            .experimental_resume_intent(&authorization, paused())
+            .unwrap();
+        let closed = intent.cancelled.clone();
+        // The request boundary was crossed; retire the surface inside the
+        // response poll immediately before returning its successful reply.
+        fake.push(Step::ReplyPoll(
+            Box::new(move || drop(cancel)),
+            if social {
+                status(200)
+            } else {
+                current(true.into())
+            },
+        ));
+        fake.push(Step::Reply(status(200)));
+        let result = kernel.experimental_resume(intent, Arc::clone(&slots)).await;
+        assert!(!*closed.borrow());
+        assert!(closed.has_changed().is_err());
+        assert_eq!(
+            result,
+            Outcome {
+                terminal: Terminal::Cancelled,
+                gate: Gate::Unknown,
+                current_possible: true,
+                post_possible: social
+            }
+        );
+        let expected_calls = 1 + usize::from(social);
+        assert_eq!(
+            (fake.count(), fake.writes()),
+            (expected_calls, usize::from(social))
+        );
+        assert!(matches!(kernel.snapshot().membership, Membership::Unknown));
+        assert_eq!(slots.available_permits(), 1);
+        assert!(kernel.gate.try_lock().is_ok());
+        let (again, _cancel) = kernel
+            .experimental_resume_intent(&authorization, paused())
+            .unwrap();
+        assert_eq!(
+            kernel.experimental_resume(again, slots).await.terminal,
+            Terminal::Exhausted
+        );
+        assert_eq!(fake.count(), expected_calls);
+    }
+}

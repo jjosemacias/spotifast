@@ -5990,6 +5990,7 @@ dependencies = [
  "tiny-skia",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "unicode-bidi",
  "urlencoding",
  "windows-native-keyring-store",

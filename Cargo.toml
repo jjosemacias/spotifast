@@ -25,6 +25,9 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
+# The isolated Jam experiment refuses an active tracing subscriber before auth.
+# Already used transitively by the Session HTTP stack; no new runtime/logger.
+tracing = { version = "0.1", optional = true }
 directories = "6"
 # One protected-store API, with only each target's native provider below.
 # Durable Spotify grants must not be copied into ordinary state JSON.
@@ -247,7 +250,7 @@ default = ["milkdrop"]
 # Sample data and screenshot flags; never part of a release build.
 demo = []
 # Experimental host UI in Connect. Deliberate reads/writes only; off by default.
-jam-host = ["dep:http-body-util", "dep:qrcodegen", "dep:hyper", "dep:h2", "dep:bytes", "dep:hyper-rustls", "dep:hyper-proxy2", "dep:tokio-rustls"]
+jam-host = ["dep:http-body-util", "dep:qrcodegen", "dep:hyper", "dep:h2", "dep:bytes", "dep:hyper-rustls", "dep:hyper-proxy2", "dep:tokio-rustls", "dep:tracing"]
 # MilkDrop, through libprojectM: a C++ library that CMake builds into the
 # binary at compile time, so building needs cmake, a C++ compiler, and
 # libclang. `--no-default-features` leaves it out.

@@ -11,6 +11,7 @@ pub mod lifecycle;
 mod link;
 pub mod metadata;
 mod projection;
+pub mod resume;
 pub use link::Link;
 
 use std::future::Future;
@@ -467,6 +468,7 @@ fn success(reply: &Reply) -> Result<(), Error> {
 }
 
 struct Read {
+    resume_gate: resume::Gate,
     generation_uri: Option<generation::JoinUri>,
     membership: Membership,
     metadata: metadata::Metadata,
@@ -497,6 +499,7 @@ fn read_reply_observed(
     }
     if reply.status == StatusCode::NOT_FOUND.as_u16() {
         return Ok(Read {
+            resume_gate: resume::Gate::Unknown,
             generation_uri: None,
             membership: Membership::Absent,
             metadata: Default::default(),
@@ -533,8 +536,10 @@ fn read_reply_observed(
     let metadata =
         metadata::snapshot_observed(&root, diagnostic).map_err(classify(Schema::Metadata))?;
     let generation_uri = generation::JoinUri::capture(&root);
+    let resume_gate = resume::Gate::capture(&root);
     let projection = projection::from_value(root).map_err(classify(Schema::Projection))?;
     Ok(Read {
+        resume_gate,
         generation_uri,
         membership: Membership::Present(projection),
         metadata,
@@ -577,6 +582,8 @@ impl State {
 
 /// No background task or automatic reads. Invoke explicitly on the backend runtime.
 pub struct Kernel<T: Transport> {
+    // Identity for experimental gestures, not a product playback restriction.
+    resume_identity: Arc<()>,
     transport: Arc<T>,
     profile: Profile,
     gate: AsyncMutex<()>,
@@ -719,6 +726,7 @@ impl<T: Transport> Kernel<T> {
     }
     pub fn new(transport: Arc<T>, profile: Profile) -> Self {
         Self {
+            resume_identity: Arc::new(()),
             transport,
             profile,
             gate: AsyncMutex::new(()),

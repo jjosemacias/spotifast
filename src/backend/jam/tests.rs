@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use super::*;
 
-fn context() -> Context {
+pub(super) fn context() -> Context {
     Context {
         account: "synthetic-account".into(),
         device: "synthetic device&?".into(),
@@ -11,7 +11,7 @@ fn context() -> Context {
     }
 }
 
-fn session(id: &str, owner: bool) -> Reply {
+pub(super) fn session(id: &str, owner: bool) -> Reply {
     Reply {
         status: 200,
         content_type: None,
@@ -23,7 +23,7 @@ fn session(id: &str, owner: bool) -> Reply {
     }
 }
 
-fn status(status: u16) -> Reply {
+pub(super) fn status(status: u16) -> Reply {
     Reply {
         status,
         content_type: None,
@@ -114,7 +114,7 @@ async fn metadata_late_reply_cannot_restore_a_retired_binding() {
     assert!(kernel.snapshot().metadata.invitation.is_none());
 }
 
-enum Step {
+pub(super) enum Step {
     Reply(Reply),
     Error(Error),
     Wait(tokio::sync::oneshot::Receiver<Reply>),
@@ -122,33 +122,36 @@ enum Step {
     Pending,
 }
 
-struct Fake {
-    context: Mutex<Option<Context>>,
+pub(super) struct Fake {
+    resume_posts: std::sync::atomic::AtomicUsize,
+    pub(super) context: Mutex<Option<Context>>,
     steps: Mutex<VecDeque<Step>>,
     calls: Mutex<Vec<Operation>>,
 }
 
 impl Fake {
-    fn new(replies: Vec<Reply>) -> Arc<Self> {
+    pub(super) fn new(replies: Vec<Reply>) -> Arc<Self> {
         Arc::new(Self {
+            resume_posts: std::sync::atomic::AtomicUsize::new(0),
             context: Mutex::new(Some(context())),
             steps: Mutex::new(replies.into_iter().map(Step::Reply).collect()),
             calls: Mutex::new(Vec::new()),
         })
     }
-    fn push(&self, step: Step) {
+    pub(super) fn push(&self, step: Step) {
         self.steps.lock().unwrap().push_back(step);
     }
-    fn count(&self) -> usize {
-        self.calls.lock().unwrap().len()
+    pub(super) fn count(&self) -> usize {
+        self.calls.lock().unwrap().len() + self.resume_posts.load(Ordering::SeqCst)
     }
-    fn writes(&self) -> usize {
+    pub(super) fn writes(&self) -> usize {
         self.calls
             .lock()
             .unwrap()
             .iter()
             .filter(|op| **op != Operation::Current)
             .count()
+            + self.resume_posts.load(Ordering::SeqCst)
     }
 }
 
@@ -188,6 +191,53 @@ impl Transport for Fake {
                 Step::Reply(reply) => Ok(reply),
                 Step::Error(error) => Err(error),
                 Step::Wait(receiver) => receiver.await.map_err(|_| Error::Transport),
+                Step::Pending => std::future::pending().await,
+                Step::Preparing(_, _) => unreachable!(),
+            }
+        })
+    }
+}
+
+// Reuse Jam's existing reply/preparation/wait/error fake steps. Resume has its
+// own counter, without pretending it is an existing Jam operation.
+impl resume::Wire for Fake {
+    fn exchange<'a>(
+        &'a self,
+        exchange: &'a resume::Exchange,
+        expected: &'a Context,
+        possible: &'a AtomicBool,
+        permit: resume::Permit<'a>,
+    ) -> resume::WireResponse<'a> {
+        Box::pin(async move {
+            permit()?;
+            if self.context().ok().as_ref() != Some(expected) {
+                return Err(resume::Terminal::Invalidated);
+            }
+            let step = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected exchange");
+            let step = if let Step::Preparing(receiver, reply) = step {
+                receiver.await.map_err(|_| resume::Terminal::Preparation)?;
+                permit()?;
+                Step::Reply(reply)
+            } else {
+                step
+            };
+            permit()?;
+            possible.store(true, Ordering::SeqCst);
+            match exchange {
+                resume::Exchange::Current => self.calls.lock().unwrap().push(Operation::Current),
+                resume::Exchange::Social { .. } => {
+                    self.resume_posts.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            match step {
+                Step::Reply(reply) => Ok(reply),
+                Step::Error(_) => Err(resume::Terminal::Transport),
+                Step::Wait(receiver) => receiver.await.map_err(|_| resume::Terminal::Transport),
                 Step::Pending => std::future::pending().await,
                 Step::Preparing(_, _) => unreachable!(),
             }

@@ -1189,7 +1189,7 @@ impl App {
     /// media controls keep running until Show or Quit.
     pub fn window_gone(&mut self) {
         #[cfg(feature = "jam-host")]
-        self.backend.cancel_jam_resume();
+        self.backend.dismiss_jam_resume();
         #[cfg(feature = "jam-host")]
         self.cancel_generation_view();
         self.winamp.forget_textures();
@@ -10239,7 +10239,7 @@ impl App {
             }
             Action::SignOut => {
                 #[cfg(feature = "jam-host")]
-                self.backend.cancel_jam_resume();
+                self.backend.dismiss_jam_resume();
                 self.backend.send(Command::SignOut);
                 self.history = vec![Page::Home];
                 self.history_index = 0;

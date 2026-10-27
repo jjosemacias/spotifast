@@ -3553,3 +3553,217 @@ fn resume_ui_gesture_is_single_use_before_queue_and_window_retirement_cancels() 
         assert!(commands.try_recv().is_err());
     });
 }
+
+#[test]
+fn resume_playing_http_and_retirement_keep_terminal_through_manual_current() {
+    for case in 0..8 {
+        let (rt, mut worker, fake, mut commands, events) = setup("resume-terminal-recovery");
+        rt.block_on(async {
+            tokio::time::pause();
+            let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+            let playback = Arc::new(Mutex::new(crate::player::Playback::Paused));
+            let live = playback.clone();
+            gate.lock().paused =
+                Arc::new(move || *live.lock().unwrap() == crate::player::Playback::Paused);
+            fake.push(resume_current());
+            let (headers, receive) = tokio::sync::oneshot::channel();
+            fake.0.steps.lock().unwrap().push_back(Step::Wait(receive));
+            let intent = gate.capture_resume(gate.stamp(), Instant::now()).unwrap();
+            worker.resume_jam(intent);
+            resume_settle().await;
+            assert_eq!(
+                gate.resume_report(gate.stamp()),
+                Some(ResumeReport::Observing)
+            );
+            if case < 6 {
+                *playback.lock().unwrap() = crate::player::Playback::Playing;
+            }
+            match case {
+                1 | 6 => {
+                    let _ = headers.send(empty(200));
+                }
+                2 | 7 => {
+                    let _ = headers.send(empty(403));
+                }
+                3 => drop(headers),
+                4 => {
+                    gate.cancel_resume();
+                    drop(headers);
+                }
+                5 => {
+                    gate.signal(gate.stamp().engine, Notice::Jam);
+                    drop(headers);
+                }
+                _ => { /* HTTP remains pending even after Playing. */ }
+            }
+            resume_settle().await;
+            tokio::time::advance(std::time::Duration::from_millis(10001)).await;
+            resume_settle().await;
+            {
+                let state = gate
+                    .0
+                    .try_lock()
+                    .expect("no Shared lock held by observation");
+                assert!(!state.resume_active && !state.resume_running, "case={case}");
+                assert!(state.resume_used);
+            }
+            assert!(
+                gate.resume_report(gate.stamp()).is_some(),
+                "retired terminal visible, case={case}"
+            );
+            assert!(!matches!(
+                gate.resume_report(gate.stamp()),
+                Some(ResumeReport::Waiting | ResumeReport::Observing)
+            ));
+            // A manual read is allowed after dispatch/observation. It cannot replay Resume.
+            fake.push(owner());
+            request(&mut worker, Action::Current);
+            finish(&mut worker, &mut commands).await;
+            assert_eq!(
+                fake.calls(),
+                3,
+                "one setup, one experiment, one manual read"
+            );
+            assert_eq!(fake.0.resume_posts.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                latest(&events).phase,
+                Phase::Complete(Kind::Current)
+            ));
+            assert!(matches!(
+                latest(&events).snapshot.membership,
+                Membership::Present(_)
+            ));
+            assert!(
+                gate.resume_report(gate.stamp()).is_some(),
+                "reading must not erase terminal, case={case}"
+            );
+            assert!(matches!(
+                gate.capture_resume(gate.stamp(), Instant::now()),
+                Err(resume::Terminal::Exhausted)
+            ));
+            if case != 6 {
+                assert!(gate.write_uncertain());
+            }
+            if case == 6 {
+                // A completed HTTP receipt also retires monotonically when a
+                // getter changes before notice, even if its value returns.
+                fake.0.context.lock().unwrap().connection = "transient".into();
+                assert!(matches!(
+                    gate.resume_report(gate.stamp()),
+                    Some(ResumeReport::Retired {
+                        post_possible: true
+                    })
+                ));
+                fake.0.context.lock().unwrap().connection = "connection-a".into();
+                assert!(matches!(
+                    gate.resume_report(gate.stamp()),
+                    Some(ResumeReport::Retired {
+                        post_possible: true
+                    })
+                ));
+            }
+        });
+    }
+}
+
+#[test]
+fn resume_uncertain_manual_read_reports_observed_presence_without_authority() {
+    let (rt, mut worker, fake, mut commands, events) = setup("resume-read-projection");
+    rt.block_on(async {
+        let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+        gate.lock().write_uncertain.store(true, Ordering::SeqCst);
+        fake.push(owner());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        let mut model = crate::model::jam::State::default();
+        assert!(model.observe(&latest(&events), gate.stamp()));
+        assert!(matches!(model.membership, Membership::Present(_)));
+        assert_eq!(model.error, Some(Error::WriteUncertain));
+        assert!(model.reconcile && !model.fresh() && model.owner_id().is_none());
+        assert!(!model.can_create());
+        assert!(
+            model
+                .notice
+                .is_some_and(|text| text.starts_with("Last check: Jam present."))
+        );
+        assert!(
+            gate.write_uncertain(),
+            "a read never resolves an uncertain mutation"
+        );
+        assert_eq!(fake.0.resume_posts.load(Ordering::SeqCst), 0);
+        // A later failed read must not inherit the previous successful caption.
+        fake.push(empty(500));
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        assert!(model.observe(&latest(&events), gate.stamp()));
+        assert!(model.notice.is_none());
+        assert!(model.reconcile && !model.fresh());
+        assert!(gate.write_uncertain());
+    });
+}
+
+#[test]
+fn resume_context_retirement_survives_ui_sync_but_not_surface_or_engine_replacement() {
+    let (rt, mut worker, fake, mut commands, events) = setup("resume-retired-ui");
+    let (ctx, mut app) = caller_app(&worker, events);
+    app.backend.jam_resume_mode = true;
+    rt.block_on(async {
+        tokio::time::pause();
+        let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+        caller_sync(&mut app, &ctx);
+        fake.push(resume_current());
+        let (_headers, receive) = tokio::sync::oneshot::channel();
+        fake.0.steps.lock().unwrap().push_back(Step::Wait(receive));
+        let intent = gate.capture_resume(gate.stamp(), Instant::now()).unwrap();
+        worker.resume_jam(intent);
+        resume_settle().await;
+        fake.0.context.lock().unwrap().connection = "connection-b".into();
+        tokio::time::advance(std::time::Duration::from_millis(10001)).await;
+        resume_settle().await;
+        assert!(!gate.lock().resume_active);
+        assert!(gate.lock().resume_report.is_some());
+        // Getter changed before its notice. UI sync must cancel, not erase the receipt.
+        caller_sync(&mut app, &ctx);
+        assert!(
+            app.backend
+                .jam_resume_report(app.backend.jam_stamp())
+                .is_some()
+        );
+        gate.signal(
+            gate.stamp().engine,
+            Notice::Connection(Some("connection-b".into())),
+        );
+        caller_sync(&mut app, &ctx);
+        assert!(
+            app.backend
+                .jam_resume_report(app.backend.jam_stamp())
+                .is_some()
+        );
+        fake.push(owner());
+        request(&mut worker, Action::Current);
+        finish(&mut worker, &mut commands).await;
+        caller_sync(&mut app, &ctx);
+        assert!(
+            app.backend
+                .jam_resume_report(app.backend.jam_stamp())
+                .is_some()
+        );
+        assert!(
+            app.jam
+                .notice
+                .is_some_and(|text| text.starts_with("Last check: Jam present."))
+        );
+        assert!(app.jam.reconcile && !app.jam.fresh() && app.jam.owner_id().is_none());
+        assert!(gate.write_uncertain());
+        assert_eq!(
+            (fake.calls(), fake.0.resume_posts.load(Ordering::SeqCst)),
+            (3, 1)
+        );
+        // Scope retirement cannot publish a receipt into a replacement engine.
+        worker.jam.retire(gate.stamp().account, Cause::Engine);
+        assert!(gate.resume_report(gate.stamp()).is_none());
+        app.window_gone();
+        assert!(gate.lock().resume_report.is_none());
+        assert!(gate.lock().resume_used);
+    });
+}

@@ -107,10 +107,10 @@ impl App {
     }
 
     pub(super) fn sync_resume_view(&self, ctx: &egui::Context) {
-        if !self.resume_surface_visible(ctx)
-            || !self.backend.jam_context_valid(self.backend.jam_stamp())
-        {
-            self.backend.cancel_jam_resume();
+        if !self.resume_surface_visible(ctx) {
+            self.backend.dismiss_jam_resume();
+        } else if !self.backend.jam_context_valid(self.backend.jam_stamp()) {
+            self.backend.retire_jam_resume();
         }
     }
 

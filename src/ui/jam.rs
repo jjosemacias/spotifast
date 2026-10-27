@@ -456,13 +456,29 @@ fn resume_controls(
     }
     if let Some(report) = report {
         ui.add(egui::Label::new(format!("resume={report:?}")).wrap());
-        button(
-            app,
-            ui,
-            "Stop Resume observation",
-            true,
-            Intent::CancelResume,
-        );
+        if matches!(
+            report,
+            crate::backend::jam::lifecycle::ResumeReport::Waiting
+                | crate::backend::jam::lifecycle::ResumeReport::Observing
+        ) {
+            button(
+                app,
+                ui,
+                "Stop Resume observation",
+                true,
+                Intent::CancelResume,
+            );
+        }
+        if matches!(
+            report,
+            crate::backend::jam::lifecycle::ResumeReport::Retired { .. }
+        ) {
+            text(
+                app,
+                ui,
+                "Attempt retired. No HTTP conclusion is retained. A possible POST is not undone; do not retry.",
+            );
+        }
     }
     text(
         app,
@@ -1082,6 +1098,9 @@ mod tests {
                     None,
                     Some(ResumeReport::Waiting),
                     Some(ResumeReport::Observing),
+                    Some(ResumeReport::Retired {
+                        post_possible: true,
+                    }),
                     Some(ResumeReport::Finished(Outcome {
                         terminal: Terminal::Http(403),
                         gate: Gate::Unknown,
@@ -1117,6 +1136,16 @@ mod tests {
                             .text()
                             .contains("HTTP acceptance does not establish")
                     }));
+                    let stop_visible = found
+                        .iter()
+                        .any(|s| s.galley.text() == "Stop Resume observation");
+                    assert_eq!(
+                        stop_visible,
+                        matches!(
+                            report,
+                            Some(ResumeReport::Waiting | ResumeReport::Observing)
+                        )
+                    );
                     assert!(found.iter().all(|s| s.galley.size().x <= width));
                     assert!(app.actions.is_empty() && output.platform_output.commands.is_empty());
                     output.textures_delta.clear();

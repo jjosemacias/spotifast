@@ -4,6 +4,10 @@ use crate::backend::jam::{
     lifecycle::{Event, Kind, Phase, Stamp},
 };
 
+const OBSERVED_PRESENT: &str =
+    "Last check: Jam present. A previous change is still uncertain; Jam changes remain blocked.";
+const OBSERVED_ABSENT: &str = "Last check: no Jam reported. A previous change is still uncertain; Jam changes remain blocked.";
+
 #[derive(Clone)]
 pub enum Intent {
     Resume(tokio::time::Instant),
@@ -287,13 +291,31 @@ impl State {
             if !same_context || !matches!(event.snapshot.membership, Membership::Unknown) {
                 self.membership = event.snapshot.membership.clone();
             }
-            self.notice = if matches!(event.phase, Phase::Complete(Kind::End))
+            // Only the observation just delivered may supply this caption.
+            let previous_notice = self
+                .notice
+                .take()
+                .filter(|notice| !matches!(*notice, OBSERVED_PRESENT | OBSERVED_ABSENT));
+            self.notice = if matches!(event.phase, Phase::Complete(Kind::Current))
+                && self.error == Some(Error::WriteUncertain)
+                && event.snapshot.fresh_until.is_some()
+            {
+                match &event.snapshot.membership {
+                    Membership::Present(_) => Some(
+                        "Last check: Jam present. A previous change is still uncertain; Jam changes remain blocked.",
+                    ),
+                    Membership::Absent => Some(
+                        "Last check: no Jam reported. A previous change is still uncertain; Jam changes remain blocked.",
+                    ),
+                    Membership::Unknown => None,
+                }
+            } else if matches!(event.phase, Phase::Complete(Kind::End))
                 && self.error.is_none()
                 && matches!(self.membership, Membership::Absent)
             {
                 Some("You no longer participate in this Jam. Its state for others is unconfirmed.")
             } else {
-                self.notice.take()
+                previous_notice
             };
         }
         if self.fresh() && matches!(event.snapshot.membership, Membership::Present(_)) {

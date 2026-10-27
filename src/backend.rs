@@ -1527,6 +1527,14 @@ impl Backend {
         self.jam_gate.cancel_resume();
     }
     #[cfg(feature = "jam-host")]
+    pub fn retire_jam_resume(&self) {
+        self.jam_gate.retire_resume();
+    }
+    #[cfg(feature = "jam-host")]
+    pub fn dismiss_jam_resume(&self) {
+        self.jam_gate.dismiss_resume();
+    }
+    #[cfg(feature = "jam-host")]
     pub fn jam_resume_report(
         &self,
         expected: jam::lifecycle::Stamp,

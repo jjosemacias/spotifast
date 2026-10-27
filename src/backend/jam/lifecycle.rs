@@ -375,8 +375,13 @@ pub enum ResumeReport {
     Waiting,
     Observing,
     Finished(resume::Outcome),
-    Cancelled,
-    Invalidated,
+    Cancelled {
+        post_possible: bool,
+    },
+    /// Fixed receipt only: retired HTTP/gate/membership are not deliverable.
+    Retired {
+        post_possible: bool,
+    },
 }
 
 type Factory = Arc<dyn Fn(watch::Receiver<u64>) -> Result<Arc<dyn Host>, Error> + Send + Sync>;
@@ -446,6 +451,26 @@ struct Shared {
 }
 
 impl Shared {
+    fn resume_post_possible(&self) -> bool {
+        self.resume_boundary
+            .as_ref()
+            .is_some_and(|b| b.borrow().is_some())
+    }
+    fn retire_resume(&mut self) {
+        let source = self.resume_report.map(|(stamp, _)| stamp);
+        let report = ResumeReport::Retired {
+            post_possible: self.resume_post_possible(),
+        };
+        self.cancel_resume(report);
+        // Retirement is sticky even after the dispatch task already finished.
+        // Preserve receipt provenance, never retag it as current authority.
+        if let Some(source) = source
+            && self.resume_report != Some((source, report))
+        {
+            self.resume_report = Some((source, report));
+            self.waker.wake();
+        }
+    }
     fn cancel_resume(&mut self, report: ResumeReport) {
         if let Some(cancel) = self.resume_cancel.take() {
             cancel.cancel();
@@ -492,7 +517,7 @@ impl Shared {
     }
 
     fn invalidate(&mut self, cause: Cause) {
-        self.cancel_resume(ResumeReport::Invalidated);
+        self.retire_resume();
         if let Some((cancelled, _)) = self.generation_queued.take() {
             cancelled.store(true, Ordering::SeqCst);
             self.generation_report = Some(generation::Terminal::Invalidated);
@@ -594,33 +619,57 @@ impl Gate {
     }
     pub(crate) fn cancel_resume(&self) {
         let mut state = self.lock();
-        if state.resume_cancel.is_none() && !state.resume_active {
-            if state.resume_report.take().is_some() {
-                state.waker.wake();
-            }
-        } else {
-            state.cancel_resume(ResumeReport::Cancelled);
+        let report = ResumeReport::Cancelled {
+            post_possible: state.resume_post_possible(),
+        };
+        state.cancel_resume(report);
+    }
+    pub(crate) fn retire_resume(&self) {
+        self.lock().retire_resume();
+    }
+    /// Surface withdrawal discards presentation, never the consumed allowance.
+    pub(crate) fn dismiss_resume(&self) {
+        let mut state = self.lock();
+        let report = ResumeReport::Cancelled {
+            post_possible: state.resume_post_possible(),
+        };
+        state.cancel_resume(report);
+        if state.resume_report.take().is_some() {
+            state.waker.wake();
         }
     }
     pub(crate) fn resume_report(&self, expected: Stamp) -> Option<ResumeReport> {
-        let state = self.lock();
-        let (stamp, report) = state.resume_report?;
-        if stamp != expected || state.stamp != expected || !state.context_valid() {
+        let mut state = self.lock();
+        let (source, report) = state.resume_report?;
+        // Never deliver into an old view or another account/engine. A receipt
+        // has no membership authority and can survive an ordinary read's op++.
+        if state.stamp != expected
+            || source.account != expected.account
+            || source.engine != expected.engine
+            || !(state.verify)()
+        {
             return None;
         }
-        Some(
-            if state.resume_active
-                && state.resume_cancel.is_some()
-                && state
-                    .resume_boundary
-                    .as_ref()
-                    .is_some_and(|b| b.borrow().is_some())
-            {
+        let post_possible = state.resume_post_possible();
+        let retired = ResumeReport::Retired { post_possible };
+        if source.revision != expected.revision
+            || !state.context_valid()
+            || (source.operation != expected.operation
+                && matches!(report, ResumeReport::Waiting | ResumeReport::Observing))
+        {
+            state.retire_resume();
+            return Some(retired);
+        }
+        Some(match report {
+            ResumeReport::Finished(_) => report,
+            ResumeReport::Cancelled { .. } => ResumeReport::Cancelled { post_possible },
+            ResumeReport::Retired { .. } => retired,
+            _ if source != expected => retired,
+            _ if state.resume_active && state.resume_cancel.is_some() && post_possible => {
                 ResumeReport::Observing
-            } else {
-                report
-            },
-        )
+            }
+            _ => report,
+        })
     }
 
     /// Local capability bit only; never exposes the private URI to presentation.
@@ -1048,7 +1097,7 @@ impl Bridge {
             || state.resume_cancel.is_none()
             || !state.resume_active
         {
-            state.cancel_resume(ResumeReport::Invalidated);
+            state.retire_resume();
             state.resume_active = false;
             return;
         }

@@ -124,3 +124,26 @@ Cancellation can occur after possible POST: STOP, without another attempt.
 Review/build/prestate/human I/O permissions remain separate. The planning
 handoff records exact offline commands, tests and the future human protocol.
 This caller does not implement creation, joining or prestate audio preparation.
+
+## Retired receipts and manual reads
+
+A Jam/connection retirement within the same account and engine retains only a
+fixed `Retired { post_possible }` diagnostic. It cannot retain an HTTP conclusion,
+gate, membership or dispatch permission. Retirement is monotonic, including a
+getter change before its notice. A completed receipt can survive an ordinary
+manual Current's operation increment; that is a historical attempt result, not
+current Jam authority. Account/engine withdrawal or closing the diagnostic
+surface removes presentation. Stopping an active attempt retains a sanitized
+cancelled receipt; Stop is shown only while Waiting/Observing. None of these
+paths replenish the captured attempt or Authorization.
+
+The ten-second POST-boundary timer, owned auth future and cooperative fences
+are unchanged. Playing while headers remain pending can invalidate the attempt,
+but does not create an infinite observation. No automatic Current is added.
+A separately requested Current can finish after observation even when a prior
+POST remains uncertain. Its valid Presence is shown as `Last check: Jam present`
+(or no Jam reported), while membership authority, metadata and mutations stay
+blocked by the existing reconciliation/uncertainty policy. A read does not prove
+an earlier mutation finished and never clears that uncertainty. This correction
+does not establish catch-up or synchronization and does not change endpoint,
+authentication, invitation parsing or the social command body.

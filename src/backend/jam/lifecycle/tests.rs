@@ -10,6 +10,7 @@ enum Step {
     Wait(tokio::sync::oneshot::Receiver<Reply>),
 }
 struct FakeState {
+    resume_posts: AtomicUsize,
     generation_prepares: AtomicUsize,
     generation_posts: AtomicUsize,
     generation_auth_fail: AtomicBool,
@@ -27,6 +28,7 @@ struct Fake(Arc<FakeState>);
 impl Fake {
     fn new(account: &str) -> Self {
         Self(Arc::new(FakeState {
+            resume_posts: AtomicUsize::new(0),
             generation_prepares: AtomicUsize::new(0),
             generation_posts: AtomicUsize::new(0),
             generation_auth_fail: AtomicBool::new(false),
@@ -132,6 +134,38 @@ impl Transport for Fake {
             match step {
                 Step::Reply(reply) => Ok(reply),
                 Step::Wait(receiver) => receiver.await.map_err(|_| Error::Transport),
+            }
+        })
+    }
+}
+
+impl resume::Wire for Fake {
+    fn exchange<'a>(
+        &'a self,
+        exchange: &'a resume::Exchange,
+        _: &'a Context,
+        possible: &'a resume::Boundary,
+        permit: resume::Permit<'a>,
+    ) -> resume::WireResponse<'a> {
+        Box::pin(async move {
+            permit()?;
+            possible.mark();
+            match exchange {
+                resume::Exchange::Current => self.0.calls.lock().unwrap().push(Operation::Current),
+                resume::Exchange::Social { .. } => {
+                    self.0.resume_posts.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let step = self
+                .0
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected resume request");
+            match step {
+                Step::Reply(reply) => Ok(reply),
+                Step::Wait(wait) => wait.await.map_err(|_| resume::Terminal::Transport),
             }
         })
     }
@@ -2076,6 +2110,7 @@ fn listeners_are_reserved_on_the_real_dealer_before_spirc_launch_and_do_not_clai
         worker.session.subscribe(),
         Arc::clone(&worker.api),
         Arc::clone(&worker.background_session),
+        Arc::new(|| false),
     );
     assert!(worker.jam.gate.lock().listening);
     assert!(latest(&events).snapshot.membership == Membership::Unknown);
@@ -2114,6 +2149,7 @@ fn failed_listener_reservation_remains_blocked_when_connection_later_becomes_rea
         worker.session.subscribe(),
         Arc::clone(&worker.api),
         Arc::clone(&worker.background_session),
+        Arc::new(|| false),
     );
     session.set_connection_id("synthetic-later-connection");
     let probe = diagnose(&mut worker);
@@ -3259,4 +3295,261 @@ fn official_visibility_and_getter_loss_purge_native_input_before_actions_and_sea
             assert!(sent.try_recv().is_err());
         });
     }
+}
+
+fn resume_current() -> Reply {
+    let mut reply = owner();
+    let mut body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    body["redirectCommands"] = serde_json::json!(true);
+    reply.body = serde_json::to_vec(&body).unwrap();
+    reply
+}
+async fn resume_ready(
+    worker: &mut Worker,
+    fake: &Fake,
+    commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+) -> Gate {
+    fake.push(owner());
+    request(worker, Action::Current);
+    finish(worker, commands).await;
+    let gate = worker.jam.gate();
+    gate.lock().paused = Arc::new(|| true);
+    gate
+}
+async fn resume_settle() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[test]
+fn resume_caller_uses_coordinated_kernel_budget_and_original_observation_boundary() {
+    let (rt, mut worker, fake, mut commands, _) = setup("resume-caller-success");
+    rt.block_on(async {
+        tokio::time::pause();
+        let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+        let stamp = gate.stamp();
+        let permit = worker
+            .background_session
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        fake.push(resume_current());
+        let (headers, receive) = tokio::sync::oneshot::channel();
+        fake.0.steps.lock().unwrap().push_back(Step::Wait(receive));
+        let request = gate.capture_resume(stamp, Instant::now()).unwrap();
+        assert!(!gate.resume_available(stamp));
+        // Ordinary requests cannot steal the queued reservation.
+        worker.request_jam(Request {
+            expected: stamp,
+            action: Action::Current,
+        });
+        assert_eq!(fake.calls(), 1);
+        worker.resume_jam(request);
+        resume_settle().await;
+        assert_eq!(fake.calls(), 1, "same backend session budget");
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        drop(permit);
+        resume_settle().await;
+        assert_eq!(fake.calls(), 2);
+        assert_eq!(fake.0.resume_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.resume_report(stamp), Some(ResumeReport::Observing));
+        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        headers.send(empty(200)).ok().unwrap();
+        resume_settle().await;
+        assert_eq!(gate.resume_report(stamp), Some(ResumeReport::Observing));
+        // Tokio's timer wheel may deliver on the following millisecond tick.
+        tokio::time::advance(std::time::Duration::from_millis(1001)).await;
+        resume_settle().await;
+        assert!(matches!(
+            gate.resume_report(stamp),
+            Some(ResumeReport::Finished(resume::Outcome {
+                terminal: resume::Terminal::Accepted,
+                current_possible: true,
+                post_possible: true,
+                ..
+            }))
+        ));
+        assert_eq!(fake.calls(), 2, "no observation Current");
+        assert!(matches!(
+            gate.capture_resume(stamp, Instant::now()),
+            Err(resume::Terminal::Exhausted)
+        ));
+    });
+}
+
+#[test]
+fn resume_caller_queue_time_counts_and_grant_survives_rebinding() {
+    let (rt, mut worker, fake, mut commands, _) = setup("resume-caller-queue");
+    rt.block_on(async {
+        tokio::time::pause();
+        let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+        let stamp = gate.stamp();
+        let request = gate.capture_resume(stamp, Instant::now()).unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(21)).await;
+        worker.resume_jam(request);
+        resume_settle().await;
+        assert!(matches!(
+            gate.resume_report(stamp),
+            Some(ResumeReport::Finished(resume::Outcome {
+                terminal: resume::Terminal::Deadline,
+                current_possible: false,
+                post_possible: false,
+                ..
+            }))
+        ));
+        assert_eq!(fake.calls(), 1);
+        bind(&mut worker, &fake, "alice");
+        let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+        assert!(matches!(
+            gate.capture_resume(gate.stamp(), Instant::now()),
+            Err(resume::Terminal::Exhausted)
+        ));
+    });
+}
+
+#[test]
+fn resume_caller_pause_surface_and_identical_jam_retirement_prevent_post() {
+    for case in 0..7 {
+        let (rt, mut worker, fake, mut commands, _) = setup("resume-caller-retire");
+        rt.block_on(async {
+            let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+            let paused = Arc::new(AtomicBool::new(true));
+            let live = paused.clone();
+            gate.lock().paused = Arc::new(move || live.load(Ordering::SeqCst));
+            let stamp = gate.stamp();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            fake.0.steps.lock().unwrap().push_back(Step::Wait(receive));
+            let request = gate.capture_resume(stamp, Instant::now()).unwrap();
+            worker.resume_jam(request);
+            resume_settle().await;
+            assert_eq!(fake.calls(), 2);
+            match case {
+                0 => paused.store(false, Ordering::SeqCst),
+                1 => gate.cancel_resume(),
+                2 => gate.signal(stamp.engine, Notice::Jam),
+                3 => gate.signal(stamp.engine, Notice::Connection(Some("replacement".into()))),
+                4 => worker.jam.retire(stamp.account, Cause::Account),
+                5 => worker.jam.retire(stamp.account, Cause::Engine),
+                _ => bind(&mut worker, &fake, "alice"),
+            }
+            let _ = send.send(resume_current());
+            resume_settle().await;
+            assert_eq!(fake.0.resume_posts.load(Ordering::SeqCst), 0);
+            assert!(!gate.lock().resume_active);
+            assert!(gate.lock().resume_used);
+            if case >= 2 {
+                assert!(gate.resume_report(stamp).is_none());
+            }
+        });
+    }
+}
+
+#[test]
+fn resume_caller_pending_reconcile_and_uncertainty_are_not_bypassed() {
+    let (rt, mut worker, fake, mut commands, _) = setup("resume-caller-preflight");
+    rt.block_on(async {
+        let gate = worker.jam.gate();
+        gate.lock().paused = Arc::new(|| true);
+        assert!(
+            !gate.resume_available(gate.stamp()),
+            "reconcile before first Current"
+        );
+        let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+        gate.lock().write_uncertain.store(true, Ordering::SeqCst);
+        assert!(gate.capture_resume(gate.stamp(), Instant::now()).is_err());
+        gate.lock().write_uncertain.store(false, Ordering::SeqCst);
+        let (_send, receive) = tokio::sync::oneshot::channel();
+        fake.0.steps.lock().unwrap().push_back(Step::Wait(receive));
+        request(&mut worker, Action::Current);
+        assert!(gate.capture_resume(gate.stamp(), Instant::now()).is_err());
+        assert!(!gate.lock().resume_used);
+    });
+}
+
+#[test]
+fn resume_caller_post_timeout_stops_at_ten_seconds_without_replay() {
+    let (rt, mut worker, fake, mut commands, _) = setup("resume-caller-post-timeout");
+    rt.block_on(async {
+        tokio::time::pause();
+        let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+        let stamp = gate.stamp();
+        fake.push(resume_current());
+        let (_send, receive) = tokio::sync::oneshot::channel();
+        fake.0.steps.lock().unwrap().push_back(Step::Wait(receive));
+        let request = gate.capture_resume(stamp, Instant::now()).unwrap();
+        worker.resume_jam(request);
+        resume_settle().await;
+        assert_eq!(gate.resume_report(stamp), Some(ResumeReport::Observing));
+        tokio::time::advance(std::time::Duration::from_millis(10001)).await;
+        resume_settle().await;
+        assert!(!gate.lock().resume_active);
+        assert!(gate.write_uncertain());
+        assert!(matches!(
+            gate.resume_report(stamp),
+            Some(ResumeReport::Finished(resume::Outcome {
+                terminal: resume::Terminal::Cancelled,
+                post_possible: true,
+                ..
+            }))
+        ));
+        assert_eq!(fake.calls(), 2);
+        assert_eq!(fake.0.resume_posts.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn resume_ui_gesture_is_single_use_before_queue_and_window_retirement_cancels() {
+    use crate::model::{
+        Action as UiAction,
+        jam::{Intent, UiAction as JamAction},
+    };
+    let (rt, mut worker, fake, mut commands, events) = setup("resume-ui-caller");
+    let (ctx, mut app) = caller_app(&worker, events);
+    // Same existing offline caller seam, no process startup, Session or accounts.
+    app.backend.jam_resume_mode = true;
+    rt.block_on(async {
+        tokio::time::pause();
+        let gate = resume_ready(&mut worker, &fake, &mut commands).await;
+        caller_sync(&mut app, &ctx);
+        let gesture = Instant::now();
+        app.apply(
+            UiAction::Jam(JamAction {
+                expected: app.backend.jam_stamp(),
+                intent: Intent::Resume(gesture),
+            }),
+            &ctx,
+        );
+        assert!(
+            gate.lock().resume_active,
+            "reserved synchronously before queue"
+        );
+        app.apply(
+            UiAction::Jam(JamAction {
+                expected: app.backend.jam_stamp(),
+                intent: Intent::Resume(gesture),
+            }),
+            &ctx,
+        );
+        let Command::JamResume(request) = commands.try_recv().unwrap() else {
+            panic!("explicit gesture")
+        };
+        assert!(commands.try_recv().is_err());
+        app.window_gone();
+        assert!(!gate.lock().resume_active);
+        worker.resume_jam(request);
+        resume_settle().await;
+        assert_eq!(fake.calls(), 1, "no request after window retirement");
+        assert!(gate.lock().resume_used);
+        app.show_queue_panel = true;
+        app.apply(
+            UiAction::Jam(JamAction {
+                expected: app.backend.jam_stamp(),
+                intent: Intent::Resume(Instant::now()),
+            }),
+            &ctx,
+        );
+        assert!(commands.try_recv().is_err());
+    });
 }

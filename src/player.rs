@@ -324,6 +324,21 @@ pub struct Engine {
 
 impl Engine {
     #[cfg(feature = "jam-host")]
+    pub(crate) fn jam_paused(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let state = Arc::clone(&self.state);
+        let shutting_down = Arc::clone(&self.shutting_down);
+        Arc::new(move || {
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+                && state.connected
+                && !state.loading
+                && state.track.is_some()
+                && state.playback == Playback::Paused
+        })
+    }
+    #[cfg(feature = "jam-host")]
     pub(crate) fn take_jam_listeners(
         &self,
     ) -> Option<crate::backend::jam::lifecycle::PreparedListeners> {

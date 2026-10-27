@@ -153,6 +153,17 @@ impl CreateLease {
     }
 }
 trait Host: Send + Sync {
+    fn resume_intent(
+        &self,
+        authorization: &resume::Authorization,
+        paused: Arc<dyn Fn() -> bool + Send + Sync>,
+        gesture: Instant,
+    ) -> Result<(resume::Intent, resume::Cancellation), resume::Terminal>;
+    fn resume(
+        &self,
+        intent: resume::Intent,
+        budget: Arc<Semaphore>,
+    ) -> Pin<Box<dyn Future<Output = resume::Outcome> + Send + '_>>;
     fn purge_generation(&self);
     fn generation_until(&self) -> Result<Instant, generation::Terminal>;
     fn generate(
@@ -168,7 +179,22 @@ trait Host: Send + Sync {
     fn commit_create(&self);
 }
 
-impl<T: Transport> Host for Kernel<T> {
+impl<T: resume::Wire> Host for Kernel<T> {
+    fn resume_intent(
+        &self,
+        authorization: &resume::Authorization,
+        paused: Arc<dyn Fn() -> bool + Send + Sync>,
+        gesture: Instant,
+    ) -> Result<(resume::Intent, resume::Cancellation), resume::Terminal> {
+        self.experimental_resume_intent_at(authorization, paused, gesture)
+    }
+    fn resume(
+        &self,
+        intent: resume::Intent,
+        budget: Arc<Semaphore>,
+    ) -> Pin<Box<dyn Future<Output = resume::Outcome> + Send + '_>> {
+        Box::pin(self.experimental_resume(intent, budget))
+    }
     fn purge_generation(&self) {
         self.state().generation_uri = None;
     }
@@ -310,9 +336,52 @@ impl<T: Transport> Transport for EpochTransport<T> {
     }
 }
 
+impl<T: resume::Wire> resume::Wire for EpochTransport<T> {
+    fn exchange<'a>(
+        &'a self,
+        exchange: &'a resume::Exchange,
+        context: &'a Context,
+        possible: &'a resume::Boundary,
+        permit: resume::Permit<'a>,
+    ) -> resume::WireResponse<'a> {
+        Box::pin(async move {
+            let check = || {
+                permit()?;
+                if self.context().ok().as_ref() != Some(context) {
+                    return Err(resume::Terminal::Invalidated);
+                }
+                Ok(())
+            };
+            check()?;
+            let result = self
+                .inner
+                .exchange(exchange, context, possible, &check)
+                .await;
+            check()?;
+            result
+        })
+    }
+}
+
+/// Captured on the UI gesture, before the backend command queue.
+/// No Debug/Clone: the underlying intent is single-use.
+pub struct ResumeRequest {
+    stamp: Stamp,
+    kernel: Arc<dyn Host>,
+    intent: resume::Intent,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeReport {
+    Waiting,
+    Observing,
+    Finished(resume::Outcome),
+    Cancelled,
+    Invalidated,
+}
+
 type Factory = Arc<dyn Fn(watch::Receiver<u64>) -> Result<Arc<dyn Host>, Error> + Send + Sync>;
 
-fn factory<T: Transport + 'static>(
+fn factory<T: resume::Wire + 'static>(
     make: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
     verify: Arc<dyn Fn() -> bool + Send + Sync>,
     budget: Arc<Semaphore>,
@@ -344,6 +413,14 @@ fn unknown(error: Option<Error>) -> Snapshot {
 }
 
 struct Shared {
+    resume_authorization: resume::Authorization,
+    resume_used: bool,
+    resume_active: bool,
+    resume_running: bool,
+    resume_cancel: Option<resume::Cancellation>,
+    resume_boundary: Option<watch::Receiver<Option<Instant>>>,
+    resume_report: Option<(Stamp, ResumeReport)>,
+    paused: Arc<dyn Fn() -> bool + Send + Sync>,
     generation_queued: Option<(Arc<AtomicBool>, Instant)>,
     generation_active: bool,
     generation_allowance: Arc<generation::Allowance>,
@@ -369,6 +446,40 @@ struct Shared {
 }
 
 impl Shared {
+    fn cancel_resume(&mut self, report: ResumeReport) {
+        if let Some(cancel) = self.resume_cancel.take() {
+            cancel.cancel();
+            if self
+                .resume_boundary
+                .as_ref()
+                .is_some_and(|b| b.borrow().is_some())
+            {
+                self.write_uncertain.store(true, Ordering::SeqCst);
+            }
+            self.resume_report = Some((self.stamp, report));
+            self.waker.wake();
+        }
+        if !self.resume_running {
+            self.resume_active = false;
+        }
+        // A running operation remains exclusive until it returns cooperatively.
+    }
+    fn resume_ready(&self, expected: Stamp) -> bool {
+        self.stamp == expected
+            && self.context_valid()
+            && self.listening
+            && self.connection.as_deref().is_some_and(|s| !s.is_empty())
+            && self.pending.is_none()
+            && !self.resume_active
+            && self.generation_queued.is_none()
+            && !self.generation_active
+            && !self.write_uncertain.load(Ordering::SeqCst)
+            && self
+                .kernel
+                .as_ref()
+                .is_some_and(|k| !k.snapshot().reconcile_required)
+    }
+
     fn publish(&mut self, phase: Phase, snapshot: Snapshot) {
         let event = Arc::new(Event {
             stamp: self.stamp,
@@ -381,6 +492,7 @@ impl Shared {
     }
 
     fn invalidate(&mut self, cause: Cause) {
+        self.cancel_resume(ResumeReport::Invalidated);
         if let Some((cancelled, _)) = self.generation_queued.take() {
             cancelled.store(true, Ordering::SeqCst);
             self.generation_report = Some(generation::Terminal::Invalidated);
@@ -445,6 +557,72 @@ impl Shared {
 pub(crate) struct Gate(Arc<Mutex<Shared>>);
 
 impl Gate {
+    pub(crate) fn resume_available(&self, expected: Stamp) -> bool {
+        let state = self.lock();
+        !state.resume_used && state.resume_ready(expected) && (state.paused)()
+    }
+    pub(crate) fn capture_resume(
+        &self,
+        expected: Stamp,
+        gesture: Instant,
+    ) -> Result<ResumeRequest, resume::Terminal> {
+        let mut state = self.lock();
+        if state.resume_used {
+            return Err(resume::Terminal::Exhausted);
+        }
+        if !state.resume_ready(expected) {
+            return Err(resume::Terminal::Invalidated);
+        }
+        let kernel = state.kernel.clone().ok_or(resume::Terminal::Invalidated)?;
+        let (intent, cancel) = kernel.resume_intent(
+            &state.resume_authorization,
+            Arc::clone(&state.paused),
+            gesture,
+        )?;
+        // One captured gesture for this backend lifetime, also on queued failure.
+        state.resume_used = true;
+        state.resume_active = true;
+        state.resume_boundary = Some(intent.post_boundary());
+        state.resume_cancel = Some(cancel);
+        state.resume_report = Some((expected, ResumeReport::Waiting));
+        state.waker.wake();
+        Ok(ResumeRequest {
+            stamp: expected,
+            kernel,
+            intent,
+        })
+    }
+    pub(crate) fn cancel_resume(&self) {
+        let mut state = self.lock();
+        if state.resume_cancel.is_none() && !state.resume_active {
+            if state.resume_report.take().is_some() {
+                state.waker.wake();
+            }
+        } else {
+            state.cancel_resume(ResumeReport::Cancelled);
+        }
+    }
+    pub(crate) fn resume_report(&self, expected: Stamp) -> Option<ResumeReport> {
+        let state = self.lock();
+        let (stamp, report) = state.resume_report?;
+        if stamp != expected || state.stamp != expected || !state.context_valid() {
+            return None;
+        }
+        Some(
+            if state.resume_active
+                && state.resume_cancel.is_some()
+                && state
+                    .resume_boundary
+                    .as_ref()
+                    .is_some_and(|b| b.borrow().is_some())
+            {
+                ResumeReport::Observing
+            } else {
+                report
+            },
+        )
+    }
+
     /// Local capability bit only; never exposes the private URI to presentation.
     pub(crate) fn generation_available(&self, expected: Stamp) -> bool {
         let state = self.lock();
@@ -456,6 +634,7 @@ impl Gate {
                 .as_deref()
                 .is_some_and(|value| !value.is_empty())
             && state.pending.is_none()
+            && !state.resume_active
             && state.generation_queued.is_none()
             && !state.generation_allowance.exhausted()
             && state
@@ -466,7 +645,7 @@ impl Gate {
     /// Install cancellation before the backend queue, without capturing secrets.
     pub(crate) fn arm_generation(&self, intent: &generation::Intent) -> bool {
         let mut state = self.lock();
-        if state.pending.is_some() || state.generation_queued.is_some() {
+        if state.pending.is_some() || state.resume_active || state.generation_queued.is_some() {
             state.generation_report = Some(generation::Terminal::Busy);
             state.waker.wake();
             return false;
@@ -695,6 +874,14 @@ impl Bridge {
     pub(crate) fn channel(waker: Waker) -> (Self, watch::Receiver<Option<Arc<Event>>>) {
         let (output, receiver) = watch::channel(None);
         let state = Shared {
+            resume_authorization: resume::Authorization::explicitly_authorized(),
+            resume_used: false,
+            resume_active: false,
+            resume_running: false,
+            resume_cancel: None,
+            resume_boundary: None,
+            resume_report: None,
+            paused: Arc::new(|| false),
             generation_queued: None,
             generation_active: false,
             generation_allowance: Arc::new(generation::Allowance::default()),
@@ -785,6 +972,7 @@ impl Bridge {
         account_epoch: watch::Receiver<u64>,
         api: Arc<crate::api::ApiGateway>,
         budget: Arc<Semaphore>,
+        paused: Arc<dyn Fn() -> bool + Send + Sync>,
     ) {
         let PreparedListeners {
             session,
@@ -818,6 +1006,7 @@ impl Bridge {
             (!connection.is_empty()).then_some(connection),
             listening,
         );
+        self.gate.lock().paused = paused;
         if let (Ok(mut jam), Ok(mut connections)) = (jam, connections) {
             let gate = self.gate();
             let engine = gate.stamp().engine;
@@ -842,6 +1031,78 @@ impl Bridge {
             });
             self.watcher = Some(task.abort_handle());
         }
+    }
+
+    pub(crate) fn resume(
+        &mut self,
+        request: ResumeRequest,
+        account: Option<&str>,
+        epoch: u64,
+        budget: Arc<Semaphore>,
+    ) {
+        let mut state = self.gate.lock();
+        if state.stamp != request.stamp
+            || state.account.as_deref() != account
+            || state.stamp.account != epoch
+            || !state.context_valid()
+            || state.resume_cancel.is_none()
+            || !state.resume_active
+        {
+            state.cancel_resume(ResumeReport::Invalidated);
+            state.resume_active = false;
+            return;
+        }
+        state.resume_running = true;
+        let gate = self.gate.clone();
+        let mut cancelled = request.intent.cancellation();
+        let mut boundary = request.intent.post_boundary();
+        let stamp = request.stamp;
+        tokio::spawn(async move {
+            let work = request.kernel.resume(request.intent, budget);
+            tokio::pin!(work);
+            let observation = async {
+                loop {
+                    let started = *boundary.borrow_and_update();
+                    if let Some(started) = started {
+                        gate.lock().waker.wake();
+                        tokio::time::sleep_until(started + std::time::Duration::from_secs(10))
+                            .await;
+                        break;
+                    }
+                    if boundary.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+            tokio::pin!(observation);
+            let outcome = tokio::select! {
+                outcome = &mut work => {
+                    if outcome.post_possible {
+                        // Observe only the remaining original ten seconds; no new I/O.
+                        tokio::select! {
+                            _ = &mut observation => (),
+                            _ = cancelled.changed() => (),
+                        }
+                    }
+                    outcome
+                },
+                _ = &mut observation => {
+                    if let Some(cancel) = &gate.lock().resume_cancel { cancel.cancel(); }
+                    work.await
+                },
+            };
+            let mut state = gate.lock();
+            if outcome.post_possible && outcome.terminal != resume::Terminal::Accepted {
+                state.write_uncertain.store(true, Ordering::SeqCst);
+            }
+            state.resume_active = false;
+            state.resume_running = false;
+            if state.stamp == stamp && state.context_valid() && state.resume_cancel.is_some() {
+                state.resume_report = Some((stamp, ResumeReport::Finished(outcome)));
+                state.resume_cancel = None;
+            }
+            state.waker.wake();
+        });
     }
 
     pub(crate) fn request(
@@ -878,7 +1139,7 @@ impl Bridge {
             reject(&mut state, Error::Stale);
             return;
         }
-        if state.pending.is_some() {
+        if state.pending.is_some() || state.resume_active {
             reject(&mut state, Error::Busy);
             return;
         }
@@ -1138,7 +1399,7 @@ impl Bridge {
             return;
         }
         // Busy does not replace the active lease, abort handle or allowance.
-        if state.pending.is_some() {
+        if state.pending.is_some() || state.resume_active {
             state.generation_report = Some(T::Busy);
             state.waker.wake();
             return;

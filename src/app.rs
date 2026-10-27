@@ -1189,6 +1189,8 @@ impl App {
     /// media controls keep running until Show or Quit.
     pub fn window_gone(&mut self) {
         #[cfg(feature = "jam-host")]
+        self.backend.cancel_jam_resume();
+        #[cfg(feature = "jam-host")]
         self.cancel_generation_view();
         self.winamp.forget_textures();
         self.window_hidden = true;
@@ -9459,6 +9461,8 @@ impl App {
                 self.apply(action, ctx);
                 #[cfg(feature = "jam-host")]
                 self.sync_generation_view(ctx);
+                #[cfg(feature = "jam-host")]
+                self.sync_resume_view(ctx);
             }
             actions = std::mem::take(&mut self.actions);
         }
@@ -10234,6 +10238,8 @@ impl App {
                 });
             }
             Action::SignOut => {
+                #[cfg(feature = "jam-host")]
+                self.backend.cancel_jam_resume();
                 self.backend.send(Command::SignOut);
                 self.history = vec![Page::Home];
                 self.history_index = 0;

@@ -218,7 +218,7 @@ impl resume::Wire for Fake {
         &'a self,
         exchange: &'a resume::Exchange,
         expected: &'a Context,
-        possible: &'a AtomicBool,
+        possible: &'a resume::Boundary,
         permit: resume::Permit<'a>,
     ) -> resume::WireResponse<'a> {
         Box::pin(async move {
@@ -247,7 +247,7 @@ impl resume::Wire for Fake {
                 step
             };
             permit()?;
-            possible.store(true, Ordering::SeqCst);
+            possible.mark();
             match exchange {
                 resume::Exchange::Current => self.calls.lock().unwrap().push(Operation::Current),
                 resume::Exchange::Social { .. } => {

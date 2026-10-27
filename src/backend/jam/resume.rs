@@ -1,7 +1,7 @@
-//! Explicit, unconnected experimental Resume. No product Toggle/Play routing.
+//! Explicit experimental Resume. No product Toggle/Play routing.
 //!
-//! One attempt per explicit Authorization, including pre-send failures. A future
-//! backend caller must supply its existing background_session semaphore and a
+//! One attempt per explicit Authorization, including pre-send failures. The
+//! backend caller supplies its existing background_session semaphore and a
 //! live local-paused predicate. Construction/capture performs no network I/O.
 use super::*;
 use std::task::Poll;
@@ -65,6 +65,7 @@ pub struct Outcome {
 /// An explicit experimental gesture, captured synchronously before first poll.
 /// No Debug/Serialize: account, device, connection and revision remain in RAM.
 pub struct Intent {
+    post: Arc<Boundary>,
     owner: Arc<()>,
     allowance: Arc<AtomicBool>,
     context: Context,
@@ -89,6 +90,41 @@ impl Cancellation {
     }
 }
 
+/// Conservative request boundary, timestamped before request_fut, not wire proof.
+pub struct Boundary {
+    possible: AtomicBool,
+    started: watch::Sender<Option<Instant>>,
+}
+impl Default for Boundary {
+    fn default() -> Self {
+        Self {
+            possible: AtomicBool::new(false),
+            started: watch::channel(None).0,
+        }
+    }
+}
+impl Boundary {
+    pub fn mark(&self) {
+        if !self.possible.swap(true, Ordering::SeqCst) {
+            self.started.send_replace(Some(Instant::now()));
+        }
+    }
+    pub fn started(&self) -> watch::Receiver<Option<Instant>> {
+        self.started.subscribe()
+    }
+    fn possible(&self) -> bool {
+        self.possible.load(Ordering::SeqCst)
+    }
+}
+impl Intent {
+    pub(crate) fn cancellation(&self) -> watch::Receiver<bool> {
+        self.cancelled.clone()
+    }
+    pub fn post_boundary(&self) -> watch::Receiver<Option<Instant>> {
+        self.post.started()
+    }
+}
+
 /// Real request choices, separate from the product's mutation enum/builder.
 /// No Debug/Serialize or raw diagnostic output.
 pub enum Exchange {
@@ -104,7 +140,7 @@ pub trait Wire: Transport {
         &'a self,
         exchange: &'a Exchange,
         context: &'a Context,
-        possible: &'a AtomicBool,
+        possible: &'a Boundary,
         permit: Permit<'a>,
     ) -> WireResponse<'a>;
 }
@@ -143,6 +179,15 @@ impl<T: Wire> Kernel<T> {
         authorization: &Authorization,
         paused: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<(Intent, Cancellation), Terminal> {
+        self.experimental_resume_intent_at(authorization, paused, Instant::now())
+    }
+
+    pub(crate) fn experimental_resume_intent_at(
+        &self,
+        authorization: &Authorization,
+        paused: Arc<dyn Fn() -> bool + Send + Sync>,
+        gesture: Instant,
+    ) -> Result<(Intent, Cancellation), Terminal> {
         let context = self.sync_context().map_err(map_error)?;
         if !paused() {
             return Err(Terminal::Invalidated);
@@ -150,11 +195,12 @@ impl<T: Wire> Kernel<T> {
         let (cancel, cancelled) = watch::channel(false);
         Ok((
             Intent {
+                post: Arc::new(Boundary::default()),
                 owner: Arc::clone(&self.resume_identity),
                 allowance: Arc::clone(&authorization.0),
                 context,
                 revision: self.state().revision,
-                deadline: Instant::now() + DEADLINE,
+                deadline: gesture + DEADLINE,
                 cancelled,
                 paused,
                 command_id: format!("{:032x}", rand::random::<u128>()),
@@ -166,8 +212,8 @@ impl<T: Wire> Kernel<T> {
     /// Never called by normal Play/Toggle, startup, Dealer, refresh or timers.
     /// `budget` must be this backend's existing background_session semaphore.
     pub async fn experimental_resume(&self, intent: Intent, budget: Arc<Semaphore>) -> Outcome {
-        let current = AtomicBool::new(false);
-        let post = AtomicBool::new(false);
+        let current = Boundary::default();
+        let post = Arc::clone(&intent.post);
         let mut gate = Gate::Unknown;
         let terminal = self
             .resume_attempt(&intent, budget, &current, &post, &mut gate)
@@ -179,8 +225,8 @@ impl<T: Wire> Kernel<T> {
         Outcome {
             terminal,
             gate,
-            current_possible: current.load(Ordering::SeqCst),
-            post_possible: post.load(Ordering::SeqCst),
+            current_possible: current.possible(),
+            post_possible: post.possible(),
         }
     }
 
@@ -188,8 +234,8 @@ impl<T: Wire> Kernel<T> {
         &self,
         intent: &Intent,
         budget: Arc<Semaphore>,
-        current: &AtomicBool,
-        post: &AtomicBool,
+        current: &Boundary,
+        post: &Boundary,
         observed_gate: &mut Gate,
     ) -> Result<Terminal, Terminal> {
         let check = || {
@@ -281,7 +327,7 @@ impl<T: Wire> Kernel<T> {
 fn logging_safe(max: log::LevelFilter, tracing_active: bool) -> bool {
     max == log::LevelFilter::Off && !tracing_active
 }
-fn privacy() -> Result<(), Terminal> {
+pub(crate) fn privacy() -> Result<(), Terminal> {
     let tracing_active = tracing::dispatcher::has_been_set()
         || tracing::dispatcher::get_default(|dispatch| {
             !dispatch.is::<tracing::subscriber::NoSubscriber>()
@@ -395,7 +441,7 @@ impl Wire for SessionTransport {
         &'a self,
         exchange: &'a Exchange,
         context: &'a Context,
-        possible: &'a AtomicBool,
+        possible: &'a Boundary,
         permit: Permit<'a>,
     ) -> WireResponse<'a> {
         Box::pin(async move {
@@ -439,7 +485,7 @@ impl Wire for SessionTransport {
             check()?;
             // Burn before the conservative request_fut boundary, even if the
             // private Session domain limiter refuses synchronously. No retry.
-            possible.store(true, Ordering::SeqCst);
+            possible.mark();
             let future = self
                 .session
                 .http_client()

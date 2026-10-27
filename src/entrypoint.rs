@@ -7,6 +7,11 @@ use fastframe_shell::window::Geometry;
 #[derive(Debug, Parser)]
 #[command(name = env!("CARGO_BIN_NAME"), version, about)]
 struct Cli {
+    /// Enable the single-use Resume experiment with silent logging from startup.
+    #[cfg(feature = "jam-host")]
+    #[arg(long, conflicts_with_all = ["verbose", "link"])]
+    experimental_jam_resume: bool,
+
     /// A command for the running instance; without one, the app starts.
     #[command(subcommand)]
     control: Option<Control>,
@@ -381,6 +386,18 @@ pub(crate) fn run() -> eframe::Result<()> {
 
     let cli = Cli::from_arg_matches(&Cli::command().get_matches_from(&launch.arguments))
         .unwrap_or_else(|error| error.exit());
+    #[cfg(feature = "jam-host")]
+    if cli.experimental_jam_resume && cli.control.is_some() {
+        eprintln!("Experimental Resume requires a fresh app process without a control command.");
+        std::process::exit(2);
+    }
+    #[cfg(feature = "jam-host")]
+    if cli.experimental_jam_resume
+        && let Err(reason) = spotifast::experimental_resume::configure_startup()
+    {
+        eprintln!("{reason}");
+        std::process::exit(2);
+    }
     // Demo mode invents plays, settings, and a signed-in account. Without a
     // folder of its own it would write them into the real profile, where
     // they would pass for the user's history.
@@ -459,14 +476,19 @@ pub(crate) fn run() -> eframe::Result<()> {
     // Launched from a desktop, stderr goes nowhere; keep the run's log where
     // a bug report can find it, and a line per panic in the panic log (with
     // any link in its message removed: a URL can carry a token).
-    if let Err(error) = fastframe_log::Logging::new("spotifast", env!("CARGO_PKG_VERSION"))
-        .filter(default_filter)
-        .file(dirs.log_file())
-        .panic_log(dirs.panic_log())
-        .panic_message(fastframe_log::PanicMessage::Redacted(
-            fastframe_log::redact::links,
-        ))
-        .init()
+    #[cfg(feature = "jam-host")]
+    let ordinary_logging = !cli.experimental_jam_resume;
+    #[cfg(not(feature = "jam-host"))]
+    let ordinary_logging = true;
+    if ordinary_logging
+        && let Err(error) = fastframe_log::Logging::new("spotifast", env!("CARGO_PKG_VERSION"))
+            .filter(default_filter)
+            .file(dirs.log_file())
+            .panic_log(dirs.panic_log())
+            .panic_message(fastframe_log::PanicMessage::Redacted(
+                fastframe_log::redact::links,
+            ))
+            .init()
     {
         eprintln!("not logging: {error}");
     }
@@ -1536,6 +1558,29 @@ mod tests {
         );
 
         assert_eq!(missing_pulseaudio_properties(|_| true).count(), 0);
+    }
+
+    #[cfg(feature = "jam-host")]
+    #[test]
+    fn resume_startup_switch_is_explicit_and_conflicts_with_verbose_and_links() {
+        let cli = Cli::try_parse_from(["spotifast", "--experimental-jam-resume"]).unwrap();
+        assert!(cli.experimental_jam_resume && cli.control.is_none());
+        assert!(
+            !Cli::try_parse_from(["spotifast"])
+                .unwrap()
+                .experimental_jam_resume
+        );
+        assert!(
+            Cli::try_parse_from(["spotifast", "--experimental-jam-resume", "--verbose"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "spotifast",
+                "--experimental-jam-resume",
+                "spotify:track:synthetic"
+            ])
+            .is_err()
+        );
     }
 
     /// A link on the command line is a link, and a control verb is still a

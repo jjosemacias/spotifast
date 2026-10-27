@@ -59,3 +59,6 @@ pub mod vis;
 pub mod winamp;
 pub mod window;
 pub mod zeroconf;
+
+#[cfg(feature = "jam-host")]
+pub mod experimental_resume;

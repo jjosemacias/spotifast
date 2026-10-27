@@ -415,6 +415,62 @@ fn official_capture(ui: &mut egui::Ui, label: &str) -> (egui::Response, Vec<Inte
     (response, edits)
 }
 
+fn resume_diagnostic(app: &mut App, ui: &mut egui::Ui) {
+    if !app.backend.jam_resume_mode() {
+        return;
+    }
+    resume_controls(
+        app,
+        ui,
+        app.backend.jam_resume_available(app.jam.stamp),
+        app.backend.jam_resume_report(app.jam.stamp),
+    );
+}
+
+fn resume_controls(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ready: bool,
+    report: Option<crate::backend::jam::lifecycle::ResumeReport>,
+) {
+    text(
+        app,
+        ui,
+        "Resume test: Spotifast locally paused; official client continues in the same Jam.",
+    );
+    if ui
+        .add_enabled(
+            ready,
+            egui::Button::new("Resume social once (experimental)").wrap(),
+        )
+        .clicked()
+    {
+        enqueue(app, Intent::Resume(tokio::time::Instant::now()));
+    }
+    if !ready && report.is_none() {
+        text(
+            app,
+            ui,
+            "Unavailable: registered paused engine, reconciled Jam and unused allowance required.",
+        );
+    }
+    if let Some(report) = report {
+        ui.add(egui::Label::new(format!("resume={report:?}")).wrap());
+        button(
+            app,
+            ui,
+            "Stop Resume observation",
+            true,
+            Intent::CancelResume,
+        );
+    }
+    text(
+        app,
+        ui,
+        "Current at most once, conditional POST at most once. Observe for 10 seconds from possible POST. HTTP acceptance does not establish audio recovery or synchronization. STOP after this attempt.",
+    );
+}
+
 fn diagnostic(app: &mut App, ui: &mut egui::Ui, allow_comparison: bool) {
     text(
         app,
@@ -428,6 +484,9 @@ fn diagnostic(app: &mut App, ui: &mut egui::Ui, allow_comparison: bool) {
         app.jam.pending.is_none(),
         Intent::DiagnoseCurrent,
     );
+    if allow_comparison {
+        resume_diagnostic(app, ui);
+    }
     if allow_comparison {
         if app.jam.official_open {
             text(
@@ -1003,6 +1062,69 @@ fn join_form(app: &mut App, ctx: &egui::Context) {
 #[cfg(all(test, feature = "demo"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_controls_wrap_and_expose_only_sanitized_states_offline() {
+        use crate::backend::jam::{
+            lifecycle::ResumeReport,
+            resume::{Gate, Outcome, Terminal},
+        };
+        fn texts<'a>(shape: &'a egui::Shape, found: &mut Vec<&'a egui::epaint::TextShape>) {
+            match shape {
+                egui::Shape::Text(text) => found.push(text),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, found)),
+                _ => (),
+            }
+        }
+        for palette in [theme::Palette::dark(), theme::Palette::light()] {
+            for width in [280.0, 560.0] {
+                for report in [
+                    None,
+                    Some(ResumeReport::Waiting),
+                    Some(ResumeReport::Observing),
+                    Some(ResumeReport::Finished(Outcome {
+                        terminal: Terminal::Http(403),
+                        gate: Gate::Unknown,
+                        current_possible: true,
+                        post_possible: true,
+                    })),
+                ] {
+                    let (ctx, mut app) = accessible_app("resume-controls");
+                    app.locale = crate::i18n::Locale::English;
+                    app.palette = palette;
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 900.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| resume_controls(&mut app, ui, report.is_none(), report),
+                    );
+                    let mut found = Vec::new();
+                    output
+                        .shapes
+                        .iter()
+                        .for_each(|s| texts(&s.shape, &mut found));
+                    assert!(
+                        found
+                            .iter()
+                            .any(|s| s.galley.text() == "Resume social once (experimental)")
+                    );
+                    assert!(found.iter().any(|s| {
+                        s.galley
+                            .text()
+                            .contains("HTTP acceptance does not establish")
+                    }));
+                    assert!(found.iter().all(|s| s.galley.size().x <= width));
+                    assert!(app.actions.is_empty() && output.platform_output.commands.is_empty());
+                    output.textures_delta.clear();
+                    app.backend.shutdown();
+                }
+            }
+        }
+    }
 
     #[test]
     fn invitation_generation_reuses_card_and_wraps_in_both_themes_without_io() {

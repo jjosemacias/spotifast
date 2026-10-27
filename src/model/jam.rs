@@ -6,6 +6,8 @@ use crate::backend::jam::{
 
 #[derive(Clone)]
 pub enum Intent {
+    Resume(tokio::time::Instant),
+    CancelResume,
     AskGeneration,
     ConfirmGeneration,
     CancelGeneration,
@@ -53,6 +55,8 @@ impl OfficialEdit {
 impl std::fmt::Debug for Intent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Resume(_) => "Resume",
+            Self::CancelResume => "CancelResume",
             Self::AskGeneration => "AskGeneration",
             Self::ConfirmGeneration => "ConfirmGeneration",
             Self::CancelGeneration => "CancelGeneration",

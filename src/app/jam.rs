@@ -51,6 +51,7 @@ impl App {
         let comparison_visible = self.lyrics_fullscreen.is_none()
             && ((self.show_queue_panel && self.queue_tab == QueueTab::Queue)
                 || matches!(self.page(), Page::Queue));
+        self.sync_resume_view(ctx);
         if !comparison_visible {
             self.jam.official_open = false;
         }
@@ -87,6 +88,29 @@ impl App {
             self.jam.confirmation = None;
             self.jam.notice = Some("The Jam changed. Check its state before continuing.");
             ctx.data_mut(|data| data.insert_temp(egui::Id::new("jam-management-focus"), true));
+        }
+    }
+
+    fn resume_surface_visible(&self, ctx: &egui::Context) -> bool {
+        self.lyrics_fullscreen.is_none()
+            && ((self.show_queue_panel && self.queue_tab == QueueTab::Queue)
+                || matches!(self.page(), Page::Queue))
+            && !self.window_hidden
+            && !self.hide_intent
+            && !self.quit_requested
+            && !self.switch_intent
+            && !self.settings.winamp_window
+            && !self.show_devices
+            && !ctx.input(|i| {
+                i.viewport().minimized.unwrap_or(false) || i.viewport().close_requested()
+            })
+    }
+
+    pub(super) fn sync_resume_view(&self, ctx: &egui::Context) {
+        if !self.resume_surface_visible(ctx)
+            || !self.backend.jam_context_valid(self.backend.jam_stamp())
+        {
+            self.backend.cancel_jam_resume();
         }
     }
 
@@ -212,11 +236,25 @@ impl App {
                 | Intent::CancelJoin
                 | Intent::CancelCompare
                 | Intent::CancelGeneration
+                | Intent::CancelResume
         ) && action.expected != self.jam.stamp
         {
             return;
         }
         match intent {
+            Intent::Resume(gesture) => {
+                if !self.resume_surface_visible(ctx) {
+                    return;
+                }
+                if let Some(request) = self.backend.capture_jam_resume(action.expected, gesture) {
+                    self.backend.send(Command::JamResume(request));
+                }
+                return;
+            }
+            Intent::CancelResume => {
+                self.backend.cancel_jam_resume();
+                return;
+            }
             Intent::AskGeneration => {
                 if self.jam.generation.is_none() && self.jam.generation_ready {
                     let Some(until) = self.jam.fresh_until else {

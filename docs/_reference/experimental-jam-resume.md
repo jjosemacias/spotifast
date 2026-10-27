@@ -1,10 +1,10 @@
 ---
 title: Experimental Jam Resume adapter
-description: Backend-only preparation, not a product playback control.
+description: Explicit single-use caller for the approved backend adapter.
 ---
 
-This adapter is an isolated candidate for one authorized experiment. It is not
-connected to Play, Toggle, startup, refresh, or Dealer notifications. HTTP
+This adapter is an isolated candidate for one authorized experiment. The queue diagnostic offers an explicit Resume action only in the experimental
+startup mode. It is not connected to Play, Toggle, startup, refresh, or Dealer notifications. HTTP
 acceptance does not establish audio recovery or synchronization. It does not
 change the existing playback controls.
 
@@ -22,8 +22,12 @@ come from that registered local engine and its lifecycle watch channel. Session
 device ID is the local descriptor; no active/remote device ID is substituted.
 The hosting backend must call `Kernel::invalidate` for Jam changes, including
 replacement by an identical projection. This API does not install a second
-Dealer listener or a second Session. These are integration requirements for a
-future experimental caller; no UI/CLI caller is installed by this preparation.
+Dealer listener or a second Session. These requirements are implemented by the existing lifecycle Bridge and the
+registered engine. The Bridge retains one Authorization for its entire lifetime,
+including retire, bind and surface reopen. Capture reserves exclusion before the
+backend queue; pending, reconciliation and uncertainty refuse capture. The
+engine predicate locks its current LocalState and requires connected, paused,
+a track, no loading and no shutdown. It is never an optimistic UI snapshot.
 
 The adapter invokes Current once, through the existing Session request builder
 and bounded response parser. It captures the exact root field `redirectCommands`
@@ -72,3 +76,51 @@ count. A real experiment needs separate authorization for prestate and this I/O,
 review of the exact caller/build/protocol, and a finite observation window without
 another Current or automatic retry. The backend API and its offline fake tests
 do not validate credential compatibility, recipient behavior, or catch-up.
+
+## Experimental caller (offline candidate, review required)
+
+A future authorized run must start a fresh process with `--experimental-jam-resume`
+and feature `jam-host`. This is an explicit startup switch, not a saved setting,
+IPC command, or authorization to prepare accounts/audio. An already running
+ordinary instance cannot be upgraded into this mode. The switch conflicts with
+verbose, a link and a remote control command. Before creating any Session it
+installs a silent logger, facade max level Off, no log/panic files, and a panic
+hook which discards its payload. It refuses an existing logger or tracing
+subscriber. It skips fastframe-log entirely, so RUST_LOG is not parsed and
+cannot override the filter. No other logger/subscriber is installed by this
+path. The adapter continues to verify log/tracing at its controlled polls.
+The hook does not forward to the ordinary panic sink. This is not retroactive
+sanitization for a previously started Session.
+
+In the queue's existing diagnostic section, `Resume social once (experimental)`
+emits an action with the gesture time; App captures the actual Kernel Intent
+synchronously before sending its backend command. The original 20 seconds
+includes the command queue and semaphore wait. Bridge uses the same Kernel,
+Session lifecycle, uncertainty flag and background_session budget as ordinary
+Jam work. A captured attempt cannot be replaced, automatically retried or
+renewed after failure, finish, retire or rebind. Play/Toggle are unchanged.
+The caller blocks ordinary Jam work for its queued, dispatch and observation
+intervals. An ordinary action cannot take the reservation between capture and
+backend execution. Closing/hiding/minimizing/leaving the queue, switching
+account, engine, connection or Jam (including identical replacement) cancels.
+A running future owns auth and returns cooperatively; it is not aborted while
+another auth future keeps polling. A queued cancellation releases its local
+reservation while permanently retaining the consumed caller allowance.
+
+The adapter now exposes a timestamped conservative Boundary: Current and POST
+mark it immediately before request_fut, including a synchronous limiter refusal.
+The timestamp is operational only, not proof that bytes reached Spotify. The
+caller watches the POST boundary and ends observation at boundary +10 seconds,
+including time awaiting HTTP headers. It adds no Current, polling, collector,
+audio capture or local fallback. At the end it cancels any still pending request
+cooperatively. It never starts a fresh ten seconds when a late response arrives.
+Context retirement ends observation early; late results cannot cross the stamp.
+A post-possible failure or cancellation retains Bridge write uncertainty.
+A successful HTTP result is displayed independently of the manual audio and
+position comparison. Fixed Debug output contains only ResumeReport/Outcome
+classifications, HTTP number, gate class and possible-emission booleans.
+Cancellation can occur after possible POST: STOP, without another attempt.
+
+Review/build/prestate/human I/O permissions remain separate. The planning
+handoff records exact offline commands, tests and the future human protocol.
+This caller does not implement creation, joining or prestate audio preparation.

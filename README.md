@@ -176,6 +176,17 @@ the remote test; it does not enable general regeneration or short-link resolutio
 These experimental
 paths still need a real invitation-to-Join test. See the [candidate contract](docs/_reference/jam-host-kernel.md).
 
+The same development feature also includes an isolated single-use Resume social
+caller in the queue diagnostic. It requires a fresh process explicitly started
+with `--experimental-jam-resume`, which disables log/panic sinks before any
+playback Session and ignores environment log filters. It never replaces Play or
+Toggle. It makes at most one Current and one conditional social POST, with a
+finite ten-second observation from possible POST. HTTP acceptance does not
+establish audio recovery or synchronization. The exact caller, build and human
+protocol require independent review and separate authorization before real use.
+See [experimental Resume](docs/_reference/experimental-jam-resume.md).
+
+
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull
 request. To look at the interface without a Spotify account, run:
 

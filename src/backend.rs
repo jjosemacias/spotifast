@@ -605,6 +605,8 @@ struct PlaylistCacheWrite {
 pub enum Command {
     /// Experimental explicit diagnostic only. No UI/startup caller is installed.
     #[cfg(feature = "jam-host")]
+    JamResume(jam::lifecycle::ResumeRequest),
+    #[cfg(feature = "jam-host")]
     JamGenerate(jam::generation::Intent),
     #[cfg(feature = "jam-host")]
     JamGenerationFinished(Box<jam::lifecycle::GenerationCompleted>),
@@ -1004,6 +1006,8 @@ pub struct Backend {
     jam_events: watch::Receiver<Option<Arc<jam::lifecycle::Event>>>,
     #[cfg(feature = "jam-host")]
     jam_gate: jam::lifecycle::Gate,
+    #[cfg(feature = "jam-host")]
+    jam_resume_mode: bool,
     commands: mpsc::UnboundedSender<Command>,
     events: std::sync::mpsc::Receiver<Event>,
     art: ArtLoader,
@@ -1053,6 +1057,8 @@ impl Backend {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         #[cfg(feature = "jam-host")]
         let (jam, jam_events) = jam::lifecycle::Bridge::channel(waker.clone());
+        #[cfg(feature = "jam-host")]
+        let jam_resume_mode = crate::experimental_resume::enabled();
         #[cfg(feature = "jam-host")]
         let jam_gate = jam.gate();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1114,6 +1120,8 @@ impl Backend {
             jam_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "jam-host")]
             jam_gate,
+            #[cfg(feature = "jam-host")]
+            jam_resume_mode,
             events: event_rx,
             art,
             activity,
@@ -1164,6 +1172,8 @@ impl Backend {
 
     pub fn send(&self, command: Command) {
         #[cfg(feature = "jam-host")]
+        let resume_requested = matches!(&command, Command::JamResume(_));
+        #[cfg(feature = "jam-host")]
         let generation_requested = matches!(&command, Command::JamGenerate(_));
         #[cfg(feature = "jam-host")]
         if let Command::JamGenerate(intent) = &command {
@@ -1213,10 +1223,17 @@ impl Backend {
         {
             #[cfg(feature = "jam-host")]
             self.jam_gate.refuse_comparison(jam::Error::NotReady);
+            #[cfg(feature = "jam-host")]
+            if resume_requested {
+                self.jam_gate.cancel_resume();
+            }
             return;
         }
         #[cfg(feature = "jam-host")]
         if self.commands.send(command).is_err() {
+            if resume_requested {
+                self.jam_gate.cancel_resume();
+            }
             if generation_requested {
                 self.jam_gate.cancel_generation();
             }
@@ -1486,6 +1503,36 @@ impl Backend {
     }
 
     /// Consumers echo this stamp for deliberate work from the current view.
+    #[cfg(feature = "jam-host")]
+    pub fn jam_resume_mode(&self) -> bool {
+        self.jam_resume_mode && jam::resume::privacy().is_ok()
+    }
+    #[cfg(feature = "jam-host")]
+    pub fn jam_resume_available(&self, expected: jam::lifecycle::Stamp) -> bool {
+        self.jam_resume_mode() && !self.offline && self.jam_gate.resume_available(expected)
+    }
+    #[cfg(feature = "jam-host")]
+    pub fn capture_jam_resume(
+        &self,
+        expected: jam::lifecycle::Stamp,
+        gesture: tokio::time::Instant,
+    ) -> Option<jam::lifecycle::ResumeRequest> {
+        if !self.jam_resume_mode() || self.offline {
+            return None;
+        }
+        self.jam_gate.capture_resume(expected, gesture).ok()
+    }
+    #[cfg(feature = "jam-host")]
+    pub fn cancel_jam_resume(&self) {
+        self.jam_gate.cancel_resume();
+    }
+    #[cfg(feature = "jam-host")]
+    pub fn jam_resume_report(
+        &self,
+        expected: jam::lifecycle::Stamp,
+    ) -> Option<jam::lifecycle::ResumeReport> {
+        self.jam_gate.resume_report(expected)
+    }
     #[cfg(feature = "jam-host")]
     pub fn jam_stamp(&self) -> jam::lifecycle::Stamp {
         self.jam_gate.stamp()
@@ -1896,6 +1943,20 @@ impl Worker {
     }
 
     #[cfg(feature = "jam-host")]
+    fn resume_jam(&mut self, request: jam::lifecycle::ResumeRequest) {
+        let epoch = *self.session.borrow();
+        if !self.signed_in {
+            self.jam.retire(epoch, jam::lifecycle::Cause::Account);
+        }
+        let account = self.api.account();
+        self.jam.resume(
+            request,
+            account.as_ref().map(|a| a.as_str()),
+            epoch,
+            Arc::clone(&self.background_session),
+        );
+    }
+    #[cfg(feature = "jam-host")]
     fn generate_jam(&mut self, intent: jam::generation::Intent) {
         let epoch = *self.session.borrow();
         if !self.signed_in {
@@ -2103,6 +2164,8 @@ impl Worker {
                 continue;
             }
             match command {
+                #[cfg(feature = "jam-host")]
+                Command::JamResume(request) => self.resume_jam(request),
                 #[cfg(feature = "jam-host")]
                 Command::JamGenerate(intent) => self.generate_jam(intent),
                 #[cfg(feature = "jam-host")]
@@ -3741,6 +3804,7 @@ impl Worker {
                         self.session.subscribe(),
                         Arc::clone(&self.api),
                         Arc::clone(&self.background_session),
+                        engine.jam_paused(),
                     );
                 } else {
                     self.jam
